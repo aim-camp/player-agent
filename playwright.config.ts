@@ -9,7 +9,7 @@ export default defineConfig({
     viewport: { width: 1280, height: 720 },
   },
   webServer: {
-    command: "npx vite --port 5199",
+    command: "npx --package=vite@5 vite --port 5199",
     port: 5199,
     timeout: 30000,
     reuseExistingServer: true,

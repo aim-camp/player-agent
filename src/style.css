@@ -2546,6 +2546,14 @@ textarea:focus {
   background: var(--neon-green);
   color: #020617;
 }
+.ai-modal-actions .ai-test {
+  background: rgba(34, 197, 94, 0.15);
+  color: var(--neon-green);
+  border: 1px solid rgba(34, 197, 94, 0.3) !important;
+}
+.ai-modal-actions .ai-test:hover {
+  background: rgba(34, 197, 94, 0.25);
+}
 .ai-modal-actions .ai-cancel {
   background: rgba(255, 255, 255, 0.08);
   color: var(--text-muted);
