@@ -1,6 +1,6 @@
 [package]
 name = "aimcamp-player-agent"
-version = "1.1.0"
+version = "1.1.2"
 description = "aim.camp Player Agent - CS2 Optimization Tool"
 authors = ["Rqdiniz <rqdiniz@aim.camp>"]
 edition = "2021"

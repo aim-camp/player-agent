@@ -547,10 +547,88 @@ function updateImpact() {
    UI helpers
    ================================================================ */
 
+/* ── Custom Tooltip System ──────────────────────────────────────── */
+let _tipEl: HTMLDivElement | null = null;
+let _tipTimer: ReturnType<typeof setTimeout> | null = null;
+
+function ensureTipEl(): HTMLDivElement {
+  if (!_tipEl) {
+    _tipEl = document.createElement("div");
+    _tipEl.className = "ac-tooltip";
+    _tipEl.style.display = "none";
+    document.body.appendChild(_tipEl);
+  }
+  return _tipEl;
+}
+
+function attachTooltip(el: HTMLElement, html: string) {
+  el.addEventListener("mouseenter", (e) => {
+    const tip = ensureTipEl();
+    tip.innerHTML = html;
+    tip.style.display = "block";
+    positionTip(tip, e);
+    if (_tipTimer) clearTimeout(_tipTimer);
+    _tipTimer = setTimeout(() => { tip.classList.add("visible"); }, 10);
+  });
+  el.addEventListener("mousemove", (e) => { positionTip(ensureTipEl(), e); });
+  el.addEventListener("mouseleave", () => {
+    const tip = ensureTipEl();
+    tip.classList.remove("visible");
+    if (_tipTimer) clearTimeout(_tipTimer);
+    _tipTimer = setTimeout(() => { tip.style.display = "none"; }, 120);
+  });
+}
+
+function positionTip(tip: HTMLDivElement, e: MouseEvent) {
+  const pad = 12;
+  let x = e.clientX + pad;
+  let y = e.clientY + pad;
+  const r = tip.getBoundingClientRect();
+  if (x + r.width > window.innerWidth - pad) x = e.clientX - r.width - pad;
+  if (y + r.height > window.innerHeight - pad) y = e.clientY - r.height - pad;
+  tip.style.left = `${x}px`;
+  tip.style.top = `${y}px`;
+}
+
+/* helper: build tooltip HTML with optional performance impact */
+function tipHtml(title: string, desc: string, impact?: string, method?: string): string {
+  let h = `<div class="tt-title">${title}</div><div class="tt-desc">${desc}</div>`;
+  if (impact) h += `<div class="tt-impact">${impact}</div>`;
+  if (method) h += `<div class="tt-method">${method}</div>`;
+  return h;
+}
+
+/* parse TIP strings into rich HTML — extracts impact & method from the ✔/⚠/ℹ format */
+function tipFromLegacy(raw: string): string {
+  const isAuto = raw.startsWith("✔");
+  const isManual = raw.startsWith("⚠");
+  const isInfo = raw.startsWith("ℹ");
+  const badge = isAuto ? '<span class="tt-badge auto">AUTO</span>' : isManual ? '<span class="tt-badge manual">MANUAL</span>' : '<span class="tt-badge info">INFO</span>';
+
+  // extract method in parens e.g. (Registry), (PowerShell), (Service)
+  const methodMatch = raw.match(/\(([^)]+)\)/);
+  const method = methodMatch ? methodMatch[1] : "";
+
+  // extract impact e.g. +3.0% (+8 FPS) or 0 FPS
+  const impactMatch = raw.match(/([+\d.]+%\s*\([^)]+\)|0 FPS[^.]*)/);
+  const impact = impactMatch ? impactMatch[1] : "";
+
+  // remaining description: strip the prefix markers and extracted parts
+  let desc = raw.replace(/^[✔⚠ℹ]\s*(AUTO|MANUAL BIOS|MANUAL PASTE|INFO ONLY)?\s*\([^)]*\)\s*:?\s*/i, "").trim();
+  if (impact) desc = desc.replace(impact, "").replace(/\.\s*$/, "").trim();
+  // remove trailing dot
+  desc = desc.replace(/\.\s*$/, "");
+
+  let h = `<div class="tt-header">${badge}${method ? `<span class="tt-via">${method}</span>` : ""}</div>`;
+  h += `<div class="tt-desc">${desc}</div>`;
+  if (impact && impact !== "0 FPS") h += `<div class="tt-impact">⚡ ${impact}</div>`;
+  return h;
+}
+
 function toggle(id: string, label: string, isChecked: boolean, tooltip?: string, showLed = true): HTMLDivElement {
   const row = document.createElement("div");
   row.className = "toggle-row";
-  if (tooltip) row.title = tooltip;
+  if (tooltip) attachTooltip(row, tipFromLegacy(tooltip));
   const lbl = document.createElement("label");
   lbl.htmlFor = id;
   lbl.textContent = label;
@@ -580,7 +658,7 @@ function toggle(id: string, label: string, isChecked: boolean, tooltip?: string,
 function infoRow(label: string, tooltip?: string): HTMLDivElement {
   const row = document.createElement("div");
   row.className = "info-row";
-  if (tooltip) row.title = tooltip;
+  if (tooltip) attachTooltip(row, tipFromLegacy(tooltip));
   const badge = document.createElement("span");
   badge.className = "info-badge";
   badge.textContent = "!";
@@ -595,7 +673,7 @@ function infoRow(label: string, tooltip?: string): HTMLDivElement {
 function numInput(id: string, label: string, value: string, tooltip?: string): HTMLDivElement {
   const row = document.createElement("div");
   row.className = "input-row";
-  if (tooltip) row.title = tooltip;
+  if (tooltip) attachTooltip(row, tipFromLegacy(tooltip));
   const lbl = document.createElement("label");
   lbl.htmlFor = id;
   lbl.textContent = label;
@@ -621,7 +699,7 @@ function card(title: string, tooltip?: string): HTMLElement {
   sec.className = "card";
   const h2 = document.createElement("h2");
   h2.textContent = title;
-  if (tooltip) h2.title = tooltip;
+  if (tooltip) attachTooltip(h2, `<div class="tt-desc">${tooltip}</div>`);
   sec.appendChild(h2);
   return sec;
 }
@@ -1475,25 +1553,83 @@ function updateCfgCounter() {
 }
 
 function collectCfgContent(): string {
-  const L: string[] = ["// Generated by aim.camp Player Agent - CS2 CFG Manager", `// Theme: ${THEMES[currentThemeIdx].name}`, `// Date: ${new Date().toISOString().slice(0, 10)}`, ""];
+  const d = new Date();
+  const date = d.toISOString().slice(0, 10);
+  const time = d.toTimeString().slice(0, 8);
+  const theme = THEMES[currentThemeIdx].name;
+  const ver = "1.1.2";
+
+  // count active commands
+  let totalActive = 0;
+  for (const cat of CFG)
+    for (const c of cat.commands) {
+      const el = document.getElementById(c.id) as HTMLInputElement | null;
+      if (el?.checked) totalActive++;
+    }
+
+  const W = 60; // banner width
+  const border = (ch: string) => ch.repeat(W);
+  const center = (txt: string) => {
+    const pad = Math.max(0, Math.floor((W - 4 - txt.length) / 2));
+    return `// ${" ".repeat(pad)}${txt}`;
+  };
+
+  const L: string[] = [
+    `//${border("═")}`,
+    center("aim.camp Player Agent — CS2 CFG"),
+    center(`v${ver}  ·  ${theme} Theme`),
+    center(`${date} ${time}  ·  ${totalActive} commands active`),
+    `//${border("═")}`,
+    "//",
+    "// Place this file in your CS2 cfg folder as autoexec.cfg",
+    "// Steam › CS2 › Properties › Launch Options: +exec autoexec.cfg",
+    "//",
+    `// Generated with ❤ by aim.camp Player Agent`,
+    "// https://aim.camp",
+    "//",
+    "",
+  ];
+
   for (const cat of CFG) {
-    const cl: string[] = [];
+    const cl: { cmd: string; comment: string }[] = [];
     for (const c of cat.commands) {
       const el = document.getElementById(c.id) as HTMLInputElement | null;
       if (!el?.checked) continue;
+      let line: string;
       if (c.type === "toggle") {
-        cl.push(c.val === "" ? c.cmd : `${c.cmd} ${c.val}`);
+        line = c.val === "" ? c.cmd : `${c.cmd} ${c.val}`;
       } else {
         const v = (document.getElementById(`${c.id}_v`) as HTMLInputElement | null)?.value || c.val;
-        cl.push(c.val === "" && !v ? c.cmd : `${c.cmd} ${v}`);
+        line = c.val === "" && !v ? c.cmd : `${c.cmd} ${v}`;
       }
+      // build inline comment from tip (first sentence, max 50 chars)
+      const raw = (c.tip || "").split(".")[0].trim();
+      const comment = raw.length > 50 ? raw.slice(0, 47) + "..." : raw;
+      cl.push({ cmd: line, comment });
     }
     if (cl.length) {
-      L.push(`// -- ${cat.name} --`);
-      L.push(...cl);
+      // category banner
+      const tag = ` ${cat.name.toUpperCase()} `;
+      const half = Math.max(1, Math.floor((W - 4 - tag.length) / 2));
+      L.push(`//${" "}${"─".repeat(half)}${tag}${"─".repeat(W - 4 - half - tag.length)}`);
+      L.push("");
+      // find longest command for alignment
+      const maxLen = Math.max(...cl.map((x) => x.cmd.length));
+      for (const { cmd, comment } of cl) {
+        if (comment) {
+          const pad = " ".repeat(Math.max(1, maxLen - cmd.length + 2));
+          L.push(`${cmd}${pad}// ${comment}`);
+        } else {
+          L.push(cmd);
+        }
+      }
       L.push("");
     }
   }
+
+  L.push(`//${border("─")}`);
+  L.push("// End of autoexec.cfg");
+  L.push(`//${border("─")}`);
   return L.join("\n");
 }
 
@@ -3435,9 +3571,29 @@ function showAiModal() {
       <label>Model</label>
       <input type="text" id="ai-model" value="${cfg.model}" placeholder="${AI_DEFAULTS.model}" />
       <div id="ai-test-result" style="font-size:10px;margin-top:6px;min-height:16px;"></div>
-      <div style="font-size:9px;opacity:0.4;margin-top:4px;">
-        Pre-configured for Groq (free). Works with OpenAI, OpenRouter, Ollama, or any OpenAI-compatible API.
-        Just paste your Groq API key from <a href="#" id="ai-groq-link" style="color:var(--primary);text-decoration:underline;">console.groq.com</a>.
+      <div class="ai-providers">
+        <div class="ai-providers-label">Get a free API key from:</div>
+        <div class="ai-providers-grid">
+          <a href="#" class="ai-provider-link" data-url="https://console.groq.com/keys" data-endpoint="https://api.groq.com/openai/v1/chat/completions" data-model="llama-3.3-70b-versatile">
+            <span class="ai-prov-icon">⚡</span><span class="ai-prov-name">Groq</span><span class="ai-prov-tag">Free</span>
+          </a>
+          <a href="#" class="ai-provider-link" data-url="https://platform.openai.com/api-keys" data-endpoint="https://api.openai.com/v1/chat/completions" data-model="gpt-4o-mini">
+            <span class="ai-prov-icon">🟢</span><span class="ai-prov-name">OpenAI</span><span class="ai-prov-tag">Paid</span>
+          </a>
+          <a href="#" class="ai-provider-link" data-url="https://openrouter.ai/keys" data-endpoint="https://openrouter.ai/api/v1/chat/completions" data-model="meta-llama/llama-3.3-70b-instruct:free">
+            <span class="ai-prov-icon">🔀</span><span class="ai-prov-name">OpenRouter</span><span class="ai-prov-tag">Free tier</span>
+          </a>
+          <a href="#" class="ai-provider-link" data-url="https://aistudio.google.com/apikey" data-endpoint="https://generativelanguage.googleapis.com/v1beta/openai/chat/completions" data-model="gemini-2.0-flash">
+            <span class="ai-prov-icon">💎</span><span class="ai-prov-name">Google Gemini</span><span class="ai-prov-tag">Free</span>
+          </a>
+          <a href="#" class="ai-provider-link" data-url="https://github.com/ollama/ollama" data-endpoint="http://localhost:11434/v1/chat/completions" data-model="llama3.3">
+            <span class="ai-prov-icon">🦙</span><span class="ai-prov-name">Ollama</span><span class="ai-prov-tag">Local</span>
+          </a>
+          <a href="#" class="ai-provider-link" data-url="https://console.mistral.ai/api-keys" data-endpoint="https://api.mistral.ai/v1/chat/completions" data-model="mistral-small-latest">
+            <span class="ai-prov-icon">🌀</span><span class="ai-prov-name">Mistral</span><span class="ai-prov-tag">Free tier</span>
+          </a>
+        </div>
+        <div style="font-size:8px;opacity:0.3;margin-top:4px;">Click a provider to open its key page and auto-fill endpoint + model. Works with any OpenAI-compatible API.</div>
       </div>
       <div class="ai-modal-actions">
         <button class="ai-cancel" id="ai-cancel">Cancel</button>
@@ -3453,9 +3609,19 @@ function showAiModal() {
   overlay.addEventListener("click", (e) => {
     if (e.target === overlay) overlay.remove();
   });
-  document.getElementById("ai-groq-link")?.addEventListener("click", (e) => {
-    e.preventDefault();
-    shellOpen("https://console.groq.com/keys");
+
+  // Provider quick-links: click opens key page + auto-fills endpoint and model
+  overlay.querySelectorAll(".ai-provider-link").forEach((link) => {
+    link.addEventListener("click", (e) => {
+      e.preventDefault();
+      const el = link as HTMLElement;
+      const url = el.dataset.url || "";
+      const endpoint = el.dataset.endpoint || "";
+      const model = el.dataset.model || "";
+      if (url) shellOpen(url);
+      if (endpoint) (document.getElementById("ai-endpoint") as HTMLInputElement).value = endpoint;
+      if (model) (document.getElementById("ai-model") as HTMLInputElement).value = model;
+    });
   });
 
   document.getElementById("ai-test-btn")!.addEventListener("click", async () => {
@@ -3928,47 +4094,47 @@ function build() {
   const btnSys = document.createElement("button");
   btnSys.className = "sidebar-btn active";
   btnSys.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg><span>SYS</span>`;
-  btnSys.title = "System Optimizer";
+  attachTooltip(btnSys, tipHtml("System Optimizer", "One-click Windows, BIOS, NVIDIA, Network & Services optimizations for CS2. Applies registry tweaks, power plans, and system tuning through auto-generated PowerShell scripts.", "Up to +40% cumulative FPS gain", "Registry / PowerShell / bcdedit"));
 
   const btnCfgTab = document.createElement("button");
   btnCfgTab.className = "sidebar-btn";
   btnCfgTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 3h16a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M4 15h16a2 2 0 0 1 2 2v2a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-2a2 2 0 0 1 2-2z"/><path d="M6 7h.01"/><path d="M6 17h.01"/></svg><span>CFG</span>`;
-  btnCfgTab.title = "CFG Manager";
+  attachTooltip(btnCfgTab, tipHtml("CFG Manager", "Full CS2 console command editor with 148+ commands across 12 categories — Performance, Crosshair, Viewmodel, HUD, Radar, Audio, Mouse, Network, Voice, Buy, Spectator & QoL. Export autoexec.cfg, import pro player configs, and preview crosshair live."));
 
   const btnHwTab = document.createElement("button");
   btnHwTab.className = "sidebar-btn";
   btnHwTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v2"/><path d="M15 2v2"/><path d="M9 20v2"/><path d="M15 20v2"/><path d="M20 9h2"/><path d="M20 14h2"/><path d="M2 9h2"/><path d="M2 14h2"/></svg><span>HW</span>`;
-  btnHwTab.title = "Hardware Info";
+  attachTooltip(btnHwTab, tipHtml("Hardware Info", "Scans your full system hardware — CPU, GPU, RAM, motherboard, storage and monitors via WMI queries. Detects XMP status, GPU scheduling, power plan, HPET timer and more. AI analysis available to identify bottlenecks."));
 
   const btnDrvTab = document.createElement("button");
   btnDrvTab.className = "sidebar-btn";
   btnDrvTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg><span>DRV</span>`;
-  btnDrvTab.title = "Drivers";
+  attachTooltip(btnDrvTab, tipHtml("Drivers", "Lists all installed device drivers with version, date, manufacturer and digital signature status. Checks Windows Update for available driver updates and allows one-click background installation."));
 
   const btnProcTab = document.createElement("button");
   btnProcTab.className = "sidebar-btn";
   btnProcTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg><span>PROC</span>`;
-  btnProcTab.title = "Process Manager";
+  attachTooltip(btnProcTab, tipHtml("Process Manager", "Real-time process monitor focused on gaming. Flags known resource-heavy applications (overlays, RGB software, streaming tools) that compete with CS2 for CPU/GPU time. Kill processes directly to free resources.", "Varies — killing bloatware can free 5-15% CPU"));
 
   const btnNetTab = document.createElement("button");
   btnNetTab.className = "sidebar-btn";
   btnNetTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><circle cx="12" cy="20" r="1"/></svg><span>NET</span>`;
-  btnNetTab.title = "Network Diagnostics";
+  attachTooltip(btnNetTab, tipHtml("Network Diagnostics", "Pings official Valve CS2 server regions worldwide and measures latency, jitter and packet loss. Helps identify the best server region for your connection. AI analysis suggests network config improvements."));
 
   const btnDemoTab = document.createElement("button");
   btnDemoTab.className = "sidebar-btn";
   btnDemoTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8"/></svg><span>DEMO</span>`;
-  btnDemoTab.title = "Demo Review";
+  attachTooltip(btnDemoTab, tipHtml("Demo Review", "Parses CS2 .dem files and extracts match metadata (map, duration, tickrate, rounds). Rate your performance and add notes. AI coaching analysis scores 18 gameplay review tips with personalized feedback."));
 
   const btnFdbkTab = document.createElement("button");
   btnFdbkTab.className = "sidebar-btn";
   btnFdbkTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span>FDBK</span>`;
-  btnFdbkTab.title = "Feedback & Sugestões";
+  attachTooltip(btnFdbkTab, tipHtml("Feedback & Suggestions", "Send bug reports, feature requests and general feedback directly to the development team via Discord webhook. Your input shapes future updates. All submissions are anonymous."));
 
   const btnBenchTab = document.createElement("button");
   btnBenchTab.className = "sidebar-btn";
   btnBenchTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M18 20V10"/><path d="M12 20V4"/><path d="M6 20v-6"/></svg><span>BNCH</span>`;
-  btnBenchTab.title = "Benchmark & Frame Analysis";
+  attachTooltip(btnBenchTab, tipHtml("Benchmark & Frame Analysis", "Import PresentMon CSV or CapFrameX JSON benchmark captures. Visualizes FPS over time, frame time distribution, 1% / 0.1% lows, and stutter analysis. Compare before/after optimization runs."));
 
   /* ── Community placeholder buttons ─────────────────────────── */
   const sidebarSep = document.createElement("div");
@@ -3980,22 +4146,22 @@ function build() {
   const btnRankTab = document.createElement("button");
   btnRankTab.className = "sidebar-btn placeholder-btn";
   btnRankTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M6 9H4.5a2.5 2.5 0 0 1 0-5C6 4 6 7 6 7s0 3 1.5 3S9 7 9 7s0-3 1.5-3a2.5 2.5 0 0 1 0 5H9"/><path d="M6 9v12"/><path d="M9 9v12"/><path d="M18 9h1.5a2.5 2.5 0 0 0 0-5C18 4 18 7 18 7s0 3-1.5 3S15 7 15 7s0-3-1.5-3a2.5 2.5 0 0 0 0 5H15"/><path d="M15 9v12"/><path d="M18 9v12"/></svg><span>RANK</span>`;
-  btnRankTab.title = "Rankings & Stats";
+  attachTooltip(btnRankTab, tipHtml("Rankings & Stats", "Coming soon — Track your CS2 competitive rankings, ELO history, win rate trends and per-map statistics. Integrates with Steam and FACEIT profiles."));
 
   const btnServersTab = document.createElement("button");
   btnServersTab.className = "sidebar-btn placeholder-btn";
   btnServersTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><circle cx="6" cy="6" r="1"/><circle cx="6" cy="18" r="1"/></svg><span>SRVS</span>`;
-  btnServersTab.title = "Match & Servers";
+  attachTooltip(btnServersTab, tipHtml("Match & Servers", "Coming soon — Browse community servers, retake/DM/FFA servers and organize 5v5 practice matches with your team through aim.camp matchmaking."));
 
   const btnMarketTab = document.createElement("button");
   btnMarketTab.className = "sidebar-btn placeholder-btn";
   btnMarketTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="9" cy="21" r="1"/><circle cx="20" cy="21" r="1"/><path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"/></svg><span>MRKT</span>`;
-  btnMarketTab.title = "Item Tracker & Market";
+  attachTooltip(btnMarketTab, tipHtml("Item Tracker & Market", "Coming soon — Track CS2 skin prices, inventory value, trade-up calculator and market trends. Price alerts and Steam Community Market integration."));
 
   const btnHubTab = document.createElement("button");
   btnHubTab.className = "sidebar-btn placeholder-btn";
   btnHubTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg><span>HUB</span>`;
-  btnHubTab.title = "aim.camp Hub";
+  attachTooltip(btnHubTab, tipHtml("aim.camp Hub", "Coming soon — Central hub for the aim.camp community. News, guides, team finder, tournament brackets and direct integration with the aim.camp platform."));
 
   /* ── Sidebar watermark ─────────────────────────────────────── */
   const watermark = document.createElement("div");
@@ -4581,54 +4747,20 @@ function build() {
 
   tabCfg.appendChild(cfgSub.bar);
 
-  /* ── Pro Config presets + Crosshair preview ──────────────────── */
-  const cfgExtras = document.createElement("section");
-  cfgExtras.className = "cfg-extras";
-  cfgExtras.style.cssText = "display:flex;gap:10px;padding:0 12px 8px;flex-wrap:wrap;";
-
-  // pro config dropdown
-  const proCard = card("Pro Configs");
-  proCard.style.flex = "1";
-  proCard.style.minWidth = "200px";
-  const proSel = document.createElement("select");
-  proSel.className = "pro-select";
-  const proOpt0 = document.createElement("option");
-  proOpt0.value = "";
-  proOpt0.textContent = "-- Select player --";
-  proSel.appendChild(proOpt0);
-  for (const p of PRO_CONFIGS) {
-    const o = document.createElement("option");
-    o.value = p.name;
-    o.textContent = `${p.name} (${p.team}) — ${p.sens}@${p.dpi}dpi`;
-    proSel.appendChild(o);
-  }
-  proSel.addEventListener("change", () => {
-    const p = PRO_CONFIGS.find((x) => x.name === proSel.value);
-    if (p) applyProConfig(p);
-  });
-  const proInfo = document.createElement("div");
-  proInfo.style.cssText = "font-size:10px;opacity:0.5;margin-top:6px;";
-  proInfo.textContent = "Loads crosshair, sensitivity, viewmodel from pro player settings";
-  proCard.appendChild(proSel);
-  proCard.appendChild(proInfo);
-  cfgExtras.appendChild(proCard);
-
-  // crosshair preview
+  /* ── Crosshair Preview — inline in sub-tab 0 ────────────────── */
   const xhCard = card("Crosshair Preview");
-  xhCard.style.flex = "1";
-  xhCard.style.minWidth = "200px";
+  xhCard.style.cssText = "margin:0 12px 8px;";
   const xhDiv = document.createElement("div");
   xhDiv.className = "xhair-preview";
+  xhDiv.style.cssText = "min-height:120px;";
   const cvs = document.createElement("canvas");
   cvs.id = "xhair-cvs";
   cvs.className = "xhair-canvas";
-  cvs.width = 160;
-  cvs.height = 120;
+  cvs.width = 200;
+  cvs.height = 150;
   xhDiv.appendChild(cvs);
   xhCard.appendChild(xhDiv);
-  cfgExtras.appendChild(xhCard);
-
-  cfgSub.panels[2].appendChild(cfgExtras);
+  cfgSub.panels[0].appendChild(xhCard);
 
   for (const p of cfgSub.panels) tabCfg.appendChild(p);
 
@@ -4648,15 +4780,101 @@ function build() {
   const cfgActions = document.createElement("section");
   cfgActions.className = "cfg-actions";
 
+  /* Save .cfg — dropdown with Local / Drive / Email */
+  const saveWrap = document.createElement("div");
+  saveWrap.className = "cfg-dropdown-wrap";
   const btnSaveCfg = document.createElement("button");
-  btnSaveCfg.className = "btn-export";
-  btnSaveCfg.textContent = "Save .cfg";
-  btnSaveCfg.title = "Save autoexec.cfg with selected commands";
+  btnSaveCfg.className = "btn-export cfg-dropdown-trigger";
+  btnSaveCfg.innerHTML = '💾 Save .cfg <span class="dd-arrow">▾</span>';
+  const saveMenu = document.createElement("div");
+  saveMenu.className = "cfg-dropdown-menu";
+  saveMenu.innerHTML = `
+    <button data-action="save-local" class="cfg-dd-item"><span class="cfg-dd-icon">📁</span> Save Locally</button>
+    <button data-action="save-drive" class="cfg-dd-item"><span class="cfg-dd-icon">☁️</span> Google Drive</button>
+    <button data-action="save-email" class="cfg-dd-item"><span class="cfg-dd-icon">✉️</span> Send by Email</button>
+  `;
+  saveWrap.appendChild(btnSaveCfg);
+  saveWrap.appendChild(saveMenu);
+  btnSaveCfg.addEventListener("click", (e) => {
+    e.stopPropagation();
+    saveMenu.classList.toggle("open");
+    loadMenu.classList.remove("open");
+  });
+  saveMenu.addEventListener("click", async (e) => {
+    const t = (e.target as HTMLElement).closest("[data-action]") as HTMLElement | null;
+    if (!t) return;
+    saveMenu.classList.remove("open");
+    const action = t.dataset.action;
+    if (action === "save-local") {
+      await saveCfgFile();
+    } else if (action === "save-drive") {
+      const content = collectCfgContent();
+      const encoded = encodeURIComponent(content);
+      const name = encodeURIComponent("autoexec.cfg");
+      // Open Google Drive upload via Google Docs create-then-save-as flow
+      const url = `https://drive.google.com/drive/my-drive`;
+      shellOpen(url);
+      // Copy to clipboard for paste
+      await navigator.clipboard.writeText(content);
+      toast("CFG copied to clipboard — paste into Google Drive");
+    } else if (action === "save-email") {
+      const content = collectCfgContent();
+      const subject = encodeURIComponent("My CS2 autoexec.cfg — aim.camp Player Agent");
+      const body = encodeURIComponent(content);
+      const mailto = `mailto:?subject=${subject}&body=${body}`;
+      window.location.href = mailto;
+      toast("Opening email client with CFG...");
+    }
+  });
 
+  /* Load .cfg — dropdown with Pro Player / Drive / Local */
+  const loadWrap = document.createElement("div");
+  loadWrap.className = "cfg-dropdown-wrap";
   const btnLoadCfg = document.createElement("button");
-  btnLoadCfg.className = "btn-import";
-  btnLoadCfg.textContent = "Load .cfg";
-  btnLoadCfg.title = "Load an existing .cfg file";
+  btnLoadCfg.className = "btn-import cfg-dropdown-trigger";
+  btnLoadCfg.innerHTML = '📂 Load .cfg <span class="dd-arrow">▾</span>';
+  const loadMenu = document.createElement("div");
+  loadMenu.className = "cfg-dropdown-menu cfg-dd-load";
+  // Build pro player sub-items
+  let proHtml = '<div class="cfg-dd-section">Pro Players</div>';
+  for (const p of PRO_CONFIGS) {
+    proHtml += `<button data-action="load-pro" data-pro="${p.name}" class="cfg-dd-item cfg-dd-pro"><span class="cfg-dd-icon">🎯</span> ${p.name} <span class="cfg-dd-meta">${p.team} · ${p.sens}@${p.dpi}</span></button>`;
+  }
+  loadMenu.innerHTML = `
+    ${proHtml}
+    <div class="cfg-dd-divider"></div>
+    <button data-action="load-drive" class="cfg-dd-item"><span class="cfg-dd-icon">☁️</span> Import from Google Drive</button>
+    <button data-action="load-local" class="cfg-dd-item"><span class="cfg-dd-icon">📁</span> Import Local File</button>
+  `;
+  loadWrap.appendChild(btnLoadCfg);
+  loadWrap.appendChild(loadMenu);
+  btnLoadCfg.addEventListener("click", (e) => {
+    e.stopPropagation();
+    loadMenu.classList.toggle("open");
+    saveMenu.classList.remove("open");
+  });
+  loadMenu.addEventListener("click", async (e) => {
+    const t = (e.target as HTMLElement).closest("[data-action]") as HTMLElement | null;
+    if (!t) return;
+    loadMenu.classList.remove("open");
+    const action = t.dataset.action;
+    if (action === "load-pro") {
+      const name = t.dataset.pro;
+      const p = PRO_CONFIGS.find((x) => x.name === name);
+      if (p) applyProConfig(p);
+    } else if (action === "load-drive") {
+      shellOpen("https://drive.google.com/drive/my-drive");
+      toast("Open your .cfg from Drive, then use 'Import Local File'");
+    } else if (action === "load-local") {
+      await loadCfgFile();
+    }
+  });
+
+  // Close dropdowns on outside click
+  document.addEventListener("click", () => {
+    saveMenu.classList.remove("open");
+    loadMenu.classList.remove("open");
+  });
 
   const btnResetCfg = document.createElement("button");
   btnResetCfg.className = "btn-run";
@@ -4708,8 +4926,8 @@ function build() {
   cfgSig.className = "app-signature";
   cfgSig.innerHTML = `<span class="sig-by">by</span> <span class="sig-name">Rqdiniz</span> <span class="sig-tag">[ bu- ]</span>`;
 
-  cfgActions.appendChild(btnSaveCfg);
-  cfgActions.appendChild(btnLoadCfg);
+  cfgActions.appendChild(saveWrap);
+  cfgActions.appendChild(loadWrap);
   cfgActions.appendChild(btnResetCfg);
   cfgActions.appendChild(btnCfgAi);
   cfgActions.appendChild(cfgCounter);
@@ -5289,8 +5507,6 @@ function build() {
   btnExport.addEventListener("click", exportScript);
   btnImport2.addEventListener("click", importScript);
   btnRun2.addEventListener("click", runConfigAsAdmin);
-  btnSaveCfg.addEventListener("click", saveCfgFile);
-  btnLoadCfg.addEventListener("click", loadCfgFile);
   btnResetCfg.addEventListener("click", resetCfgDefaults);
 
   /* CFG counter listeners */
