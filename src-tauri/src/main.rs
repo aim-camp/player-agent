@@ -2051,20 +2051,45 @@ fn parse_capframex_json(path: &str, file_name: &str) -> Result<BenchmarkResult, 
     let json: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| format!("JSON inválido: {}", e))?;
 
-    // CapFrameX stores frame times in "Runs" array (each run is an array of frame times in ms)
-    // or in "CaptureData"/"MsBetweenPresents"
-    let frametimes: Vec<f64> = if let Some(runs) = json.get("Runs").and_then(|r| r.as_array()) {
-        // Flatten all runs
-        runs.iter()
-            .filter_map(|r| r.as_array())
-            .flatten()
-            .filter_map(|v| v.as_f64())
-            .filter(|&v| v > 0.0)
-            .collect()
+    // CapFrameX JSON format: { "Runs": [ { "CaptureData": { "MsBetweenPresents": [...], "Dropped": [...] } } ], "Info": { "ProcessName": "..." } }
+    // Each Run is a SessionRun object with CaptureData sub-object
+    let (frametimes, dropped) = if let Some(runs) = json.get("Runs").and_then(|r| r.as_array()) {
+        // Try as array of SessionRun objects (official CapFrameX format)
+        let mut ft: Vec<f64> = Vec::new();
+        let mut dr: usize = 0;
+        let mut found_obj = false;
+        for run in runs {
+            if let Some(capture) = run.get("CaptureData") {
+                found_obj = true;
+                if let Some(ms) = capture.get("MsBetweenPresents").and_then(|m| m.as_array()) {
+                    ft.extend(ms.iter().filter_map(|v| v.as_f64()).filter(|&v| v > 0.0));
+                }
+                if let Some(dropped_arr) = capture.get("Dropped").and_then(|d| d.as_array()) {
+                    dr += dropped_arr.iter().filter(|v| v.as_bool().unwrap_or(false) || v.as_i64().unwrap_or(0) == 1).count();
+                }
+            }
+        }
+        if !found_obj {
+            // Fallback: maybe Runs is array of arrays of raw frame times
+            ft = runs.iter()
+                .filter_map(|r| r.as_array())
+                .flatten()
+                .filter_map(|v| v.as_f64())
+                .filter(|&v| v > 0.0)
+                .collect();
+        }
+        (ft, dr)
     } else if let Some(data) = json.get("CaptureData").and_then(|d| d.get("MsBetweenPresents")).and_then(|m| m.as_array()) {
-        data.iter().filter_map(|v| v.as_f64()).filter(|&v| v > 0.0).collect()
+        let ft: Vec<f64> = data.iter().filter_map(|v| v.as_f64()).filter(|&v| v > 0.0).collect();
+        let dr = json.get("CaptureData")
+            .and_then(|d| d.get("Dropped"))
+            .and_then(|d| d.as_array())
+            .map(|arr| arr.iter().filter(|v| v.as_bool().unwrap_or(false) || v.as_i64().unwrap_or(0) == 1).count())
+            .unwrap_or(0);
+        (ft, dr)
     } else if let Some(data) = json.get("MsBetweenPresents").and_then(|m| m.as_array()) {
-        data.iter().filter_map(|v| v.as_f64()).filter(|&v| v > 0.0).collect()
+        let ft: Vec<f64> = data.iter().filter_map(|v| v.as_f64()).filter(|&v| v > 0.0).collect();
+        (ft, 0)
     } else {
         return Err("Formato CapFrameX não reconhecido: não encontrou frame times".into());
     };
@@ -2087,12 +2112,6 @@ fn parse_capframex_json(path: &str, file_name: &str) -> Result<BenchmarkResult, 
         .or_else(|| json.get("ProcessName").and_then(|p| p.as_str()))
         .unwrap_or("Unknown")
         .to_string();
-
-    let dropped = json.get("CaptureData")
-        .and_then(|d| d.get("Dropped"))
-        .and_then(|d| d.as_array())
-        .map(|arr| arr.iter().filter(|v| v.as_bool().unwrap_or(false) || v.as_i64().unwrap_or(0) == 1).count())
-        .unwrap_or(0);
 
     Ok(calc_metrics(&frametimes, &timestamps, dropped, &process, file_name))
 }
