@@ -407,8 +407,10 @@ Read-Host -Prompt '  Press Enter to exit'
 // Script generator
 // ────────────────────────────────────────────────────────────────────
 #[tauri::command]
-async fn generate_script(config: OptimizationConfig) -> Result<String, String> {
+async fn generate_script(config: OptimizationConfig, section: Option<String>) -> Result<String, String> {
     let mut s = String::with_capacity(32_000);
+    let run_all = section.is_none();
+    let sf = section.as_deref();
 
     let pc = if config.theme_primary.is_empty() { "#84cc16".to_string() } else { config.theme_primary.clone() };
     let sc = if config.theme_secondary.is_empty() { "#22d3ee".to_string() } else { config.theme_secondary.clone() };
@@ -427,6 +429,7 @@ async fn generate_script(config: OptimizationConfig) -> Result<String, String> {
     s.push_str("}\n\n");
 
     // 1. BIOS
+    if run_all || sf == Some("bios") {
     ps1_section(&mut s, 1, "BIOS -- Hardware Checks", "HW");
 
     s.push_str("    # Check virtualization state\n");
@@ -463,8 +466,10 @@ async fn generate_script(config: OptimizationConfig) -> Result<String, String> {
     if config.bios.enable_above_4g {
         ps1_info(&mut s, "Enable Above 4G Decoding in BIOS");
     }
+    } // end bios
 
     // 2. Windows
+    if run_all || sf == Some("windows") {
     ps1_section(&mut s, 2, "Windows -- Performance Tweaks", "OS");
 
     if config.windows.ultimate_power_plan {
@@ -689,8 +694,10 @@ async fn generate_script(config: OptimizationConfig) -> Result<String, String> {
             "Set-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management' -Name 'LargeSystemCache' -Value 0 -Type DWord -Force",
         ]);
     }
+    } // end windows
 
     // ── 3. Network ──────────────────────────────────────────────────
+    if run_all || sf == Some("network") {
     ps1_section(&mut s, 3, "Network -- Latency & TCP", "NET");
 
     if config.network.disable_nagle {
@@ -769,8 +776,10 @@ async fn generate_script(config: OptimizationConfig) -> Result<String, String> {
             "netsh int tcp set supplemental Internet congestionprovider=ctcp 2>$null",
         ]);
     }
+    } // end network
 
     // ── 4. NVIDIA ───────────────────────────────────────────────────
+    if run_all || sf == Some("nvidia") {
     ps1_section(&mut s, 4, "NVIDIA -- Registry-Level GPU Tweaks", "GPU");
 
     s.push_str("    # ── Find NVIDIA GPU registry path ──\n");
@@ -885,8 +894,10 @@ async fn generate_script(config: OptimizationConfig) -> Result<String, String> {
             "}",
         ]);
     }
+    } // end nvidia
 
     // ── 5. Services ─────────────────────────────────────────────────
+    if run_all || sf == Some("services") {
     ps1_section(&mut s, 5, "Services -- Disable Unnecessary", "SVC");
 
     let services: Vec<(&str, &str, bool)> = vec![
@@ -928,8 +939,10 @@ async fn generate_script(config: OptimizationConfig) -> Result<String, String> {
             "Get-Service -Name 'WpnUserService*' -ErrorAction SilentlyContinue | Set-Service -StartupType Disabled -ErrorAction SilentlyContinue",
         ]);
     }
+    } // end services
 
     // ── 6. autoexec.cfg ────────────────────────────────────────────
+    if run_all || sf == Some("autoexec") {
     if config.autoexec.enabled {
         ps1_section(&mut s, 6, "CS2 -- autoexec.cfg Generation", "CFG");
 
@@ -978,8 +991,10 @@ async fn generate_script(config: OptimizationConfig) -> Result<String, String> {
         s.push_str("    $autoexecLines | Set-Content -Path $autoexecPath -Encoding UTF8\n");
         s.push_str("    Write-Host \"    ✔ autoexec.cfg written to: $autoexecPath\" -ForegroundColor Green\n");
     }
+    } // end autoexec
 
     // ── 7. Launch options ─────────────────────────────────────────
+    if run_all || sf == Some("launch") {
     ps1_section(&mut s, 7, "CS2 -- Launch Options", "RUN");
     {
         let mut opts: Vec<String> = Vec::new();
@@ -1000,8 +1015,10 @@ async fn generate_script(config: OptimizationConfig) -> Result<String, String> {
         s.push_str(&format!("    Set-Clipboard -Value '{}'\n", opts_str));
         s.push_str("    Write-Host '    (Copied to clipboard!)' -ForegroundColor Cyan\n");
     }
+    } // end launch
 
     // ── 8. Extras / FACEIT ─────────────────────────────────────────
+    if run_all || sf == Some("extras") {
     ps1_section(&mut s, 8, "Extras & FACEIT", "EXT");
 
     if config.extras.disable_steam_overlay {
@@ -1109,6 +1126,7 @@ async fn generate_script(config: OptimizationConfig) -> Result<String, String> {
             "Write-Host '    💡 Always run FACEIT AC as Administrator.' -ForegroundColor Yellow",
         ]);
     }
+    } // end extras
 
     // ── Galaxy Footer ───────────────────────────────────────────────
     ps1_footer(&mut s);
@@ -1319,8 +1337,8 @@ async fn check_system_state() -> Result<serde_json::Value, String> {
 // Generate + run script content directly as admin (no file dialog)
 // ────────────────────────────────────────────────────────────────────
 #[tauri::command]
-async fn run_config_as_admin(config: OptimizationConfig) -> Result<String, String> {
-    let script = generate_script(config).await?;
+async fn run_config_as_admin(config: OptimizationConfig, section: Option<String>) -> Result<String, String> {
+    let script = generate_script(config, section).await?;
 
     let temp_dir = std::env::temp_dir();
     let script_path = temp_dir.join("aimcamp_run.ps1");
@@ -1637,7 +1655,7 @@ async fn save_feedback(
     tab: String,
     description: String,
     screenshot_b64: String,
-    sent: bool,
+    sent: String,
 ) -> Result<String, String> {
     // Save screenshot file
     let ss_dir = screenshots_dir()?;
@@ -2187,6 +2205,111 @@ async fn check_presentmon() -> Result<serde_json::Value, String> {
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Auto-update — check GitHub releases for newer version
+// ────────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn check_for_update() -> Result<serde_json::Value, String> {
+    let current_version = env!("CARGO_PKG_VERSION");
+    let client = reqwest::Client::builder()
+        .user_agent("aimcamp-player-agent")
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    let resp = client
+        .get("https://api.github.com/repos/aim-camp/player-agent/releases/latest")
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Ok(serde_json::json!({ "update_available": false, "error": format!("GitHub API: {}", resp.status()) }));
+    }
+
+    let release: serde_json::Value = resp.json().await
+        .map_err(|e| format!("Parse error: {}", e))?;
+
+    let tag = release["tag_name"].as_str().unwrap_or("v0.0.0");
+    let remote_version = tag.trim_start_matches('v');
+
+    let has_update = version_newer(remote_version, current_version);
+
+    // Find installer download URLs
+    let mut msi_url = String::new();
+    let mut nsis_url = String::new();
+    if let Some(assets) = release["assets"].as_array() {
+        for asset in assets {
+            let name = asset["name"].as_str().unwrap_or("");
+            let url = asset["browser_download_url"].as_str().unwrap_or("");
+            if name.ends_with(".msi") { msi_url = url.to_string(); }
+            if name.ends_with(".exe") && name.contains("setup") { nsis_url = url.to_string(); }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "update_available": has_update,
+        "current_version": current_version,
+        "latest_version": remote_version,
+        "tag": tag,
+        "release_name": release["name"].as_str().unwrap_or(""),
+        "release_notes": release["body"].as_str().unwrap_or(""),
+        "html_url": release["html_url"].as_str().unwrap_or(""),
+        "msi_url": msi_url,
+        "nsis_url": nsis_url,
+        "published_at": release["published_at"].as_str().unwrap_or("")
+    }))
+}
+
+fn version_newer(remote: &str, current: &str) -> bool {
+    let parse = |v: &str| -> Vec<u32> {
+        v.split('.').filter_map(|s| s.parse().ok()).collect()
+    };
+    let r = parse(remote);
+    let c = parse(current);
+    for i in 0..3 {
+        let rv = r.get(i).copied().unwrap_or(0);
+        let cv = c.get(i).copied().unwrap_or(0);
+        if rv > cv { return true; }
+        if rv < cv { return false; }
+    }
+    false
+}
+
+#[tauri::command]
+async fn download_update(url: String) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .user_agent("aimcamp-player-agent")
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    let resp = client.get(&url).send().await
+        .map_err(|e| format!("Download error: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Download failed: {}", resp.status()));
+    }
+
+    let fname = url.split('/').last().unwrap_or("update-installer.msi");
+    let download_dir = dirs_next::download_dir()
+        .unwrap_or_else(|| std::env::temp_dir());
+    let dest = download_dir.join(fname);
+
+    let bytes = resp.bytes().await.map_err(|e| format!("Read error: {}", e))?;
+    std::fs::write(&dest, &bytes).map_err(|e| format!("Write error: {}", e))?;
+
+    Ok(dest.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+async fn run_installer(path: String) -> Result<(), String> {
+    Command::new("cmd")
+        .args(&["/C", "start", "", &path])
+        .spawn()
+        .map_err(|e| format!("Launch installer error: {}", e))?;
+    Ok(())
+}
+
+// ────────────────────────────────────────────────────────────────────
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -2220,6 +2343,9 @@ fn main() {
             parse_benchmark_file,
             scan_capframex_folder,
             check_presentmon,
+            check_for_update,
+            download_update,
+            run_installer,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

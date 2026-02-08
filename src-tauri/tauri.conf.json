@@ -33,7 +33,7 @@
     "bundle": {
       "active": true,
       "category": "DeveloperTool",
-      "copyright": "",
+      "copyright": "© 2024-2026 Rqdiniz (bu-) — aim.camp",
       "deb": {
         "depends": []
       },
@@ -44,7 +44,7 @@
         "icons/icon.ico"
       ],
       "identifier": "com.aimcamp.playeragent",
-      "longDescription": "",
+      "longDescription": "CS2 system optimizer, CFG manager, hardware scanner and benchmark tool by Rqdiniz (bu-) — aim.camp community.",
       "macOS": {
         "entitlements": null,
         "exceptionDomain": "",
@@ -52,7 +52,7 @@
         "signingIdentity": null
       },
       "resources": [],
-      "shortDescription": "",
+      "shortDescription": "aim.camp Player Agent — CS2 optimizer by Rqdiniz",
       "targets": "all",
       "windows": {
         "certificateThumbprint": null,

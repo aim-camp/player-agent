@@ -2,7 +2,7 @@
 name = "aimcamp-player-agent"
 version = "1.0.6"
 description = "aim.camp Player Agent - CS2 Optimization Tool"
-authors = ["aim.camp"]
+authors = ["Rqdiniz <rqdiniz@aim.camp>"]
 edition = "2021"
 rust-version = "1.70"
 
