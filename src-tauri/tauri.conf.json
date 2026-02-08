@@ -1,0 +1,84 @@
+{
+  "build": {
+    "beforeDevCommand": "npm run vite:dev",
+    "beforeBuildCommand": "npm run vite:build",
+    "devPath": "http://localhost:1420",
+    "distDir": "../dist"
+  },
+  "package": {
+    "productName": "aimcamp-player-agent",
+    "version": "1.0.0"
+  },
+  "tauri": {
+    "allowlist": {
+      "all": false,
+      "window": {
+        "all": true
+      },
+      "shell": {
+        "all": true,
+        "open": true,
+        "execute": true,
+        "sidecar": false,
+        "scope": []
+      },
+      "dialog": {
+        "all": true
+      },
+      "fs": {
+        "all": true,
+        "scope": ["$DOWNLOAD/*", "$DESKTOP/*", "$DOCUMENT/*", "**"]
+      }
+    },
+    "bundle": {
+      "active": true,
+      "category": "DeveloperTool",
+      "copyright": "",
+      "deb": {
+        "depends": []
+      },
+      "externalBin": [],
+      "icon": [
+        "icons/32x32.png",
+        "icons/128x128.png",
+        "icons/icon.ico"
+      ],
+      "identifier": "com.aimcamp.playeragent",
+      "longDescription": "",
+      "macOS": {
+        "entitlements": null,
+        "exceptionDomain": "",
+        "frameworks": [],
+        "signingIdentity": null
+      },
+      "resources": [],
+      "shortDescription": "",
+      "targets": "all",
+      "windows": {
+        "certificateThumbprint": null,
+        "digestAlgorithm": "sha256",
+        "timestampUrl": ""
+      }
+    },
+    "security": {
+      "csp": null
+    },
+    "updater": {
+      "active": false
+    },
+    "windows": [
+      {
+        "fullscreen": true,
+        "maximized": false,
+        "height": 1080,
+        "resizable": false,
+        "title": "aim.camp Player Agent",
+        "width": 1920,
+        "decorations": false,
+        "center": true,
+        "minWidth": 900,
+        "minHeight": 600
+      }
+    ]
+  }
+}
