@@ -442,6 +442,12 @@ function applyTheme(idx: number) {
     .hw-status.on { background: ${hexToRgba(pc, 0.15)} !important; color: ${pc} !important; border-color: ${hexToRgba(pc, 0.3)} !important; }
     .hw-status.off { background: rgba(239,68,68,0.15) !important; color: #ef4444 !important; }
     .hw-value { color: ${sc} !important; }
+    .drv-category-header { color: ${pc} !important; border-bottom-color: ${hexToRgba(pc, 0.12)} !important; }
+    .drv-badge.manufacturer { background: ${hexToRgba(pc, 0.1)} !important; color: ${pc} !important; border-color: ${hexToRgba(pc, 0.25)} !important; }
+    .drv-badge.current { background: ${hexToRgba(pc, 0.08)} !important; color: ${pc} !important; border-color: ${hexToRgba(pc, 0.2)} !important; }
+    .drv-driver { color: ${sc} !important; }
+    .drv-summary-val { color: ${pc} !important; }
+    .drv-signed.yes { color: ${pc} !important; }
     .proc-item.flagged { border-color: ${hexToRgba('#eab308', 0.3)} !important; background: ${hexToRgba('#eab308', 0.06)} !important; }
     .proc-kill { background: linear-gradient(135deg, #ef4444, #b91c1c) !important; }
     .proc-header { border-bottom-color: ${hexToRgba(pc, 0.15)} !important; color: ${pc} !important; }
@@ -1476,6 +1482,995 @@ function hwStatus(label: string, state: string): HTMLDivElement {
   return r;
 }
 
+/* ================================================================
+   Driver Info — system + peripheral drivers
+   ================================================================ */
+
+interface DriverEntry {
+  category: string;
+  device_name: string;
+  driver_name: string;
+  driver_version: string;
+  driver_provider: string;
+  manufacturer: string;
+  driver_date: string;
+  days_old: number;
+  is_signed: boolean;
+  is_generic: boolean;
+  status: string; // 'current' | 'aging' | 'outdated' | 'unknown'
+}
+
+const DRV_CATEGORY_ICONS: Record<string, string> = {
+  GPU: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h4v4H6z"/><circle cx="16" cy="12" r="2"/></svg>',
+  Monitor: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>',
+  Audio: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>',
+  Network: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>',
+  Mouse: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="6" y="3" width="12" height="18" rx="6"/><line x1="12" y1="7" x2="12" y2="11"/></svg>',
+  Keyboard: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="6" width="20" height="12" rx="2"/><line x1="6" y1="10" x2="6" y2="10"/><line x1="10" y1="10" x2="10" y2="10"/><line x1="14" y1="10" x2="14" y2="10"/><line x1="18" y1="10" x2="18" y2="10"/><line x1="8" y1="14" x2="16" y2="14"/></svg>',
+  Controller: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="8" width="16" height="8" rx="4"/><circle cx="9" cy="12" r="1" fill="currentColor"/><circle cx="15" cy="12" r="1" fill="currentColor"/></svg>',
+};
+
+const DRV_CATEGORY_LABELS: Record<string, string> = {
+  GPU: 'Placa Gráfica (GPU)',
+  Monitor: 'Monitor',
+  Audio: 'Áudio',
+  Network: 'Rede',
+  Mouse: 'Rato / Mouse',
+  Keyboard: 'Teclado',
+  Controller: 'Controlador de Jogo',
+};
+
+/* ================================================================
+   Feedback / Suggestions — interfaces & logic
+   ================================================================ */
+
+interface FeedbackEntry {
+  id: string;
+  tab: string;
+  description: string;
+  screenshot_b64: string;
+  sent: string;
+  timestamp: string;
+}
+
+const FEEDBACK_CATEGORIES = [
+  { value: 'bug', label: '🐛 Bug / Erro', color: '#ef4444' },
+  { value: 'feature', label: '💡 Sugestão / Feature', color: '#3b82f6' },
+  { value: 'ui', label: '🎨 Interface / UI', color: '#a855f7' },
+  { value: 'perf', label: '⚡ Performance', color: '#f59e0b' },
+  { value: 'other', label: '📝 Outro', color: '#6b7280' },
+];
+
+function getCurrentTabName(): string {
+  const active = document.querySelector('.sidebar-btn.active span');
+  return active?.textContent || 'SYS';
+}
+
+let feedbackScreenshotB64 = '';
+
+async function captureAppScreenshot(): Promise<string> {
+  try {
+    const b64: string = await invoke('capture_screenshot');
+    return b64;
+  } catch (e) {
+    console.warn('Screenshot capture failed:', e);
+    return '';
+  }
+}
+
+function showFeedbackModal(preScreenshot?: string) {
+  const existing = document.querySelector('.fdbk-overlay');
+  if (existing) existing.remove();
+
+  const currentTab = getCurrentTabName();
+  feedbackScreenshotB64 = preScreenshot || '';
+
+  const overlay = document.createElement('div');
+  overlay.className = 'fdbk-overlay';
+
+  overlay.innerHTML = `
+    <div class="fdbk-modal">
+      <div class="fdbk-modal-header">
+        <h3>📝 Nova Sugestão / Feedback</h3>
+        <button class="fdbk-close" id="fdbk-close">&times;</button>
+      </div>
+
+      <div class="fdbk-modal-body">
+        <div class="fdbk-screenshot-area" id="fdbk-screenshot-area">
+          ${feedbackScreenshotB64
+            ? `<img src="data:image/png;base64,${feedbackScreenshotB64}" class="fdbk-screenshot-preview" />`
+            : '<div class="fdbk-screenshot-placeholder">📷 A capturar screenshot...</div>'}
+        </div>
+
+        <div class="fdbk-form">
+          <label class="fdbk-label">Categoria</label>
+          <select id="fdbk-category" class="fdbk-select">
+            ${FEEDBACK_CATEGORIES.map(c => `<option value="${c.value}">${c.label}</option>`).join('')}
+          </select>
+
+          <label class="fdbk-label">Tab Atual</label>
+          <input type="text" id="fdbk-tab" class="fdbk-input" value="${currentTab}" readonly />
+
+          <label class="fdbk-label">Descrição</label>
+          <textarea id="fdbk-desc" class="fdbk-textarea" rows="5" placeholder="Descreve o problema, sugestão ou feedback...\n\nExemplo: O botão X não funciona quando..."></textarea>
+
+          <div class="fdbk-actions">
+            <button class="fdbk-btn fdbk-btn-save" id="fdbk-save">💾 Guardar Local</button>
+            <button class="fdbk-btn fdbk-btn-discord" id="fdbk-send-discord">🎮 Enviar Discord</button>
+            <button class="fdbk-btn fdbk-btn-github" id="fdbk-send-github">🐙 Enviar GitHub</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  document.body.appendChild(overlay);
+
+  // If no screenshot yet, capture it now
+  if (!feedbackScreenshotB64) {
+    captureAppScreenshot().then(b64 => {
+      feedbackScreenshotB64 = b64;
+      const area = document.getElementById('fdbk-screenshot-area');
+      if (area && b64) {
+        area.innerHTML = `<img src="data:image/png;base64,${b64}" class="fdbk-screenshot-preview" />`;
+      } else if (area) {
+        area.innerHTML = '<div class="fdbk-screenshot-placeholder">⚠ Não foi possível capturar screenshot</div>';
+      }
+    });
+  }
+
+  // Close handlers
+  document.getElementById('fdbk-close')!.addEventListener('click', () => overlay.remove());
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+
+  // Save locally
+  document.getElementById('fdbk-save')!.addEventListener('click', async () => {
+    const desc = (document.getElementById('fdbk-desc') as HTMLTextAreaElement).value.trim();
+    const cat = (document.getElementById('fdbk-category') as HTMLSelectElement).value;
+    const tab = (document.getElementById('fdbk-tab') as HTMLInputElement).value;
+    if (!desc) { toast('Escreve uma descrição'); return; }
+
+    const id = crypto.randomUUID();
+    try {
+      await invoke('save_feedback', {
+        id,
+        tab: `[${cat}] ${tab}`,
+        description: desc,
+        screenshotB64: feedbackScreenshotB64,
+        sent: 'local',
+      });
+      toast('✅ Feedback guardado localmente');
+      overlay.remove();
+      refreshFeedbackHistory();
+    } catch (e) {
+      toast(`Erro ao guardar: ${e}`);
+    }
+  });
+
+  // Send to Discord
+  document.getElementById('fdbk-send-discord')!.addEventListener('click', async () => {
+    const desc = (document.getElementById('fdbk-desc') as HTMLTextAreaElement).value.trim();
+    const cat = (document.getElementById('fdbk-category') as HTMLSelectElement).value;
+    const tab = (document.getElementById('fdbk-tab') as HTMLInputElement).value;
+    if (!desc) { toast('Escreve uma descrição'); return; }
+
+    const wh = getDiscordWebhook();
+    if (!wh) { showDiscordModal(() => toast('Webhook guardado. Tenta enviar novamente.')); return; }
+
+    const id = crypto.randomUUID();
+    const fullDesc = `**[${FEEDBACK_CATEGORIES.find(c => c.value === cat)?.label || cat}]** Tab: ${tab}\n\n${desc}`;
+
+    try {
+      const btn = document.getElementById('fdbk-send-discord') as HTMLButtonElement;
+      btn.disabled = true;
+      btn.textContent = '⏳ A enviar...';
+
+      await invoke('send_feedback_discord_with_image', {
+        webhookUrl: wh,
+        description: fullDesc,
+        tab,
+        screenshotB64: feedbackScreenshotB64,
+      });
+
+      // Also save locally
+      await invoke('save_feedback', {
+        id,
+        tab: `[${cat}] ${tab}`,
+        description: desc,
+        screenshotB64: feedbackScreenshotB64,
+        sent: 'discord',
+      });
+
+      toast('✅ Feedback enviado para Discord!');
+      overlay.remove();
+      refreshFeedbackHistory();
+    } catch (e) {
+      toast(`Erro Discord: ${e}`);
+      const btn = document.getElementById('fdbk-send-discord') as HTMLButtonElement;
+      if (btn) { btn.disabled = false; btn.textContent = '🎮 Enviar Discord'; }
+    }
+  });
+
+  // Send to GitHub
+  document.getElementById('fdbk-send-github')!.addEventListener('click', async () => {
+    const desc = (document.getElementById('fdbk-desc') as HTMLTextAreaElement).value.trim();
+    const cat = (document.getElementById('fdbk-category') as HTMLSelectElement).value;
+    const tab = (document.getElementById('fdbk-tab') as HTMLInputElement).value;
+    if (!desc) { toast('Escreve uma descrição'); return; }
+
+    const token = localStorage.getItem('csmooth_github_token') || '';
+    const repo = localStorage.getItem('csmooth_github_repo') || '';
+    if (!token || !repo) {
+      showGitHubConfigModal();
+      return;
+    }
+
+    const id = crypto.randomUUID();
+    const catLabel = FEEDBACK_CATEGORIES.find(c => c.value === cat)?.label || cat;
+    const title = `[${catLabel}] ${desc.substring(0, 80)}`;
+    const body = `## Feedback — Player Agent\n\n**Categoria:** ${catLabel}\n**Tab:** ${tab}\n**Data:** ${new Date().toLocaleString('pt-PT')}\n\n### Descrição\n${desc}\n\n---\n*Enviado automaticamente pelo Player Agent*`;
+
+    try {
+      const btn = document.getElementById('fdbk-send-github') as HTMLButtonElement;
+      btn.disabled = true;
+      btn.textContent = '⏳ A criar issue...';
+
+      await invoke('send_feedback_github', {
+        token,
+        repo,
+        title,
+        body,
+        screenshotB64: feedbackScreenshotB64,
+        labels: ['feedback', cat],
+      });
+
+      await invoke('save_feedback', {
+        id,
+        tab: `[${cat}] ${tab}`,
+        description: desc,
+        screenshotB64: feedbackScreenshotB64,
+        sent: 'github',
+      });
+
+      toast('✅ Issue criada no GitHub!');
+      overlay.remove();
+      refreshFeedbackHistory();
+    } catch (e) {
+      toast(`Erro GitHub: ${e}`);
+      const btn = document.getElementById('fdbk-send-github') as HTMLButtonElement;
+      if (btn) { btn.disabled = false; btn.textContent = '🐙 Enviar GitHub'; }
+    }
+  });
+}
+
+function showGitHubConfigModal() {
+  const existing = document.querySelector('.gh-overlay');
+  if (existing) existing.remove();
+
+  const token = localStorage.getItem('csmooth_github_token') || '';
+  const repo = localStorage.getItem('csmooth_github_repo') || '';
+
+  const overlay = document.createElement('div');
+  overlay.className = 'gh-overlay';
+  overlay.innerHTML = `
+    <div class="ai-modal">
+      <h3>🐙 GitHub Configuration</h3>
+      <label>Personal Access Token</label>
+      <input type="password" id="gh-token" value="${token}" placeholder="ghp_xxxxxxxxxxxx" />
+      <label>Repository (owner/repo)</label>
+      <input type="text" id="gh-repo" value="${repo}" placeholder="username/aim.camp" />
+      <div style="font-size:9px;opacity:0.4;margin-top:6px;">
+        Cria um <a href="#" id="gh-link" style="color:var(--primary);text-decoration:underline;">Personal Access Token</a> no GitHub com permissão "repo" → Issues.
+      </div>
+      <div class="ai-modal-actions">
+        <button class="ai-cancel" id="gh-cancel">Cancelar</button>
+        <button class="ai-save" id="gh-save">Guardar</button>
+      </div>
+    </div>
+  `;
+
+  document.body.appendChild(overlay);
+
+  document.getElementById('gh-cancel')!.addEventListener('click', () => overlay.remove());
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+  document.getElementById('gh-link')?.addEventListener('click', (e) => {
+    e.preventDefault();
+    shellOpen('https://github.com/settings/tokens/new?scopes=repo&description=PlayerAgent+Feedback');
+  });
+
+  document.getElementById('gh-save')!.addEventListener('click', () => {
+    const t = (document.getElementById('gh-token') as HTMLInputElement).value.trim();
+    const r = (document.getElementById('gh-repo') as HTMLInputElement).value.trim();
+    if (t) localStorage.setItem('csmooth_github_token', t);
+    if (r) localStorage.setItem('csmooth_github_repo', r);
+    overlay.remove();
+    toast('GitHub configurado!');
+  });
+}
+
+async function refreshFeedbackHistory() {
+  const el = document.getElementById('fdbk-history');
+  if (!el) return;
+
+  try {
+    const entries = await invoke<FeedbackEntry[]>('load_feedback_history');
+
+    if (!entries || entries.length === 0) {
+      el.innerHTML = `
+        <div class="fdbk-empty">
+          <div class="fdbk-empty-icon">📝</div>
+          <div class="fdbk-empty-text">Sem feedback registado</div>
+          <div class="fdbk-empty-hint">Clique direito em qualquer parte da app para enviar sugestões, ou usa o botão abaixo.</div>
+        </div>`;
+      return;
+    }
+
+    // Sort newest first
+    entries.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+
+    el.innerHTML = `<div class="fdbk-count">${entries.length} feedback${entries.length !== 1 ? 's' : ''} registado${entries.length !== 1 ? 's' : ''}</div>`;
+
+    for (const entry of entries) {
+      const card = document.createElement('div');
+      card.className = 'fdbk-card';
+
+      const sentBadge = entry.sent === 'discord'
+        ? '<span class="fdbk-sent-badge discord">🎮 Discord</span>'
+        : entry.sent === 'github'
+        ? '<span class="fdbk-sent-badge github">🐙 GitHub</span>'
+        : '<span class="fdbk-sent-badge local">💾 Local</span>';
+
+      const dateStr = entry.timestamp
+        ? new Date(entry.timestamp).toLocaleString('pt-PT', { day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit' })
+        : 'N/A';
+
+      card.innerHTML = `
+        <div class="fdbk-card-header">
+          <span class="fdbk-card-tab">${entry.tab}</span>
+          ${sentBadge}
+          <span class="fdbk-card-date">${dateStr}</span>
+          <button class="fdbk-card-delete" data-id="${entry.id}" title="Apagar">🗑</button>
+        </div>
+        ${entry.screenshot_b64 ? `<img src="data:image/png;base64,${entry.screenshot_b64}" class="fdbk-card-thumb" loading="lazy" />` : ''}
+        <div class="fdbk-card-desc">${entry.description}</div>
+      `;
+      el.appendChild(card);
+
+      // Delete handler
+      card.querySelector('.fdbk-card-delete')?.addEventListener('click', async (ev) => {
+        ev.stopPropagation();
+        const id = (ev.currentTarget as HTMLElement).dataset.id;
+        if (!id) return;
+        try {
+          await invoke('delete_feedback', { id });
+          toast('Feedback apagado');
+          refreshFeedbackHistory();
+        } catch (e) {
+          toast(`Erro ao apagar: ${e}`);
+        }
+      });
+
+      // Click to resend
+      card.addEventListener('click', () => {
+        showFeedbackModal(entry.screenshot_b64);
+        const descField = document.getElementById('fdbk-desc') as HTMLTextAreaElement;
+        if (descField) descField.value = entry.description;
+      });
+    }
+  } catch (e) {
+    el.innerHTML = `<div class="fdbk-empty"><div class="fdbk-empty-text">Erro ao carregar histórico: ${e}</div></div>`;
+  }
+}
+
+/* Right-click context menu for feedback */
+function setupFeedbackContextMenu() {
+  let ctxMenu: HTMLElement | null = null;
+
+  function removeMenu() {
+    if (ctxMenu) { ctxMenu.remove(); ctxMenu = null; }
+  }
+
+  document.addEventListener('contextmenu', (e) => {
+    // Don't override on inputs/textareas
+    const target = e.target as HTMLElement;
+    if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT') return;
+    if (target.closest('.fdbk-overlay') || target.closest('.fdbk-context-menu')) return;
+
+    e.preventDefault();
+    removeMenu();
+
+    ctxMenu = document.createElement('div');
+    ctxMenu.className = 'fdbk-context-menu';
+    ctxMenu.innerHTML = `
+      <div class="fdbk-ctx-item" id="fdbk-ctx-suggest">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+        <span>📝 Enviar Sugestão</span>
+      </div>
+      <div class="fdbk-ctx-item" id="fdbk-ctx-bug">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+        <span>🐛 Reportar Bug</span>
+      </div>
+    `;
+
+    // Position
+    const x = Math.min(e.clientX, window.innerWidth - 200);
+    const y = Math.min(e.clientY, window.innerHeight - 80);
+    ctxMenu.style.left = `${x}px`;
+    ctxMenu.style.top = `${y}px`;
+
+    document.body.appendChild(ctxMenu);
+
+    ctxMenu.querySelector('#fdbk-ctx-suggest')?.addEventListener('click', async () => {
+      removeMenu();
+      const b64 = await captureAppScreenshot();
+      showFeedbackModal(b64);
+      // Pre-select "feature"
+      const sel = document.getElementById('fdbk-category') as HTMLSelectElement;
+      if (sel) sel.value = 'feature';
+    });
+
+    ctxMenu.querySelector('#fdbk-ctx-bug')?.addEventListener('click', async () => {
+      removeMenu();
+      const b64 = await captureAppScreenshot();
+      showFeedbackModal(b64);
+      // Pre-select "bug"
+      const sel = document.getElementById('fdbk-category') as HTMLSelectElement;
+      if (sel) sel.value = 'bug';
+    });
+
+    // Close on click outside
+    setTimeout(() => {
+      const handler = (ev: MouseEvent) => {
+        if (ctxMenu && !ctxMenu.contains(ev.target as Node)) {
+          removeMenu();
+          document.removeEventListener('click', handler);
+        }
+      };
+      document.addEventListener('click', handler);
+    }, 50);
+  });
+}
+
+// Initialize context menu
+setupFeedbackContextMenu();
+
+/* ================================================================
+   Benchmark / Frame‑time Analysis
+   ================================================================ */
+
+interface BenchmarkResult {
+  file_name: string;
+  process_name: string;
+  duration_secs: number;
+  frame_count: number;
+  avg_fps: number;
+  min_fps: number;
+  max_fps: number;
+  p01_fps: number;
+  p1_fps: number;
+  p5_fps: number;
+  median_fps: number;
+  p95_fps: number;
+  p99_fps: number;
+  avg_frametime: number;
+  p95_frametime: number;
+  p99_frametime: number;
+  p999_frametime: number;
+  stutter_count: number;
+  stutter_pct: number;
+  dropped_frames: number;
+  frametimes: number[];
+  timestamps: number[];
+  fps_values: number[];
+}
+
+let currentBenchResult: BenchmarkResult | null = null;
+const benchHistory: BenchmarkResult[] = [];
+
+function drawFrametimeChart(canvas: HTMLCanvasElement, result: BenchmarkResult, mode: 'frametime' | 'fps' = 'frametime') {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  ctx.scale(dpr, dpr);
+
+  const w = rect.width;
+  const h = rect.height;
+  const pad = { top: 20, right: 16, bottom: 30, left: 50 };
+  const pw = w - pad.left - pad.right;
+  const ph = h - pad.top - pad.bottom;
+
+  const data = mode === 'fps' ? result.fps_values : result.frametimes;
+  const ts = result.timestamps;
+  if (data.length === 0) return;
+
+  // Find range
+  const sorted = [...data].sort((a, b) => a - b);
+  const yMin = mode === 'fps' ? 0 : 0;
+  // Use P99.5 as max to avoid extreme outliers dominating the chart
+  const p995idx = Math.floor(data.length * 0.995);
+  const yMax = sorted[Math.min(p995idx, sorted.length - 1)] * 1.15;
+  const tMin = ts[0] || 0;
+  const tMax = ts[ts.length - 1] || 1;
+
+  // Background
+  ctx.fillStyle = 'rgba(10,10,18,0.95)';
+  ctx.fillRect(0, 0, w, h);
+
+  // Grid lines
+  ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+  ctx.lineWidth = 0.5;
+  const gridSteps = 5;
+  for (let i = 0; i <= gridSteps; i++) {
+    const y = pad.top + (ph * i / gridSteps);
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + pw, y); ctx.stroke();
+    // Label
+    const val = yMax - (yMax - yMin) * i / gridSteps;
+    ctx.fillStyle = 'rgba(255,255,255,0.3)';
+    ctx.font = '9px JetBrains Mono, monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText(val.toFixed(mode === 'fps' ? 0 : 1) + (mode === 'fps' ? '' : 'ms'), pad.left - 4, y + 3);
+  }
+
+  // Time labels
+  ctx.fillStyle = 'rgba(255,255,255,0.25)';
+  ctx.textAlign = 'center';
+  for (let i = 0; i <= 5; i++) {
+    const x = pad.left + pw * i / 5;
+    const t = tMin + (tMax - tMin) * i / 5;
+    ctx.fillText(t.toFixed(1) + 's', x, h - 6);
+  }
+
+  // Average line
+  const avgVal = mode === 'fps' ? result.avg_fps : result.avg_frametime;
+  const avgY = pad.top + ph * (1 - (avgVal - yMin) / (yMax - yMin));
+  if (avgY > pad.top && avgY < pad.top + ph) {
+    ctx.strokeStyle = 'rgba(0,255,170,0.3)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(pad.left, avgY); ctx.lineTo(pad.left + pw, avgY); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = 'rgba(0,255,170,0.5)';
+    ctx.textAlign = 'left';
+    ctx.fillText(`avg ${avgVal.toFixed(mode === 'fps' ? 0 : 1)}`, pad.left + pw + 2, avgY + 3);
+  }
+
+  // 1% low line (for FPS mode)
+  if (mode === 'fps') {
+    const p1Y = pad.top + ph * (1 - (result.p1_fps - yMin) / (yMax - yMin));
+    if (p1Y > pad.top && p1Y < pad.top + ph) {
+      ctx.strokeStyle = 'rgba(255,107,107,0.3)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.moveTo(pad.left, p1Y); ctx.lineTo(pad.left + pw, p1Y); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = 'rgba(255,107,107,0.5)';
+      ctx.fillText(`1% low ${result.p1_fps.toFixed(0)}`, pad.left + pw + 2, p1Y + 3);
+    }
+  }
+
+  // Data line
+  ctx.strokeStyle = mode === 'fps' ? 'rgba(0,180,255,0.85)' : 'rgba(255,180,60,0.85)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let i = 0; i < data.length; i++) {
+    const x = pad.left + ((ts[i] - tMin) / (tMax - tMin)) * pw;
+    const y = pad.top + ph * (1 - (Math.min(data[i], yMax) - yMin) / (yMax - yMin));
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // Stutter highlights (frametime mode)
+  if (mode === 'frametime') {
+    const threshold = result.avg_frametime * 2.5;
+    ctx.fillStyle = 'rgba(255,60,60,0.25)';
+    for (let i = 0; i < data.length; i++) {
+      if (data[i] > threshold) {
+        const x = pad.left + ((ts[i] - tMin) / (tMax - tMin)) * pw;
+        ctx.fillRect(x - 1, pad.top, 2, ph);
+      }
+    }
+  }
+
+  // Title
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.font = '10px JetBrains Mono, monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText(mode === 'fps' ? 'FPS over time' : 'Frame Time (ms) over time', pad.left, pad.top - 6);
+}
+
+function drawFpsHistogram(canvas: HTMLCanvasElement, result: BenchmarkResult) {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  ctx.scale(dpr, dpr);
+
+  const w = rect.width;
+  const h = rect.height;
+  const pad = { top: 20, right: 16, bottom: 30, left: 40 };
+  const pw = w - pad.left - pad.right;
+  const ph = h - pad.top - pad.bottom;
+
+  if (result.fps_values.length === 0) return;
+
+  // Create histogram bins
+  const nbins = 30;
+  const fpsMin = Math.floor(result.p01_fps * 0.8);
+  const fpsMax = Math.ceil(result.p99_fps * 1.1);
+  const binWidth = (fpsMax - fpsMin) / nbins;
+  const bins = new Array(nbins).fill(0);
+
+  for (const fps of result.fps_values) {
+    const idx = Math.floor((fps - fpsMin) / binWidth);
+    if (idx >= 0 && idx < nbins) bins[idx]++;
+  }
+
+  const maxBin = Math.max(...bins, 1);
+
+  // Background
+  ctx.fillStyle = 'rgba(10,10,18,0.95)';
+  ctx.fillRect(0, 0, w, h);
+
+  // Draw bars
+  const barW = pw / nbins - 1;
+  for (let i = 0; i < nbins; i++) {
+    const x = pad.left + (i / nbins) * pw;
+    const barH = (bins[i] / maxBin) * ph;
+    const y = pad.top + ph - barH;
+
+    const fps = fpsMin + i * binWidth;
+    const isLow = fps < result.p1_fps;
+    const isAvg = fps >= result.avg_fps - binWidth && fps <= result.avg_fps + binWidth;
+
+    ctx.fillStyle = isLow ? 'rgba(255,107,107,0.6)' : isAvg ? 'rgba(0,255,170,0.6)' : 'rgba(0,150,255,0.4)';
+    ctx.fillRect(x, y, barW, barH);
+  }
+
+  // Labels
+  ctx.fillStyle = 'rgba(255,255,255,0.3)';
+  ctx.font = '9px JetBrains Mono, monospace';
+  ctx.textAlign = 'center';
+  for (let i = 0; i <= 5; i++) {
+    const fps = fpsMin + (fpsMax - fpsMin) * i / 5;
+    const x = pad.left + (i / 5) * pw;
+    ctx.fillText(fps.toFixed(0) + ' fps', x, h - 6);
+  }
+
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.textAlign = 'left';
+  ctx.fillText('FPS Distribution', pad.left, pad.top - 6);
+}
+
+async function importBenchmarkFile() {
+  try {
+    const path = await invoke<string>('pick_benchmark_file');
+    const result = await invoke<BenchmarkResult>('parse_benchmark_file', { path });
+    currentBenchResult = result;
+    benchHistory.push(result);
+    displayBenchmarkResult(result);
+    toast(`Benchmark carregado: ${result.file_name}`);
+  } catch (e) {
+    if (String(e) !== 'Cancelled') toast(`Erro: ${e}`, true);
+  }
+}
+
+async function scanCapFrameX() {
+  try {
+    const files = await invoke<string[]>('scan_capframex_folder');
+    if (files.length === 0) {
+      toast('CapFrameX não encontrado ou sem capturas');
+      return;
+    }
+    showCapFrameXPicker(files);
+  } catch (e) {
+    toast(`Erro: ${e}`, true);
+  }
+}
+
+function showCapFrameXPicker(files: string[]) {
+  const existing = document.querySelector('.cx-overlay');
+  if (existing) existing.remove();
+
+  const overlay = document.createElement('div');
+  overlay.className = 'cx-overlay fdbk-overlay';
+  overlay.innerHTML = `
+    <div class="fdbk-modal" style="max-height:80vh;">
+      <div class="fdbk-modal-header">
+        <h3>CapFrameX Captures (${files.length})</h3>
+        <button class="fdbk-close" id="cx-close">&times;</button>
+      </div>
+      <div class="fdbk-modal-body" style="max-height:60vh;overflow-y:auto;">
+        ${files.map(f => {
+          const name = f.split('\\').pop() || f;
+          return `<div class="cx-file-item" data-path="${f}" title="${f}">${name}</div>`;
+        }).join('')}
+      </div>
+    </div>
+  `;
+
+  document.body.appendChild(overlay);
+  document.getElementById('cx-close')!.addEventListener('click', () => overlay.remove());
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+
+  overlay.querySelectorAll('.cx-file-item').forEach(el => {
+    el.addEventListener('click', async () => {
+      const path = (el as HTMLElement).dataset.path;
+      if (!path) return;
+      overlay.remove();
+      try {
+        const result = await invoke<BenchmarkResult>('parse_benchmark_file', { path });
+        currentBenchResult = result;
+        benchHistory.push(result);
+        displayBenchmarkResult(result);
+        toast(`Benchmark carregado: ${result.file_name}`);
+      } catch (e) {
+        toast(`Erro ao analisar: ${e}`, true);
+      }
+    });
+  });
+}
+
+function displayBenchmarkResult(r: BenchmarkResult) {
+  const el = document.getElementById('bench-content');
+  if (!el) return;
+
+  el.innerHTML = '';
+
+  // Header info
+  const info = document.createElement('div');
+  info.className = 'bench-info';
+  info.innerHTML = `
+    <span class="bench-info-label">📂 ${r.file_name}</span>
+    <span class="bench-info-process">🎮 ${r.process_name}</span>
+    <span class="bench-info-duration">⏱ ${r.duration_secs.toFixed(1)}s</span>
+    <span class="bench-info-frames">${r.frame_count.toLocaleString()} frames</span>
+  `;
+  el.appendChild(info);
+
+  // Metrics grid
+  const metrics = document.createElement('div');
+  metrics.className = 'bench-metrics';
+
+  const metricItems = [
+    { label: 'AVG FPS', value: r.avg_fps.toFixed(1), cls: 'primary' },
+    { label: '1% LOW', value: r.p1_fps.toFixed(1), cls: r.p1_fps < r.avg_fps * 0.5 ? 'bad' : 'warn' },
+    { label: '0.1% LOW', value: r.p01_fps.toFixed(1), cls: r.p01_fps < r.avg_fps * 0.3 ? 'bad' : 'warn' },
+    { label: 'MEDIAN', value: r.median_fps.toFixed(1), cls: '' },
+    { label: 'MAX', value: r.max_fps.toFixed(0), cls: '' },
+    { label: 'MIN', value: r.min_fps.toFixed(0), cls: r.min_fps < 30 ? 'bad' : '' },
+    { label: 'AVG FT', value: r.avg_frametime.toFixed(2) + 'ms', cls: '' },
+    { label: 'P99 FT', value: r.p99_frametime.toFixed(2) + 'ms', cls: r.p99_frametime > 33.3 ? 'bad' : '' },
+    { label: 'STUTTERS', value: `${r.stutter_count} (${r.stutter_pct.toFixed(1)}%)`, cls: r.stutter_pct > 2 ? 'bad' : r.stutter_pct > 0.5 ? 'warn' : '' },
+    { label: 'DROPPED', value: `${r.dropped_frames}`, cls: r.dropped_frames > 0 ? 'warn' : '' },
+  ];
+
+  for (const m of metricItems) {
+    const card = document.createElement('div');
+    card.className = `bench-metric-card ${m.cls}`;
+    card.innerHTML = `<div class="bench-metric-val">${m.value}</div><div class="bench-metric-label">${m.label}</div>`;
+    metrics.appendChild(card);
+  }
+  el.appendChild(metrics);
+
+  // CS2 context assessment
+  const assessment = document.createElement('div');
+  assessment.className = 'bench-assessment';
+  const tips: string[] = [];
+  if (r.avg_fps >= 300) tips.push('✅ Excelente! FPS médio acima de 300 — ideal para monitores de 240Hz+.');
+  else if (r.avg_fps >= 200) tips.push('👍 Bom desempenho. FPS médio adequado para monitores de 144Hz-240Hz.');
+  else if (r.avg_fps >= 144) tips.push('⚠ FPS médio ok para 144Hz, mas podes sentir drops em fights intensos.');
+  else tips.push('🔴 FPS médio baixo para CS2 competitivo. Considera baixar definições gráficas.');
+
+  if (r.p1_fps < r.avg_fps * 0.4) tips.push('⚠ 1% Low muito abaixo da média — indica micro-stutters significativos.');
+  if (r.stutter_pct > 2) tips.push('🔴 Taxa de stutters elevada (>' + r.stutter_pct.toFixed(1) + '%). Verifica processos em background e drivers.');
+  if (r.stutter_pct <= 0.5 && r.p1_fps > r.avg_fps * 0.6) tips.push('✅ Frame pacing consistente — experiência fluida.');
+  if (r.dropped_frames > 5) tips.push('⚠ Frames dropped detectados — pode indicar bottleneck de GPU ou VSync issues.');
+
+  assessment.innerHTML = `<div class="bench-assessment-title">🎮 Análise CS2</div>` + tips.map(t => `<div class="bench-tip">${t}</div>`).join('');
+  el.appendChild(assessment);
+
+  // Chart mode toggle
+  const chartControls = document.createElement('div');
+  chartControls.className = 'bench-chart-controls';
+  chartControls.innerHTML = `
+    <button class="bench-chart-btn active" data-mode="frametime">Frame Time</button>
+    <button class="bench-chart-btn" data-mode="fps">FPS</button>
+  `;
+  el.appendChild(chartControls);
+
+  // Frame time chart
+  const chartCanvas = document.createElement('canvas');
+  chartCanvas.className = 'bench-chart-canvas';
+  chartCanvas.style.cssText = 'width:100%;height:200px;border-radius:6px;';
+  el.appendChild(chartCanvas);
+
+  // FPS histogram
+  const histCanvas = document.createElement('canvas');
+  histCanvas.className = 'bench-hist-canvas';
+  histCanvas.style.cssText = 'width:100%;height:140px;border-radius:6px;margin-top:8px;';
+  el.appendChild(histCanvas);
+
+  // Draw initial charts
+  requestAnimationFrame(() => {
+    drawFrametimeChart(chartCanvas, r, 'frametime');
+    drawFpsHistogram(histCanvas, r);
+  });
+
+  // Chart mode toggle handlers
+  chartControls.querySelectorAll('.bench-chart-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      chartControls.querySelectorAll('.bench-chart-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      const mode = (btn as HTMLElement).dataset.mode as 'frametime' | 'fps';
+      drawFrametimeChart(chartCanvas, r, mode);
+    });
+  });
+
+  // Comparison section (if multiple benchmarks)
+  if (benchHistory.length > 1) {
+    const cmpDiv = document.createElement('div');
+    cmpDiv.className = 'bench-comparison';
+    cmpDiv.innerHTML = `<div class="bench-assessment-title">📊 Comparação (${benchHistory.length} capturas)</div>`;
+
+    const cmpTable = document.createElement('table');
+    cmpTable.className = 'drv-table';
+    cmpTable.innerHTML = `
+      <thead><tr><th>Ficheiro</th><th>Processo</th><th>AVG FPS</th><th>1% Low</th><th>0.1% Low</th><th>Stutters</th><th>Duração</th></tr></thead>
+      <tbody>${benchHistory.map(b => `
+        <tr>
+          <td class="drv-device">${b.file_name}</td>
+          <td>${b.process_name}</td>
+          <td class="bench-metric-val">${b.avg_fps.toFixed(1)}</td>
+          <td>${b.p1_fps.toFixed(1)}</td>
+          <td>${b.p01_fps.toFixed(1)}</td>
+          <td>${b.stutter_count} (${b.stutter_pct.toFixed(1)}%)</td>
+          <td>${b.duration_secs.toFixed(1)}s</td>
+        </tr>`).join('')}
+      </tbody>
+    `;
+    cmpDiv.appendChild(cmpTable);
+    el.appendChild(cmpDiv);
+  }
+}
+
+async function refreshDriverInfo() {
+  const el = document.getElementById('drv-content');
+  if (!el) return;
+  el.innerHTML = '<div class="net-status">A analisar drivers do sistema e periféricos...</div>';
+  try {
+    const drivers = await invoke<DriverEntry[]>('get_driver_info');
+    el.innerHTML = '';
+
+    // Summary stats
+    const totalCount = drivers.length;
+    const genericCount = drivers.filter(d => d.is_generic).length;
+    const outdatedCount = drivers.filter(d => d.status === 'outdated').length;
+    const agingCount = drivers.filter(d => d.status === 'aging').length;
+    const currentCount = drivers.filter(d => d.status === 'current').length;
+
+    const summary = document.createElement('div');
+    summary.className = 'drv-summary';
+    summary.innerHTML = `
+      <div class="drv-summary-item"><span class="drv-summary-val">${totalCount}</span><span class="drv-summary-label">Total</span></div>
+      <div class="drv-summary-item"><span class="drv-summary-val${genericCount > 0 ? ' warn' : ''}">${genericCount}</span><span class="drv-summary-label">Genéricos</span></div>
+      <div class="drv-summary-item"><span class="drv-summary-val${outdatedCount > 0 ? ' bad' : ''}">${outdatedCount}</span><span class="drv-summary-label">Desatualizados</span></div>
+      <div class="drv-summary-item"><span class="drv-summary-val${agingCount > 0 ? ' warn' : ''}">${agingCount}</span><span class="drv-summary-label">&gt;6 meses</span></div>
+      <div class="drv-summary-item"><span class="drv-summary-val">${currentCount}</span><span class="drv-summary-label">Atuais</span></div>
+    `;
+    el.appendChild(summary);
+
+    // Gaming-specific recommendations
+    const tips: string[] = [];
+    const gpuDrivers = drivers.filter(d => d.category === 'GPU');
+    const mouseDrivers = drivers.filter(d => d.category === 'Mouse');
+    const audioDrivers = drivers.filter(d => d.category === 'Audio');
+    const netDrivers = drivers.filter(d => d.category === 'Network');
+
+    for (const gd of gpuDrivers) {
+      if (gd.is_generic) tips.push('⚠ A tua GPU usa uma driver <b>genérica Microsoft</b>. Instala a driver oficial da NVIDIA/AMD para teres o melhor desempenho em CS2.');
+      if (gd.status === 'outdated') tips.push('⚠ A driver da GPU tem <b>mais de 1 ano</b>. Considera atualizar para a versão Game Ready mais recente para CS2.');
+      if (gd.driver_provider?.toLowerCase().includes('nvidia') && gd.status !== 'current') tips.push('💡 Para NVIDIA: usa <b>GeForce Experience</b> ou <b>nvidia.com/drivers</b> para obter drivers Game Ready otimizados para CS2.');
+      if (gd.driver_provider?.toLowerCase().includes('amd') && gd.status !== 'current') tips.push('💡 Para AMD: usa <b>AMD Adrenalin</b> para instalar drivers otimizados. Ativa <b>Anti-Lag</b> para CS2.');
+    }
+    for (const md of mouseDrivers) {
+      if (md.is_generic) tips.push(`⚠ O rato "<b>${md.device_name}</b>" usa driver genérico. Instala o software do fabricante (ex: Logitech G Hub, Razer Synapse, SteelSeries GG) para polling rate e DPI corretos.`);
+    }
+    for (const ad of audioDrivers) {
+      if (ad.is_generic) tips.push(`💡 Dispositivo de áudio "<b>${ad.device_name}</b>" usa driver genérico. Para menor latência sonora, instala a driver do fabricante (ex: Realtek HD Audio, SteelSeries Sonar).`);
+    }
+    for (const nd of netDrivers) {
+      if (nd.is_generic) tips.push(`💡 Adaptador de rede "<b>${nd.device_name}</b>" usa driver genérico. A driver do fabricante (Intel, Realtek, Killer) pode melhorar a latência de rede.`);
+    }
+    if (genericCount === 0 && outdatedCount === 0) tips.push('✅ Excelente! Todos os teus drivers são do fabricante e estão atualizados. O teu setup está otimizado.');
+
+    if (tips.length > 0) {
+      const tipsDiv = document.createElement('div');
+      tipsDiv.className = 'drv-tips';
+      tipsDiv.innerHTML = `<div class="drv-tips-header">🎮 Recomendações para CS2</div>` + tips.map(t => `<div class="drv-tip-item">${t}</div>`).join('');
+      el.appendChild(tipsDiv);
+    }
+
+    // Group by category
+    const groups: Record<string, DriverEntry[]> = {};
+    for (const d of drivers) {
+      if (!groups[d.category]) groups[d.category] = [];
+      groups[d.category].push(d);
+    }
+
+    const grid = document.createElement('div');
+    grid.className = 'drv-grid';
+
+    const catOrder = ['GPU', 'Monitor', 'Audio', 'Network', 'Mouse', 'Keyboard', 'Controller'];
+    for (const cat of catOrder) {
+      const items = groups[cat];
+      if (!items || items.length === 0) continue;
+
+      const catDiv = document.createElement('div');
+      catDiv.className = 'drv-category';
+
+      const catHeader = document.createElement('div');
+      catHeader.className = 'drv-category-header';
+      const hasIssues = items.some(d => d.is_generic || d.status === 'outdated');
+      catHeader.innerHTML = `${DRV_CATEGORY_ICONS[cat] || ''}<span>${DRV_CATEGORY_LABELS[cat] || cat}</span>${hasIssues ? '<span class="drv-cat-warn">⚠</span>' : '<span class="drv-cat-ok">✔</span>'}<span class="drv-cat-count">${items.length} driver${items.length > 1 ? 's' : ''}</span>`;
+      catDiv.appendChild(catHeader);
+
+      const table = document.createElement('table');
+      table.className = 'drv-table';
+      const thead = document.createElement('thead');
+      thead.innerHTML = `<tr><th>Dispositivo</th><th>Driver</th><th>Versão</th><th>Fornecedor</th><th>Tipo</th><th>Estado</th><th>Data</th><th>Assinado</th></tr>`;
+      table.appendChild(thead);
+
+      const tbody = document.createElement('tbody');
+      for (const d of items) {
+        const tr = document.createElement('tr');
+        if (d.is_generic || d.status === 'outdated') tr.className = 'drv-row-warn';
+
+        // Type badge
+        const typeBadge = d.is_generic
+          ? '<span class="drv-badge generic">Genérico</span>'
+          : '<span class="drv-badge manufacturer">Fabricante</span>';
+
+        // Status badge
+        let statusBadge = '<span class="drv-badge unknown">?</span>';
+        if (d.status === 'current')  statusBadge = '<span class="drv-badge current">Atual</span>';
+        if (d.status === 'aging')    statusBadge = '<span class="drv-badge aging">&gt;6m</span>';
+        if (d.status === 'outdated') statusBadge = '<span class="drv-badge outdated">Desatualizado</span>';
+
+        // Signed
+        const signedHtml = d.is_signed
+          ? '<span class="drv-signed yes">&#10004;</span>'
+          : '<span class="drv-signed no">&#10008;</span>';
+
+        tr.innerHTML = `
+          <td class="drv-device" title="${d.device_name}">${d.device_name}</td>
+          <td class="drv-driver" title="${d.driver_name}">${d.driver_name}</td>
+          <td class="drv-version">${d.driver_version}</td>
+          <td class="drv-provider" title="${d.manufacturer}">${d.driver_provider || d.manufacturer || 'N/A'}</td>
+          <td>${typeBadge}</td>
+          <td>${statusBadge}</td>
+          <td class="drv-date">${d.driver_date || 'N/A'}</td>
+          <td>${signedHtml}</td>
+        `;
+        tbody.appendChild(tr);
+      }
+      table.appendChild(tbody);
+      catDiv.appendChild(table);
+      grid.appendChild(catDiv);
+    }
+
+    el.appendChild(grid);
+  } catch (e) {
+    el.innerHTML = `<div class="net-status">Falha ao analisar drivers: ${e}</div>`;
+  }
+}
+
 async function refreshHardwareInfo() {
   const el = document.getElementById('hw-content');
   if (!el) return;
@@ -2161,6 +3156,11 @@ function build() {
   btnHwTab.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg><span>HW</span>`;
   btnHwTab.title = 'Hardware Info';
 
+  const btnDrvTab = document.createElement('button');
+  btnDrvTab.className = 'sidebar-btn';
+  btnDrvTab.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><path d="M12 18v-6"/><path d="M9 15l3 3 3-3"/></svg><span>DRVR</span>`;
+  btnDrvTab.title = 'Drivers';
+
   const btnProcTab = document.createElement('button');
   btnProcTab.className = 'sidebar-btn';
   btnProcTab.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg><span>PROC</span>`;
@@ -2175,6 +3175,16 @@ function build() {
   btnDemoTab.className = 'sidebar-btn';
   btnDemoTab.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="5 3 19 12 5 21 5 3"/></svg><span>DEMO</span>`;
   btnDemoTab.title = 'Demo Review';
+
+  const btnFdbkTab = document.createElement('button');
+  btnFdbkTab.className = 'sidebar-btn';
+  btnFdbkTab.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg><span>FDBK</span>`;
+  btnFdbkTab.title = 'Feedback & Sugestões';
+
+  const btnBenchTab = document.createElement('button');
+  btnBenchTab.className = 'sidebar-btn';
+  btnBenchTab.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M18 20V10"/><path d="M12 20V4"/><path d="M6 20v-6"/></svg><span>BNCH</span>`;
+  btnBenchTab.title = 'Benchmark & Frame Analysis';
 
   /* ── Community placeholder buttons ─────────────────────────── */
   const sidebarSep = document.createElement('div');
@@ -2211,9 +3221,12 @@ function build() {
   sidebar.appendChild(btnSys);
   sidebar.appendChild(btnCfgTab);
   sidebar.appendChild(btnHwTab);
+  sidebar.appendChild(btnDrvTab);
   sidebar.appendChild(btnProcTab);
   sidebar.appendChild(btnNetTab);
   sidebar.appendChild(btnDemoTab);
+  sidebar.appendChild(btnFdbkTab);
+  sidebar.appendChild(btnBenchTab);
   sidebar.appendChild(sidebarSep);
   sidebar.appendChild(sidebarLabel);
   sidebar.appendChild(btnRankTab);
@@ -2222,15 +3235,18 @@ function build() {
   sidebar.appendChild(btnHubTab);
   sidebar.appendChild(watermark);
 
-  type TabId = 'sys' | 'cfg' | 'hw' | 'proc' | 'net' | 'demo' | 'rank' | 'servers' | 'market' | 'hub';
-  const allBtns = [btnSys, btnCfgTab, btnHwTab, btnProcTab, btnNetTab, btnDemoTab, btnRankTab, btnServersTab, btnMarketTab, btnHubTab];
+  type TabId = 'sys' | 'cfg' | 'hw' | 'drv' | 'proc' | 'net' | 'demo' | 'fdbk' | 'bench' | 'rank' | 'servers' | 'market' | 'hub';
+  const allBtns = [btnSys, btnCfgTab, btnHwTab, btnDrvTab, btnProcTab, btnNetTab, btnDemoTab, btnFdbkTab, btnBenchTab, btnRankTab, btnServersTab, btnMarketTab, btnHubTab];
   const tabIds: { btn: HTMLButtonElement; tabId: string }[] = [
     { btn: btnSys, tabId: 'tab-optimizer' },
     { btn: btnCfgTab, tabId: 'tab-cfg' },
     { btn: btnHwTab, tabId: 'tab-hw' },
+    { btn: btnDrvTab, tabId: 'tab-drv' },
     { btn: btnProcTab, tabId: 'tab-proc' },
     { btn: btnNetTab, tabId: 'tab-net' },
     { btn: btnDemoTab, tabId: 'tab-demo' },
+    { btn: btnFdbkTab, tabId: 'tab-fdbk' },
+    { btn: btnBenchTab, tabId: 'tab-bench' },
     { btn: btnRankTab, tabId: 'tab-rank' },
     { btn: btnServersTab, tabId: 'tab-servers' },
     { btn: btnMarketTab, tabId: 'tab-market' },
@@ -2238,21 +3254,26 @@ function build() {
   ];
 
   function switchTab(t: TabId) {
-    const idx = ['sys','cfg','hw','proc','net','demo','rank','servers','market','hub'].indexOf(t);
+    const idx = ['sys','cfg','hw','drv','proc','net','demo','fdbk','bench','rank','servers','market','hub'].indexOf(t);
     allBtns.forEach((b, i) => b.classList.toggle('active', i === idx));
     tabIds.forEach((ti, i) => {
       document.getElementById(ti.tabId)?.classList.toggle('active', i === idx);
     });
     // auto-load data on first switch
     if (t === 'hw' && !document.querySelector('.hw-grid')) refreshHardwareInfo();
+    if (t === 'drv' && !document.querySelector('.drv-grid')) refreshDriverInfo();
     if (t === 'proc' && !document.querySelector('.proc-item')) refreshProcesses();
+    if (t === 'fdbk' && !document.querySelector('.fdbk-card') && !document.querySelector('.fdbk-empty')) refreshFeedbackHistory();
   }
   btnSys.addEventListener('click', () => switchTab('sys'));
   btnCfgTab.addEventListener('click', () => switchTab('cfg'));
   btnHwTab.addEventListener('click', () => switchTab('hw'));
+  btnDrvTab.addEventListener('click', () => switchTab('drv'));
   btnProcTab.addEventListener('click', () => switchTab('proc'));
   btnNetTab.addEventListener('click', () => switchTab('net'));
   btnDemoTab.addEventListener('click', () => switchTab('demo'));
+  btnFdbkTab.addEventListener('click', () => switchTab('fdbk'));
+  btnBenchTab.addEventListener('click', () => switchTab('bench'));
   btnRankTab.addEventListener('click', () => switchTab('rank'));
   btnServersTab.addEventListener('click', () => switchTab('servers'));
   btnMarketTab.addEventListener('click', () => switchTab('market'));
@@ -2908,6 +3929,41 @@ function build() {
   hwSig.appendChild(hwSigText);
   tabHw.appendChild(hwSig);
 
+  /* ── Tab: Drivers ────────────────────────────────────────────── */
+  const tabDrv = document.createElement('div');
+  tabDrv.id = 'tab-drv';
+  tabDrv.className = 'tab-panel';
+
+  const drvHeader = document.createElement('section');
+  drvHeader.className = 'hw-actions';
+  drvHeader.style.cssText = 'display:flex;gap:8px;padding:10px 12px;align-items:center;';
+  const btnDrvRefresh = document.createElement('button');
+  btnDrvRefresh.className = 'btn-export';
+  btnDrvRefresh.textContent = 'Analisar Drivers';
+  btnDrvRefresh.title = 'Analisar drivers do sistema e periféricos via WMI';
+  btnDrvRefresh.addEventListener('click', refreshDriverInfo);
+  const drvInfo = document.createElement('span');
+  drvInfo.style.cssText = 'font-size:10px;opacity:0.5;';
+  drvInfo.textContent = 'Detecta drivers GPU, áudio, rede, rato, teclado e controladores. Verifica se são genéricos ou do fabricante.';
+  drvHeader.appendChild(btnDrvRefresh);
+  drvHeader.appendChild(drvInfo);
+  tabDrv.appendChild(drvHeader);
+
+  const drvContent = document.createElement('div');
+  drvContent.id = 'drv-content';
+  drvContent.style.cssText = 'padding:0;flex:1;overflow-y:auto;';
+  drvContent.innerHTML = '<div class="net-status">Clique "Analisar Drivers" para verificar os drivers do seu sistema</div>';
+  tabDrv.appendChild(drvContent);
+
+  const drvSig = document.createElement('section');
+  drvSig.className = 'cfg-actions';
+  drvSig.style.marginTop = 'auto';
+  const drvSigText = document.createElement('div');
+  drvSigText.className = 'app-signature';
+  drvSigText.innerHTML = `<span class="sig-by">by</span> <span class="sig-name">Rqdiniz</span> <span class="sig-tag">[ bu- ]</span>`;
+  drvSig.appendChild(drvSigText);
+  tabDrv.appendChild(drvSig);
+
   /* ── Tab: Process Manager ────────────────────────────────────── */
   const tabProc = document.createElement('div');
   tabProc.id = 'tab-proc';
@@ -3166,6 +4222,125 @@ function build() {
     return tab;
   }
 
+  /* ── Tab: Feedback & Sugestões ───────────────────────────────── */
+  const tabFdbk = document.createElement('div');
+  tabFdbk.id = 'tab-fdbk';
+  tabFdbk.className = 'tab-panel';
+
+  const fdbkToolbar = document.createElement('section');
+  fdbkToolbar.className = 'hw-actions';
+  fdbkToolbar.style.cssText = 'display:flex;gap:8px;padding:10px 12px;align-items:center;flex-wrap:wrap;';
+
+  const btnFdbkNew = document.createElement('button');
+  btnFdbkNew.className = 'btn-export';
+  btnFdbkNew.textContent = '📝 Nova Sugestão';
+  btnFdbkNew.title = 'Abrir formulário de feedback';
+  btnFdbkNew.addEventListener('click', async () => {
+    const b64 = await captureAppScreenshot();
+    showFeedbackModal(b64);
+  });
+
+  const btnFdbkRefresh = document.createElement('button');
+  btnFdbkRefresh.className = 'btn-import';
+  btnFdbkRefresh.textContent = '🔄 Atualizar';
+  btnFdbkRefresh.title = 'Recarregar histórico';
+  btnFdbkRefresh.addEventListener('click', refreshFeedbackHistory);
+
+  const btnFdbkGhCfg = document.createElement('button');
+  btnFdbkGhCfg.className = 'btn-import';
+  btnFdbkGhCfg.textContent = '🐙 GitHub';
+  btnFdbkGhCfg.title = 'Configurar GitHub';
+  btnFdbkGhCfg.addEventListener('click', showGitHubConfigModal);
+
+  const btnFdbkDiscordCfg = document.createElement('button');
+  btnFdbkDiscordCfg.className = 'btn-import';
+  btnFdbkDiscordCfg.textContent = '🎮 Discord';
+  btnFdbkDiscordCfg.title = 'Configurar Discord Webhook';
+  btnFdbkDiscordCfg.addEventListener('click', () => showDiscordModal());
+
+  const fdbkInfo = document.createElement('span');
+  fdbkInfo.style.cssText = 'font-size:10px;opacity:0.5;flex:1;';
+  fdbkInfo.textContent = 'Clique direito em qualquer parte da app para enviar feedback rápido.';
+
+  fdbkToolbar.appendChild(btnFdbkNew);
+  fdbkToolbar.appendChild(btnFdbkRefresh);
+  fdbkToolbar.appendChild(btnFdbkGhCfg);
+  fdbkToolbar.appendChild(btnFdbkDiscordCfg);
+  fdbkToolbar.appendChild(fdbkInfo);
+  tabFdbk.appendChild(fdbkToolbar);
+
+  const fdbkHistory = document.createElement('div');
+  fdbkHistory.id = 'fdbk-history';
+  fdbkHistory.style.cssText = 'padding:8px 12px;flex:1;overflow-y:auto;';
+  fdbkHistory.innerHTML = '<div class="fdbk-empty"><div class="fdbk-empty-icon">📝</div><div class="fdbk-empty-text">Sem feedback registado</div><div class="fdbk-empty-hint">Clique direito em qualquer parte da app para enviar sugestões, ou usa o botão acima.</div></div>';
+  tabFdbk.appendChild(fdbkHistory);
+
+  const fdbkSig = document.createElement('section');
+  fdbkSig.className = 'cfg-actions';
+  fdbkSig.style.marginTop = 'auto';
+  const fdbkSigText = document.createElement('div');
+  fdbkSigText.className = 'app-signature';
+  fdbkSigText.innerHTML = `<span class="sig-by">by</span> <span class="sig-name">Rqdiniz</span> <span class="sig-tag">[ bu- ]</span>`;
+  fdbkSig.appendChild(fdbkSigText);
+  tabFdbk.appendChild(fdbkSig);
+
+  /* ── Tab: Benchmark / Frame Analysis ─────────────────────────── */
+  const tabBench = document.createElement('div');
+  tabBench.id = 'tab-bench';
+  tabBench.className = 'tab-panel';
+
+  const benchToolbar = document.createElement('section');
+  benchToolbar.className = 'hw-actions';
+  benchToolbar.style.cssText = 'display:flex;gap:8px;padding:10px 12px;align-items:center;flex-wrap:wrap;';
+
+  const btnBenchImport = document.createElement('button');
+  btnBenchImport.className = 'btn-export';
+  btnBenchImport.textContent = '📂 Importar CSV/JSON';
+  btnBenchImport.title = 'Importar ficheiro PresentMon CSV ou CapFrameX JSON';
+  btnBenchImport.addEventListener('click', importBenchmarkFile);
+
+  const btnBenchCX = document.createElement('button');
+  btnBenchCX.className = 'btn-import';
+  btnBenchCX.textContent = '📦 CapFrameX';
+  btnBenchCX.title = 'Procurar capturas CapFrameX';
+  btnBenchCX.addEventListener('click', scanCapFrameX);
+
+  const btnBenchClear = document.createElement('button');
+  btnBenchClear.className = 'btn-import';
+  btnBenchClear.textContent = '🗑 Limpar';
+  btnBenchClear.title = 'Limpar dados de benchmark';
+  btnBenchClear.addEventListener('click', () => {
+    benchHistory.length = 0;
+    currentBenchResult = null;
+    const el = document.getElementById('bench-content');
+    if (el) el.innerHTML = '<div class="bench-empty"><div class="bench-empty-icon">📊</div><div class="bench-empty-title">Benchmark & Frame Analysis</div><div class="bench-empty-desc">Importa um ficheiro PresentMon (.csv) ou CapFrameX (.json) para analisar frame times, FPS e stutters do teu sistema em CS2.</div><div class="bench-empty-hint">Alternativa leve ao CapFrameX — analisa os mesmos dados com métricas completas e gráficos interativos.</div><div class="bench-compat"><span class="bench-compat-item">✅ PresentMon CSV</span><span class="bench-compat-item">✅ CapFrameX JSON</span><span class="bench-compat-item">✅ OCAT CSV</span><span class="bench-compat-item">✅ FrameView CSV</span></div></div>';
+  });
+
+  const benchInfo = document.createElement('span');
+  benchInfo.style.cssText = 'font-size:10px;opacity:0.5;flex:1;';
+  benchInfo.textContent = 'Compatível com PresentMon, CapFrameX, OCAT e FrameView. Análise de frame times, FPS, percentis e stutters.';
+
+  benchToolbar.appendChild(btnBenchImport);
+  benchToolbar.appendChild(btnBenchCX);
+  benchToolbar.appendChild(btnBenchClear);
+  benchToolbar.appendChild(benchInfo);
+  tabBench.appendChild(benchToolbar);
+
+  const benchContent = document.createElement('div');
+  benchContent.id = 'bench-content';
+  benchContent.style.cssText = 'padding:0 12px;flex:1;overflow-y:auto;';
+  benchContent.innerHTML = '<div class="bench-empty"><div class="bench-empty-icon">📊</div><div class="bench-empty-title">Benchmark & Frame Analysis</div><div class="bench-empty-desc">Importa um ficheiro PresentMon (.csv) ou CapFrameX (.json) para analisar frame times, FPS e stutters do teu sistema em CS2.</div><div class="bench-empty-hint">Alternativa leve ao CapFrameX — analisa os mesmos dados com métricas completas e gráficos interativos.</div><div class="bench-compat"><span class="bench-compat-item">✅ PresentMon CSV</span><span class="bench-compat-item">✅ CapFrameX JSON</span><span class="bench-compat-item">✅ OCAT CSV</span><span class="bench-compat-item">✅ FrameView CSV</span></div></div>';
+  tabBench.appendChild(benchContent);
+
+  const benchSig = document.createElement('section');
+  benchSig.className = 'cfg-actions';
+  benchSig.style.marginTop = 'auto';
+  const benchSigText = document.createElement('div');
+  benchSigText.className = 'app-signature';
+  benchSigText.innerHTML = `<span class="sig-by">by</span> <span class="sig-name">Rqdiniz</span> <span class="sig-tag">[ bu- ]</span>`;
+  benchSig.appendChild(benchSigText);
+  tabBench.appendChild(benchSig);
+
   const tabRank = buildPlaceholder('tab-rank',
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>',
     'RANKINGS & STATS',
@@ -3211,9 +4386,12 @@ function build() {
   container.appendChild(tabSys);
   container.appendChild(tabCfg);
   container.appendChild(tabHw);
+  container.appendChild(tabDrv);
   container.appendChild(tabProc);
   container.appendChild(tabNet);
   container.appendChild(tabDemo);
+  container.appendChild(tabFdbk);
+  container.appendChild(tabBench);
   container.appendChild(tabRank);
   container.appendChild(tabServers);
   container.appendChild(tabMarket);

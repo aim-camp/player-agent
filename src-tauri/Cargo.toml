@@ -1,6 +1,6 @@
 [package]
 name = "aimcamp-player-agent"
-version = "1.0.2"
+version = "1.0.5"
 description = "aim.camp Player Agent - CS2 Optimization Tool"
 authors = ["aim.camp"]
 edition = "2021"
@@ -15,8 +15,10 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
-reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.11", features = ["json", "rustls-tls", "multipart", "stream"] }
 chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.21"
+dirs-next = "2.0"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

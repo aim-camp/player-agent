@@ -2,6 +2,7 @@ use tauri::api::dialog::FileDialogBuilder;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::process::Command;
+// base64 Engine trait used via associated function calls
 
 // ────────────────────────────────────────────────────────────────────
 // Data model – every field maps 1:1 to a UI toggle/input AND to real
@@ -1444,6 +1445,729 @@ async fn send_to_discord(
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Driver information — system + peripheral drivers
+// Categories: GPU, Audio, Network, Mouse, Keyboard, Monitor, USB Game Controllers
+// For each: device name, driver name, driver version, manufacturer,
+//           whether it's a generic driver, and whether it's up to date.
+// ────────────────────────────────────────────────────────────────────
+#[tauri::command]
+async fn get_driver_info() -> Result<serde_json::Value, String> {
+    let script = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+
+function Get-DriverCategory {
+    param($class, $name, $compat)
+    $n = ($name + ' ' + $compat).ToLower()
+    if ($class -eq 'Display')           { return 'GPU' }
+    if ($class -match 'AudioEndpoint|MEDIA|Sound') { return 'Audio' }
+    if ($class -eq 'Net')               { return 'Network' }
+    if ($class -eq 'Mouse' -or $class -eq 'HIDClass' -and $n -match 'mouse|pointer') { return 'Mouse' }
+    if ($class -eq 'Keyboard' -or ($class -eq 'HIDClass' -and $n -match 'keyboard')) { return 'Keyboard' }
+    if ($class -eq 'Monitor')           { return 'Monitor' }
+    if ($class -eq 'HIDClass' -and $n -match 'game|controller|joystick|gamepad|xbox') { return 'Controller' }
+    if ($class -eq 'USB' -and $n -match 'headset|audio|dac|amp') { return 'Audio' }
+    if ($class -eq 'HIDClass' -and $n -match 'headset|audio') { return 'Audio' }
+    return $null
+}
+
+# Collect PnP devices with driver info
+$devices = Get-CimInstance Win32_PnPSignedDriver |
+    Where-Object { $_.DeviceName -and $_.DeviceClass } |
+    Select-Object DeviceName, DeviceClass, DriverVersion, DriverDate, Manufacturer,
+                  DriverProviderName, HardWareID, CompatID, IsSigned, InfName
+
+$results = @()
+
+foreach ($d in $devices) {
+    $compatStr = if ($d.HardWareID) { ($d.HardWareID -join ' ') } else { '' }
+    $cat = Get-DriverCategory -class $d.DeviceClass -name $d.DeviceName -compat $compatStr
+    if (-not $cat) { continue }
+
+    # Determine if generic driver
+    $provider = if ($d.DriverProviderName) { $d.DriverProviderName.Trim() } else { '' }
+    $mfr = if ($d.Manufacturer) { $d.Manufacturer.Trim() } else { '' }
+    $genericProviders = @('Microsoft', 'Microsoft Corporation', 'Windows', '(Standard system devices)',
+                          '(Generic)', 'Generic', 'Microsoft Windows', 'Dispositivos de sistema', 'USB')
+    $isGeneric = $false
+    foreach ($gp in $genericProviders) {
+        if ($provider -eq $gp -or $mfr -eq $gp) { $isGeneric = $true; break }
+    }
+    # Display adapters with 'Microsoft Basic' are generic
+    if ($d.DeviceName -match 'Microsoft Basic|Standard VGA|Generic.*Display') { $isGeneric = $true }
+
+    # Driver date and age
+    $driverDateStr = ''
+    $daysOld = -1
+    if ($d.DriverDate) {
+        try {
+            $dt = [DateTime]$d.DriverDate
+            $driverDateStr = $dt.ToString('yyyy-MM-dd')
+            $daysOld = ((Get-Date) - $dt).Days
+        } catch { }
+    }
+
+    # Heuristic: driver older than 365 days = possibly outdated
+    $status = 'unknown'
+    if ($daysOld -ge 0) {
+        if ($daysOld -le 180)    { $status = 'current' }
+        elseif ($daysOld -le 365) { $status = 'aging' }
+        else                      { $status = 'outdated' }
+    }
+
+    $results += @{
+        category      = $cat
+        device_name   = $d.DeviceName.Trim()
+        driver_name   = if ($d.InfName) { $d.InfName.Trim() } else { 'N/A' }
+        driver_version = if ($d.DriverVersion) { $d.DriverVersion.Trim() } else { 'N/A' }
+        driver_provider = $provider
+        manufacturer  = $mfr
+        driver_date   = $driverDateStr
+        days_old      = $daysOld
+        is_signed     = [bool]$d.IsSigned
+        is_generic    = $isGeneric
+        status        = $status
+    }
+}
+
+# Deduplicate by device name (keep newest driver version)
+$unique = @{}
+foreach ($r in $results) {
+    $key = $r.category + '|' + $r.device_name
+    if (-not $unique.ContainsKey($key) -or $r.days_old -lt $unique[$key].days_old) {
+        $unique[$key] = $r
+    }
+}
+
+# Sort: GPU first, then by category
+$sorted = @($unique.Values) | Sort-Object @{Expression={
+    switch ($_.category) {
+        'GPU'        { 0 }
+        'Monitor'    { 1 }
+        'Audio'      { 2 }
+        'Network'    { 3 }
+        'Mouse'      { 4 }
+        'Keyboard'   { 5 }
+        'Controller' { 6 }
+        default      { 9 }
+    }
+}}, device_name
+
+@($sorted) | ConvertTo-Json -Depth 3
+"#;
+    let output = Command::new("powershell")
+        .args(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
+        .output()
+        .map_err(|e| format!("Driver info failed: {}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(stdout.trim())
+        .map_err(|e| format!("Driver JSON parse: {} — {}", e, &stdout[..stdout.len().min(300)]))
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Feedback system — capture screenshot, save/load history, send
+// ────────────────────────────────────────────────────────────────────
+
+fn feedback_file_path() -> Result<std::path::PathBuf, String> {
+    let mut dir = dirs_next::data_local_dir()
+        .ok_or_else(|| "Cannot find local data dir".to_string())?;
+    dir.push("aimcamp-player-agent");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Dir create failed: {}", e))?;
+    dir.push("feedback.json");
+    Ok(dir)
+}
+
+fn screenshots_dir() -> Result<std::path::PathBuf, String> {
+    let mut dir = dirs_next::data_local_dir()
+        .ok_or_else(|| "Cannot find local data dir".to_string())?;
+    dir.push("aimcamp-player-agent");
+    dir.push("screenshots");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Dir create failed: {}", e))?;
+    Ok(dir)
+}
+
+#[tauri::command]
+async fn capture_screenshot() -> Result<String, String> {
+    let script = r#"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$sig = @'
+using System;
+using System.Runtime.InteropServices;
+public class WinApi {
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+}
+'@
+Add-Type -TypeDefinition $sig -ErrorAction SilentlyContinue
+
+$hwnd = [WinApi]::GetForegroundWindow()
+$rect = New-Object WinApi+RECT
+[WinApi]::GetWindowRect($hwnd, [ref]$rect) | Out-Null
+$w = $rect.Right - $rect.Left
+$h = $rect.Bottom - $rect.Top
+if ($w -lt 100 -or $h -lt 100) { $w = 1920; $h = 1080; $rect.Left = 0; $rect.Top = 0 }
+$bmp = New-Object Drawing.Bitmap($w, $h)
+$g = [Drawing.Graphics]::FromImage($bmp)
+$g.CopyFromScreen($rect.Left, $rect.Top, 0, 0, (New-Object Drawing.Size($w, $h)))
+$g.Dispose()
+$ms = New-Object IO.MemoryStream
+$bmp.Save($ms, [Drawing.Imaging.ImageFormat]::Png)
+$bmp.Dispose()
+$b64 = [Convert]::ToBase64String($ms.ToArray())
+$ms.Dispose()
+$b64
+"#;
+    let output = Command::new("powershell")
+        .args(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
+        .output()
+        .map_err(|e| format!("Screenshot failed: {}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        Err("Screenshot capture returned empty".into())
+    } else {
+        Ok(stdout)
+    }
+}
+
+#[tauri::command]
+async fn save_feedback(
+    id: String,
+    tab: String,
+    description: String,
+    screenshot_b64: String,
+    sent: bool,
+) -> Result<String, String> {
+    // Save screenshot file
+    let ss_dir = screenshots_dir()?;
+    let ss_path = ss_dir.join(format!("{}.png", id));
+    if !screenshot_b64.is_empty() {
+        let bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &screenshot_b64,
+        ).map_err(|e| format!("Base64 decode: {}", e))?;
+        std::fs::write(&ss_path, &bytes).map_err(|e| format!("Screenshot write: {}", e))?;
+    }
+
+    // Load existing feedback
+    let fb_path = feedback_file_path()?;
+    let mut entries: Vec<serde_json::Value> = if fb_path.exists() {
+        let data = std::fs::read_to_string(&fb_path).unwrap_or_else(|_| "[]".into());
+        serde_json::from_str(&data).unwrap_or_else(|_| vec![])
+    } else {
+        vec![]
+    };
+
+    let entry = serde_json::json!({
+        "id": id,
+        "tab": tab,
+        "description": description,
+        "screenshot_path": ss_path.to_string_lossy(),
+        "sent": sent,
+        "timestamp": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    });
+    entries.push(entry);
+
+    std::fs::write(&fb_path, serde_json::to_string_pretty(&entries).unwrap_or_default())
+        .map_err(|e| format!("Feedback save: {}", e))?;
+
+    Ok(ss_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+async fn load_feedback_history() -> Result<serde_json::Value, String> {
+    let fb_path = feedback_file_path()?;
+    if !fb_path.exists() {
+        return Ok(serde_json::json!([]));
+    }
+    let data = std::fs::read_to_string(&fb_path).map_err(|e| format!("Read: {}", e))?;
+    serde_json::from_str(&data).map_err(|e| format!("Parse: {}", e))
+}
+
+#[tauri::command]
+async fn delete_feedback(id: String) -> Result<(), String> {
+    let fb_path = feedback_file_path()?;
+    if !fb_path.exists() { return Ok(()); }
+    let data = std::fs::read_to_string(&fb_path).map_err(|e| format!("Read: {}", e))?;
+    let mut entries: Vec<serde_json::Value> = serde_json::from_str(&data).unwrap_or_default();
+    entries.retain(|e| e["id"].as_str() != Some(&id));
+    std::fs::write(&fb_path, serde_json::to_string_pretty(&entries).unwrap_or_default())
+        .map_err(|e| format!("Write: {}", e))?;
+
+    // Also remove screenshot
+    let ss_dir = screenshots_dir()?;
+    let ss_path = ss_dir.join(format!("{}.png", id));
+    let _ = std::fs::remove_file(ss_path);
+    Ok(())
+}
+
+#[tauri::command]
+async fn send_feedback_github(
+    token: String,
+    repo: String,
+    title: String,
+    body: String,
+    screenshot_b64: String,
+    labels: Vec<String>,
+) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    // Build body with screenshot as inline image if available
+    let full_body = if screenshot_b64.is_empty() {
+        body.clone()
+    } else {
+        format!("{}\n\n---\n### Screenshot\n![screenshot](data:image/png;base64,{})", body, &screenshot_b64[..screenshot_b64.len().min(100_000)])
+    };
+
+    let issue = serde_json::json!({
+        "title": title,
+        "body": full_body,
+        "labels": labels,
+    });
+
+    let url = format!("https://api.github.com/repos/{}/issues", repo);
+    let resp = client
+        .post(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("User-Agent", "aimcamp-player-agent/1.0")
+        .json(&issue)
+        .send()
+        .await
+        .map_err(|e| format!("GitHub request failed: {}", e))?;
+
+    let status = resp.status();
+    if status.is_success() {
+        let json: serde_json::Value = resp.json().await.unwrap_or_default();
+        let url = json["html_url"].as_str().unwrap_or("created");
+        Ok(format!("Issue created: {}", url))
+    } else {
+        let text = resp.text().await.unwrap_or_default();
+        Err(format!("GitHub error ({}): {}", status, &text[..text.len().min(300)]))
+    }
+}
+
+#[tauri::command]
+async fn send_feedback_discord_with_image(
+    webhook_url: String,
+    description: String,
+    tab: String,
+    screenshot_b64: String,
+) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    let embed = serde_json::json!({
+        "embeds": [{
+            "title": "💡 Player Agent — Sugestão",
+            "description": description,
+            "color": 0x00ffaa,
+            "fields": [
+                { "name": "Separador", "value": tab, "inline": true },
+                { "name": "Timestamp", "value": timestamp, "inline": true },
+            ],
+            "image": if !screenshot_b64.is_empty() { serde_json::json!({"url": "attachment://screenshot.png"}) } else { serde_json::json!(null) },
+            "footer": { "text": "aim.camp Player Agent — Feedback System" },
+        }]
+    });
+
+    if screenshot_b64.is_empty() {
+        // Text-only
+        let resp = client
+            .post(&webhook_url)
+            .header("Content-Type", "application/json")
+            .json(&embed)
+            .send()
+            .await
+            .map_err(|e| format!("Discord request failed: {}", e))?;
+
+        if resp.status().is_success() || resp.status().as_u16() == 204 {
+            Ok("Sugestão enviada para Discord".into())
+        } else {
+            let text = resp.text().await.unwrap_or_default();
+            Err(format!("Discord error: {}", &text[..text.len().min(300)]))
+        }
+    } else {
+        // With image attachment via multipart
+        let img_bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &screenshot_b64,
+        ).map_err(|e| format!("Base64 decode: {}", e))?;
+
+        let payload_json = serde_json::to_string(&embed)
+            .map_err(|e| format!("JSON: {}", e))?;
+
+        let form = reqwest::multipart::Form::new()
+            .text("payload_json", payload_json)
+            .part("files[0]", reqwest::multipart::Part::bytes(img_bytes)
+                .file_name("screenshot.png")
+                .mime_str("image/png")
+                .map_err(|e| format!("MIME: {}", e))?);
+
+        let resp = client
+            .post(&webhook_url)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| format!("Discord multipart failed: {}", e))?;
+
+        if resp.status().is_success() || resp.status().as_u16() == 204 {
+            Ok("Sugestão + screenshot enviados para Discord".into())
+        } else {
+            let text = resp.text().await.unwrap_or_default();
+            Err(format!("Discord error: {}", &text[..text.len().min(300)]))
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Benchmark / Frame‑time Analysis — parse PresentMon CSV & CapFrameX JSON
+// ────────────────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+struct BenchmarkResult {
+    file_name: String,
+    process_name: String,
+    duration_secs: f64,
+    frame_count: usize,
+    avg_fps: f64,
+    min_fps: f64,
+    max_fps: f64,
+    p01_fps: f64,
+    p1_fps: f64,
+    p5_fps: f64,
+    median_fps: f64,
+    p95_fps: f64,
+    p99_fps: f64,
+    avg_frametime: f64,
+    p95_frametime: f64,
+    p99_frametime: f64,
+    p999_frametime: f64,
+    stutter_count: usize,
+    stutter_pct: f64,
+    dropped_frames: usize,
+    frametimes: Vec<f64>,
+    timestamps: Vec<f64>,
+    fps_values: Vec<f64>,
+}
+
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() { return 0.0; }
+    let idx = (p / 100.0 * (sorted.len() as f64 - 1.0)).max(0.0);
+    let lo = idx.floor() as usize;
+    let hi = (lo + 1).min(sorted.len() - 1);
+    let frac = idx - lo as f64;
+    sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+}
+
+fn calc_metrics(frametimes: &[f64], timestamps: &[f64], dropped: usize, process: &str, file_name: &str) -> BenchmarkResult {
+    let n = frametimes.len();
+    if n == 0 {
+        return BenchmarkResult {
+            file_name: file_name.to_string(), process_name: process.to_string(),
+            duration_secs: 0.0, frame_count: 0, avg_fps: 0.0, min_fps: 0.0, max_fps: 0.0,
+            p01_fps: 0.0, p1_fps: 0.0, p5_fps: 0.0, median_fps: 0.0, p95_fps: 0.0, p99_fps: 0.0,
+            avg_frametime: 0.0, p95_frametime: 0.0, p99_frametime: 0.0, p999_frametime: 0.0,
+            stutter_count: 0, stutter_pct: 0.0, dropped_frames: dropped,
+            frametimes: vec![], timestamps: vec![], fps_values: vec![],
+        };
+    }
+
+    let fps_vals: Vec<f64> = frametimes.iter().map(|&ms| if ms > 0.0 { 1000.0 / ms } else { 0.0 }).collect();
+    let duration = timestamps.last().unwrap_or(&0.0) - timestamps.first().unwrap_or(&0.0);
+    let avg_ft: f64 = frametimes.iter().sum::<f64>() / n as f64;
+    let avg_fps = if avg_ft > 0.0 { 1000.0 / avg_ft } else { 0.0 };
+
+    let mut sorted_fps = fps_vals.clone();
+    sorted_fps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut sorted_ft = frametimes.to_vec();
+    sorted_ft.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Stutter: frames with frametime > 2.5× average
+    let stutter_threshold = avg_ft * 2.5;
+    let stutter_count = frametimes.iter().filter(|&&ft| ft > stutter_threshold).count();
+
+    // Downsample for frontend if > 5000 points
+    let (ds_ft, ds_ts, ds_fps) = if n > 5000 {
+        let step = n as f64 / 5000.0;
+        let mut dft = Vec::with_capacity(5000);
+        let mut dts = Vec::with_capacity(5000);
+        let mut dfps = Vec::with_capacity(5000);
+        let mut i = 0.0;
+        while (i as usize) < n {
+            let idx = i as usize;
+            dft.push(frametimes[idx]);
+            dts.push(timestamps[idx]);
+            dfps.push(fps_vals[idx]);
+            i += step;
+        }
+        (dft, dts, dfps)
+    } else {
+        (frametimes.to_vec(), timestamps.to_vec(), fps_vals.clone())
+    };
+
+    BenchmarkResult {
+        file_name: file_name.to_string(),
+        process_name: process.to_string(),
+        duration_secs: duration,
+        frame_count: n,
+        avg_fps,
+        min_fps: sorted_fps.first().copied().unwrap_or(0.0),
+        max_fps: sorted_fps.last().copied().unwrap_or(0.0),
+        p01_fps: percentile(&sorted_fps, 0.1),
+        p1_fps: percentile(&sorted_fps, 1.0),
+        p5_fps: percentile(&sorted_fps, 5.0),
+        median_fps: percentile(&sorted_fps, 50.0),
+        p95_fps: percentile(&sorted_fps, 95.0),
+        p99_fps: percentile(&sorted_fps, 99.0),
+        avg_frametime: avg_ft,
+        p95_frametime: percentile(&sorted_ft, 95.0),
+        p99_frametime: percentile(&sorted_ft, 99.0),
+        p999_frametime: percentile(&sorted_ft, 99.9),
+        stutter_count,
+        stutter_pct: stutter_count as f64 / n as f64 * 100.0,
+        dropped_frames: dropped,
+        frametimes: ds_ft,
+        timestamps: ds_ts,
+        fps_values: ds_fps,
+    }
+}
+
+#[tauri::command]
+async fn pick_benchmark_file() -> Result<String, String> {
+    use tauri::api::dialog::blocking::FileDialogBuilder;
+    FileDialogBuilder::new()
+        .add_filter("Benchmark Files", &["csv", "json"])
+        .add_filter("PresentMon CSV", &["csv"])
+        .add_filter("CapFrameX JSON", &["json"])
+        .set_title("Selecionar ficheiro de benchmark (PresentMon CSV ou CapFrameX JSON)")
+        .pick_file()
+        .map(|p| p.to_string_lossy().to_string())
+        .ok_or_else(|| "Cancelled".to_string())
+}
+
+#[tauri::command]
+async fn parse_benchmark_file(path: String) -> Result<BenchmarkResult, String> {
+    let file_name = std::path::Path::new(&path)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    if path.to_lowercase().ends_with(".csv") {
+        parse_presentmon_csv(&path, &file_name)
+    } else if path.to_lowercase().ends_with(".json") {
+        parse_capframex_json(&path, &file_name)
+    } else {
+        Err("Formato não suportado. Usa ficheiros .csv (PresentMon) ou .json (CapFrameX).".into())
+    }
+}
+
+fn parse_presentmon_csv(path: &str, file_name: &str) -> Result<BenchmarkResult, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Erro ao ler ficheiro: {}", e))?;
+    let mut lines = content.lines();
+
+    // Parse header to find column indices
+    let header = lines.next().ok_or("Ficheiro CSV vazio")?;
+    let cols: Vec<&str> = header.split(',').collect();
+
+    let find_col = |names: &[&str]| -> Option<usize> {
+        for name in names {
+            if let Some(i) = cols.iter().position(|c| c.trim().eq_ignore_ascii_case(name)) {
+                return Some(i);
+            }
+        }
+        None
+    };
+
+    let col_app = find_col(&["Application", "application"]);
+    let col_time = find_col(&["TimeInSeconds", "timeinseconds"]);
+    let col_ft = find_col(&["MsBetweenPresents", "msbetweenpresents", "FrameTime"]);
+    let col_dropped = find_col(&["Dropped", "dropped"]);
+
+    let col_ft = col_ft.ok_or("Coluna 'MsBetweenPresents' ou 'FrameTime' não encontrada no CSV")?;
+
+    let mut frametimes: Vec<f64> = Vec::new();
+    let mut timestamps: Vec<f64> = Vec::new();
+    let mut process = String::new();
+    let mut dropped_count = 0usize;
+
+    for line in lines {
+        let fields: Vec<&str> = line.split(',').collect();
+        if fields.len() <= col_ft { continue; }
+
+        let ft: f64 = match fields[col_ft].trim().parse() {
+            Ok(v) if v > 0.0 => v,
+            _ => continue,
+        };
+
+        let ts = col_time
+            .and_then(|i| fields.get(i))
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or_else(|| if timestamps.is_empty() { 0.0 } else { timestamps.last().unwrap() + ft / 1000.0 });
+
+        if process.is_empty() {
+            if let Some(i) = col_app {
+                if let Some(v) = fields.get(i) {
+                    let v = v.trim();
+                    if !v.is_empty() && v != "<unknown>" { process = v.to_string(); }
+                }
+            }
+        }
+
+        if let Some(i) = col_dropped {
+            if let Some(v) = fields.get(i) {
+                if v.trim() == "1" || v.trim().eq_ignore_ascii_case("true") {
+                    dropped_count += 1;
+                }
+            }
+        }
+
+        frametimes.push(ft);
+        timestamps.push(ts);
+    }
+
+    if frametimes.is_empty() {
+        return Err("Nenhum frame válido encontrado no ficheiro CSV".into());
+    }
+
+    if process.is_empty() { process = "Unknown".into(); }
+    Ok(calc_metrics(&frametimes, &timestamps, dropped_count, &process, file_name))
+}
+
+fn parse_capframex_json(path: &str, file_name: &str) -> Result<BenchmarkResult, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Erro ao ler ficheiro: {}", e))?;
+    let json: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| format!("JSON inválido: {}", e))?;
+
+    // CapFrameX stores frame times in "Runs" array (each run is an array of frame times in ms)
+    // or in "CaptureData"/"MsBetweenPresents"
+    let frametimes: Vec<f64> = if let Some(runs) = json.get("Runs").and_then(|r| r.as_array()) {
+        // Flatten all runs
+        runs.iter()
+            .filter_map(|r| r.as_array())
+            .flatten()
+            .filter_map(|v| v.as_f64())
+            .filter(|&v| v > 0.0)
+            .collect()
+    } else if let Some(data) = json.get("CaptureData").and_then(|d| d.get("MsBetweenPresents")).and_then(|m| m.as_array()) {
+        data.iter().filter_map(|v| v.as_f64()).filter(|&v| v > 0.0).collect()
+    } else if let Some(data) = json.get("MsBetweenPresents").and_then(|m| m.as_array()) {
+        data.iter().filter_map(|v| v.as_f64()).filter(|&v| v > 0.0).collect()
+    } else {
+        return Err("Formato CapFrameX não reconhecido: não encontrou frame times".into());
+    };
+
+    if frametimes.is_empty() {
+        return Err("Nenhum frame válido encontrado no CapFrameX JSON".into());
+    }
+
+    // Build timestamps from cumulative frame times
+    let mut timestamps = Vec::with_capacity(frametimes.len());
+    let mut t = 0.0;
+    for &ft in &frametimes {
+        timestamps.push(t);
+        t += ft / 1000.0;
+    }
+
+    let process = json.get("Info")
+        .and_then(|i| i.get("ProcessName"))
+        .and_then(|p| p.as_str())
+        .or_else(|| json.get("ProcessName").and_then(|p| p.as_str()))
+        .unwrap_or("Unknown")
+        .to_string();
+
+    let dropped = json.get("CaptureData")
+        .and_then(|d| d.get("Dropped"))
+        .and_then(|d| d.as_array())
+        .map(|arr| arr.iter().filter(|v| v.as_bool().unwrap_or(false) || v.as_i64().unwrap_or(0) == 1).count())
+        .unwrap_or(0);
+
+    Ok(calc_metrics(&frametimes, &timestamps, dropped, &process, file_name))
+}
+
+#[tauri::command]
+async fn scan_capframex_folder() -> Result<Vec<String>, String> {
+    let appdata = std::env::var("APPDATA").unwrap_or_default();
+    let cx_dir = std::path::Path::new(&appdata).join("CapFrameX").join("Captures");
+    if !cx_dir.exists() {
+        return Ok(vec![]);
+    }
+
+    let mut files: Vec<String> = Vec::new();
+    fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if let Some(ext) = p.extension() {
+                    if ext == "json" {
+                        out.push(p.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    }
+    walk(&cx_dir, &mut files);
+    files.sort_by(|a, b| b.cmp(a)); // newest first by filename (CapFrameX uses timestamps)
+    files.truncate(50); // limit to 50 most recent
+    Ok(files)
+}
+
+#[tauri::command]
+async fn check_presentmon() -> Result<serde_json::Value, String> {
+    // Check common PresentMon locations
+    let checks = vec![
+        "PresentMon.exe",
+        "PresentMon64.exe",
+        r"C:\Program Files\PresentMon\PresentMon.exe",
+        r"C:\Program Files (x86)\PresentMon\PresentMon.exe",
+    ];
+
+    for path in &checks {
+        let result = Command::new("where")
+            .arg(path)
+            .output();
+        if let Ok(out) = result {
+            if out.status.success() {
+                let found = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                return Ok(serde_json::json!({ "installed": true, "path": found }));
+            }
+        }
+        // Check file existence directly
+        if std::path::Path::new(path).exists() {
+            return Ok(serde_json::json!({ "installed": true, "path": path }));
+        }
+    }
+
+    // Check CapFrameX installation
+    let appdata = std::env::var("APPDATA").unwrap_or_default();
+    let cx_path = std::path::Path::new(&appdata).join("CapFrameX");
+    let cx_installed = cx_path.exists();
+
+    Ok(serde_json::json!({
+        "installed": false,
+        "path": "",
+        "capframex_installed": cx_installed,
+        "capframex_captures": if cx_installed {
+            cx_path.join("Captures").to_string_lossy().to_string()
+        } else { "".into() }
+    }))
+}
+
+// ────────────────────────────────────────────────────────────────────
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -1457,6 +2181,7 @@ fn main() {
             save_cfg,
             load_cfg,
             get_hardware_info,
+            get_driver_info,
             list_processes,
             kill_process,
             ping_server,
@@ -1466,6 +2191,16 @@ fn main() {
             pick_demo_folder,
             ai_chat,
             send_to_discord,
+            capture_screenshot,
+            save_feedback,
+            load_feedback_history,
+            delete_feedback,
+            send_feedback_github,
+            send_feedback_discord_with_image,
+            pick_benchmark_file,
+            parse_benchmark_file,
+            scan_capframex_folder,
+            check_presentmon,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

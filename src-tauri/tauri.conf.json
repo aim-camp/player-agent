@@ -7,7 +7,7 @@
   },
   "package": {
     "productName": "aimcamp-player-agent",
-    "version": "1.0.2"
+    "version": "1.0.5"
   },
   "tauri": {
     "allowlist": {
@@ -57,7 +57,10 @@
       "windows": {
         "certificateThumbprint": null,
         "digestAlgorithm": "sha256",
-        "timestampUrl": ""
+        "timestampUrl": "http://timestamp.digicert.com",
+        "wix": {
+          "language": "pt-BR"
+        }
       }
     },
     "security": {
