@@ -937,6 +937,99 @@ textarea:focus {
   color: var(--neon-green);
 }
 
+/* ── CFG Dropdown Menus ─────────────────────────────────────────── */
+.cfg-dropdown-wrap {
+  position: relative;
+}
+.cfg-dropdown-trigger {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.dd-arrow {
+  font-size: 8px;
+  opacity: 0.5;
+  margin-left: 2px;
+}
+.cfg-dropdown-menu {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  min-width: 200px;
+  background: rgba(13, 17, 23, 0.98);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  box-shadow: 0 -8px 32px rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(16px);
+  padding: 4px;
+  z-index: 9000;
+  opacity: 0;
+  transform: translateY(4px);
+  pointer-events: none;
+  transition: opacity 0.15s, transform 0.15s;
+  max-height: 400px;
+  overflow-y: auto;
+}
+.cfg-dropdown-menu.open {
+  opacity: 1;
+  transform: translateY(-4px);
+  pointer-events: auto;
+}
+.cfg-dd-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  background: transparent;
+  border: none;
+  border-radius: 5px;
+  color: var(--text-main);
+  font-family: "Rajdhani", sans-serif;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.1s;
+  text-align: left;
+  white-space: nowrap;
+}
+.cfg-dd-item:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+.cfg-dd-icon {
+  font-size: 13px;
+  width: 18px;
+  text-align: center;
+  flex-shrink: 0;
+}
+.cfg-dd-section {
+  padding: 6px 10px 2px;
+  font-family: "Orbitron", monospace;
+  font-size: 8px;
+  font-weight: 700;
+  color: var(--neon-green);
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  opacity: 0.7;
+}
+.cfg-dd-divider {
+  height: 1px;
+  background: rgba(255, 255, 255, 0.08);
+  margin: 4px 8px;
+}
+.cfg-dd-meta {
+  margin-left: auto;
+  font-size: 9px;
+  opacity: 0.4;
+  font-weight: 500;
+}
+.cfg-dd-pro {
+  padding-left: 18px;
+}
+.cfg-dd-load {
+  min-width: 260px;
+}
+
 /* ── Crosshair Preview ──────────────────────────────────────────── */
 .xhair-preview {
   display: flex;
@@ -3367,4 +3460,153 @@ body.theme-space::before {
   font-size: 9px;
   color: #fbbf24;
   opacity: 0.8;
+}
+
+/* ─── Custom Tooltip System ─────────────────────────────────────── */
+.ac-tooltip {
+  position: fixed;
+  z-index: 99999;
+  max-width: 340px;
+  min-width: 180px;
+  padding: 10px 14px;
+  background: rgba(13, 17, 23, 0.97);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5), 0 0 1px rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(16px);
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(4px);
+  transition: opacity 0.15s ease, transform 0.15s ease;
+  font-family: "Rajdhani", system-ui, sans-serif;
+}
+.ac-tooltip.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+.tt-title {
+  font-family: "Orbitron", monospace;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--neon-green, #84cc16);
+  margin-bottom: 6px;
+  letter-spacing: 0.3px;
+}
+.tt-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.tt-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  font-family: "Orbitron", monospace;
+}
+.tt-badge.auto {
+  background: rgba(34, 197, 94, 0.2);
+  color: #4ade80;
+  border: 1px solid rgba(34, 197, 94, 0.3);
+}
+.tt-badge.manual {
+  background: rgba(251, 191, 36, 0.2);
+  color: #fbbf24;
+  border: 1px solid rgba(251, 191, 36, 0.3);
+}
+.tt-badge.info {
+  background: rgba(96, 165, 250, 0.2);
+  color: #60a5fa;
+  border: 1px solid rgba(96, 165, 250, 0.3);
+}
+.tt-via {
+  font-size: 9px;
+  color: rgba(255, 255, 255, 0.35);
+  font-family: "Rajdhani", monospace;
+}
+.tt-desc {
+  font-size: 11px;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.75);
+}
+.tt-impact {
+  margin-top: 6px;
+  padding: 3px 8px;
+  background: rgba(132, 204, 22, 0.08);
+  border: 1px solid rgba(132, 204, 22, 0.15);
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  color: #84cc16;
+  font-family: "Orbitron", monospace;
+  letter-spacing: 0.3px;
+}
+.tt-method {
+  margin-top: 4px;
+  font-size: 9px;
+  color: rgba(255, 255, 255, 0.3);
+}
+
+/* ─── AI Provider Grid ──────────────────────────────────────────── */
+.ai-providers {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+.ai-providers-label {
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+  letter-spacing: 0.3px;
+}
+.ai-providers-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 4px;
+}
+.ai-provider-link {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 6px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 5px;
+  text-decoration: none;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.ai-provider-link:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.15);
+  transform: translateY(-1px);
+}
+.ai-prov-icon {
+  font-size: 12px;
+  line-height: 1;
+}
+.ai-prov-name {
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--text-main);
+  font-family: "Rajdhani", monospace;
+  white-space: nowrap;
+}
+.ai-prov-tag {
+  margin-left: auto;
+  font-size: 7px;
+  font-weight: 600;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: rgba(132, 204, 22, 0.15);
+  color: #84cc16;
+  font-family: "Orbitron", monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
 }
