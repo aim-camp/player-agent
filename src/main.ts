@@ -3387,12 +3387,20 @@ async function aiChat(systemPrompt: string, userContent: string): Promise<string
     { role: "system", content: systemPrompt },
     { role: "user", content: userContent },
   ];
-  return invoke<string>("ai_chat", {
-    apiKey: cfg.key,
-    endpoint: cfg.endpoint,
-    model: cfg.model,
-    messages,
-  });
+  try {
+    return await invoke<string>("ai_chat", {
+      apiKey: cfg.key,
+      endpoint: cfg.endpoint,
+      model: cfg.model,
+      messages,
+    });
+  } catch (e: any) {
+    const msg = String(e);
+    if (msg.includes("401")) {
+      throw new Error("API key invalid or expired. Open AI settings (header icon) and regenerate your key at console.groq.com/keys");
+    }
+    throw e;
+  }
 }
 
 // simple markdown-to-html for AI responses
@@ -3426,12 +3434,14 @@ function showAiModal() {
       <input type="text" id="ai-endpoint" value="${cfg.endpoint}" placeholder="${AI_DEFAULTS.endpoint}" />
       <label>Model</label>
       <input type="text" id="ai-model" value="${cfg.model}" placeholder="${AI_DEFAULTS.model}" />
-      <div style="font-size:9px;opacity:0.4;margin-top:6px;">
+      <div id="ai-test-result" style="font-size:10px;margin-top:6px;min-height:16px;"></div>
+      <div style="font-size:9px;opacity:0.4;margin-top:4px;">
         Pre-configured for Groq (free). Works with OpenAI, OpenRouter, Ollama, or any OpenAI-compatible API.
         Just paste your Groq API key from <a href="#" id="ai-groq-link" style="color:var(--primary);text-decoration:underline;">console.groq.com</a>.
       </div>
       <div class="ai-modal-actions">
         <button class="ai-cancel" id="ai-cancel">Cancel</button>
+        <button class="ai-test" id="ai-test-btn">⚡ Test</button>
         <button class="ai-save" id="ai-save-cfg">Save</button>
       </div>
     </div>
@@ -3446,6 +3456,38 @@ function showAiModal() {
   document.getElementById("ai-groq-link")?.addEventListener("click", (e) => {
     e.preventDefault();
     shellOpen("https://console.groq.com/keys");
+  });
+
+  document.getElementById("ai-test-btn")!.addEventListener("click", async () => {
+    const key = (document.getElementById("ai-key") as HTMLInputElement).value.trim();
+    const endpoint = (document.getElementById("ai-endpoint") as HTMLInputElement).value.trim() || AI_DEFAULTS.endpoint;
+    const model = (document.getElementById("ai-model") as HTMLInputElement).value.trim() || AI_DEFAULTS.model;
+    const resultEl = document.getElementById("ai-test-result")!;
+    if (!key || key.length < 5) {
+      resultEl.innerHTML = `<span style="color:#ef4444">⚠ Enter an API key first</span>`;
+      return;
+    }
+    resultEl.innerHTML = `<span style="color:var(--text-secondary)">Testing connection...</span>`;
+    try {
+      const result = await invoke<string>("ai_chat", {
+        apiKey: key,
+        endpoint,
+        model,
+        messages: [{ role: "user", content: "Reply with exactly: OK" }],
+      });
+      resultEl.innerHTML = `<span style="color:#22c55e">✓ Connected — model responded</span>`;
+    } catch (e: any) {
+      const msg = String(e);
+      if (msg.includes("401") || msg.toLowerCase().includes("invalid") || msg.toLowerCase().includes("expired")) {
+        resultEl.innerHTML = `<span style="color:#ef4444">✗ Invalid or expired API key — <a href="#" id="ai-regen-link" style="color:var(--primary);text-decoration:underline;">regenerate at Groq</a></span>`;
+        document.getElementById("ai-regen-link")?.addEventListener("click", (ev) => {
+          ev.preventDefault();
+          shellOpen("https://console.groq.com/keys");
+        });
+      } else {
+        resultEl.innerHTML = `<span style="color:#ef4444">✗ ${msg}</span>`;
+      }
+    }
   });
 
   document.getElementById("ai-save-cfg")!.addEventListener("click", () => {

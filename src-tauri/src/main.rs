@@ -1437,7 +1437,7 @@ async fn ai_chat(
         "model": model,
         "messages": messages,
         "temperature": 0.7,
-        "max_tokens": 3000,
+        "max_completion_tokens": 3000,
     });
 
     let resp = client
@@ -1453,7 +1453,15 @@ async fn ai_chat(
     let text = resp.text().await.map_err(|e| format!("Read failed: {}", e))?;
 
     if !status.is_success() {
-        return Err(format!("API error {}: {}", status, &text[..text.len().min(500)]));
+        let code = status.as_u16();
+        let hint = match code {
+            401 => " — API key is invalid or expired. Please generate a new key.",
+            403 => " — Access denied. Check your API key permissions.",
+            404 => " — Endpoint not found. Check the API URL.",
+            429 => " — Rate limit exceeded. Wait a moment and try again.",
+            _ => "",
+        };
+        return Err(format!("API error {}{}{}", status, hint, if hint.is_empty() { format!(": {}", &text[..text.len().min(500)]) } else { String::new() }));
     }
 
     let json: serde_json::Value = serde_json::from_str(&text)
