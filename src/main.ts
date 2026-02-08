@@ -167,9 +167,11 @@ const THEMES: Theme[] = [
   { name: 'Frost',        primary: '#60a5fa', secondary: '#34d399' },
   { name: 'Volcano',      primary: '#dc2626', secondary: '#fb923c' },
   { name: 'Neon Lime',    primary: '#84cc16', secondary: '#22d3ee' },
+  { name: 'Raz',          primary: '#00ff6a', secondary: '#44ff99' },
+  { name: 'Space',        primary: '#7eb8ff', secondary: '#b4a0ff' },
 ];
 
-let currentThemeIdx = 10;
+let currentThemeIdx = 11;
 
 /* ================================================================
    FPS Impact Map — % improvement per feature
@@ -328,6 +330,11 @@ function applyTheme(idx: number) {
   s.setProperty('--glow-sm', `0 0 6px ${hexToRgba(pc, 0.3)}`);
   s.setProperty('--glow-md', `0 0 14px ${hexToRgba(pc, 0.25)}, 0 0 40px ${hexToRgba(pc, 0.08)}`);
 
+  /* Apply special theme body class */
+  document.body.classList.remove('theme-raz', 'theme-space');
+  if (t.name === 'Raz') document.body.classList.add('theme-raz');
+  if (t.name === 'Space') document.body.classList.add('theme-space');
+
   const el = document.getElementById('dynamic-theme-css') || (() => {
     const e = document.createElement('style');
     e.id = 'dynamic-theme-css';
@@ -443,11 +450,16 @@ function applyTheme(idx: number) {
     .hw-status.off { background: rgba(239,68,68,0.15) !important; color: #ef4444 !important; }
     .hw-value { color: ${sc} !important; }
     .drv-category-header { color: ${pc} !important; border-bottom-color: ${hexToRgba(pc, 0.12)} !important; }
+    .drv-category { border-left-color: ${pc} !important; }
+    .drv-category.drv-cat-issue { border-left-color: #ffb43c !important; }
+    .drv-device-card.drv-dev-ok { border-left-color: ${pc} !important; }
     .drv-badge.manufacturer { background: ${hexToRgba(pc, 0.1)} !important; color: ${pc} !important; border-color: ${hexToRgba(pc, 0.25)} !important; }
     .drv-badge.current { background: ${hexToRgba(pc, 0.08)} !important; color: ${pc} !important; border-color: ${hexToRgba(pc, 0.2)} !important; }
-    .drv-driver { color: ${sc} !important; }
     .drv-summary-val { color: ${pc} !important; }
     .drv-signed.yes { color: ${pc} !important; }
+    .drv-tips-header { color: ${pc} !important; border-bottom-color: ${hexToRgba(pc, 0.1)} !important; }
+    .drv-tips { background: ${hexToRgba(pc, 0.02)} !important; }
+    .drv-cat-ok { color: ${pc} !important; }
     .proc-item.flagged { border-color: ${hexToRgba('#eab308', 0.3)} !important; background: ${hexToRgba('#eab308', 0.06)} !important; }
     .proc-kill { background: linear-gradient(135deg, #ef4444, #b91c1c) !important; }
     .proc-header { border-bottom-color: ${hexToRgba(pc, 0.15)} !important; color: ${pc} !important; }
@@ -2380,7 +2392,7 @@ async function refreshDriverInfo() {
       if (gd.driver_provider?.toLowerCase().includes('amd') && gd.status !== 'current') tips.push('💡 Para AMD: usa <b>AMD Adrenalin</b> para instalar drivers otimizados. Ativa <b>Anti-Lag</b> para CS2.');
     }
     for (const md of mouseDrivers) {
-      if (md.is_generic) tips.push(`⚠ O rato "<b>${md.device_name}</b>" usa driver genérico. Instala o software do fabricante (ex: Logitech G Hub, Razer Synapse, SteelSeries GG) para polling rate e DPI corretos.`);
+      if (md.is_generic) tips.push(`⚠ O rato "<b>${md.device_name}</b>" usa driver genérico. Instala o software do fabricante para polling rate e DPI corretos.`);
     }
     for (const ad of audioDrivers) {
       if (ad.is_generic) tips.push(`💡 Dispositivo de áudio "<b>${ad.device_name}</b>" usa driver genérico. Para menor latência sonora, instala a driver do fabricante (ex: Realtek HD Audio, SteelSeries Sonar).`);
@@ -2414,54 +2426,52 @@ async function refreshDriverInfo() {
 
       const catDiv = document.createElement('div');
       catDiv.className = 'drv-category';
+      const hasIssues = items.some(d => d.is_generic || d.status === 'outdated');
+      if (hasIssues) catDiv.classList.add('drv-cat-issue');
 
       const catHeader = document.createElement('div');
       catHeader.className = 'drv-category-header';
-      const hasIssues = items.some(d => d.is_generic || d.status === 'outdated');
-      catHeader.innerHTML = `${DRV_CATEGORY_ICONS[cat] || ''}<span>${DRV_CATEGORY_LABELS[cat] || cat}</span>${hasIssues ? '<span class="drv-cat-warn">⚠</span>' : '<span class="drv-cat-ok">✔</span>'}<span class="drv-cat-count">${items.length} driver${items.length > 1 ? 's' : ''}</span>`;
+      catHeader.innerHTML = `<span class="drv-cat-icon">${DRV_CATEGORY_ICONS[cat] || ''}</span><span class="drv-cat-name">${DRV_CATEGORY_LABELS[cat] || cat}</span>${hasIssues ? '<span class="drv-cat-warn">⚠</span>' : '<span class="drv-cat-ok">✔</span>'}<span class="drv-cat-count">${items.length}</span>`;
       catDiv.appendChild(catHeader);
 
-      const table = document.createElement('table');
-      table.className = 'drv-table';
-      const thead = document.createElement('thead');
-      thead.innerHTML = `<tr><th>Dispositivo</th><th>Driver</th><th>Versão</th><th>Fornecedor</th><th>Tipo</th><th>Estado</th><th>Data</th><th>Assinado</th></tr>`;
-      table.appendChild(thead);
-
-      const tbody = document.createElement('tbody');
+      /* ── Device cards ── */
+      const devicesWrap = document.createElement('div');
+      devicesWrap.className = 'drv-devices';
       for (const d of items) {
-        const tr = document.createElement('tr');
-        if (d.is_generic || d.status === 'outdated') tr.className = 'drv-row-warn';
+        const devCard = document.createElement('div');
+        devCard.className = 'drv-device-card';
+        if (d.is_generic || d.status === 'outdated') devCard.classList.add('drv-dev-warn');
+        if (d.status === 'current' && !d.is_generic) devCard.classList.add('drv-dev-ok');
 
-        // Type badge
         const typeBadge = d.is_generic
           ? '<span class="drv-badge generic">Genérico</span>'
-          : '<span class="drv-badge manufacturer">Fabricante</span>';
+          : '<span class="drv-badge manufacturer">OEM</span>';
 
-        // Status badge
         let statusBadge = '<span class="drv-badge unknown">?</span>';
         if (d.status === 'current')  statusBadge = '<span class="drv-badge current">Atual</span>';
         if (d.status === 'aging')    statusBadge = '<span class="drv-badge aging">&gt;6m</span>';
-        if (d.status === 'outdated') statusBadge = '<span class="drv-badge outdated">Desatualizado</span>';
+        if (d.status === 'outdated') statusBadge = '<span class="drv-badge outdated">Desatual.</span>';
 
-        // Signed
         const signedHtml = d.is_signed
-          ? '<span class="drv-signed yes">&#10004;</span>'
-          : '<span class="drv-signed no">&#10008;</span>';
+          ? '<span class="drv-signed yes">✓ Assinado</span>'
+          : '<span class="drv-signed no">✗ Não Assinado</span>';
 
-        tr.innerHTML = `
-          <td class="drv-device" title="${d.device_name}">${d.device_name}</td>
-          <td class="drv-driver" title="${d.driver_name}">${d.driver_name}</td>
-          <td class="drv-version">${d.driver_version}</td>
-          <td class="drv-provider" title="${d.manufacturer}">${d.driver_provider || d.manufacturer || 'N/A'}</td>
-          <td>${typeBadge}</td>
-          <td>${statusBadge}</td>
-          <td class="drv-date">${d.driver_date || 'N/A'}</td>
-          <td>${signedHtml}</td>
+        devCard.innerHTML = `
+          <div class="drv-dev-top">
+            <span class="drv-dev-name" title="${d.device_name}">${d.device_name}</span>
+            <div class="drv-dev-badges">${typeBadge}${statusBadge}</div>
+          </div>
+          <div class="drv-dev-details">
+            <div class="drv-dev-row"><span class="drv-dev-label">Driver</span><span class="drv-dev-val">${d.driver_name}</span></div>
+            <div class="drv-dev-row"><span class="drv-dev-label">Versão</span><span class="drv-dev-val mono">${d.driver_version}</span></div>
+            <div class="drv-dev-row"><span class="drv-dev-label">Fornecedor</span><span class="drv-dev-val">${d.driver_provider || d.manufacturer || 'N/A'}</span></div>
+            <div class="drv-dev-row"><span class="drv-dev-label">Data</span><span class="drv-dev-val mono">${d.driver_date || 'N/A'}</span></div>
+          </div>
+          <div class="drv-dev-footer">${signedHtml}</div>
         `;
-        tbody.appendChild(tr);
+        devicesWrap.appendChild(devCard);
       }
-      table.appendChild(tbody);
-      catDiv.appendChild(table);
+      catDiv.appendChild(devicesWrap);
       grid.appendChild(catDiv);
     }
 
