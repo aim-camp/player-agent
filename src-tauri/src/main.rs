@@ -1340,6 +1340,53 @@ async fn check_system_state() -> Result<serde_json::Value, String> {
 async fn run_config_as_admin(config: OptimizationConfig, section: Option<String>) -> Result<String, String> {
     let script = generate_script(config, section).await?;
 
+    // Wrap script with timing/statistics that writes a report JSON
+    let report_path = std::env::temp_dir().join("aimcamp_script_report.json");
+    let report_path_str = report_path.to_string_lossy().to_string().replace('\\', "\\\\");
+
+    let wrapped = format!(
+        r#"$_aimcamp_start = Get-Date
+$_aimcamp_errors = @()
+$_aimcamp_sections = @()
+$_aimcamp_cmds = 0
+
+# Override Write-Host to count sections/commands
+$_origEAP = $ErrorActionPreference
+
+# Trap errors
+trap {{
+    $_aimcamp_errors += $_.Exception.Message
+    continue
+}}
+
+{}
+
+$_aimcamp_end = Get-Date
+$_aimcamp_duration = ($_aimcamp_end - $_aimcamp_start).TotalSeconds
+
+# Count sections and commands from script content
+$_scriptLines = @'
+{}
+'@
+$_aimcamp_sections = ([regex]::Matches($_scriptLines, 'SECTION \d+') | ForEach-Object {{ $_.Value }})
+$_aimcamp_cmds = ([regex]::Matches($_scriptLines, '\[ OK \]')).Count
+
+$_report = @{{
+    status        = if ($_aimcamp_errors.Count -eq 0) {{ 'success' }} else {{ 'partial' }}
+    duration_secs = [math]::Round($_aimcamp_duration, 1)
+    sections_run  = $_aimcamp_sections.Count
+    commands_run  = $_aimcamp_cmds
+    errors        = @($_aimcamp_errors)
+    start_time    = $_aimcamp_start.ToString('o')
+    end_time      = $_aimcamp_end.ToString('o')
+}}
+$_report | ConvertTo-Json -Depth 3 | Set-Content -Path '{}' -Encoding UTF8
+"#,
+        script,
+        script.replace('\'', "''"),
+        report_path_str
+    );
+
     let temp_dir = std::env::temp_dir();
     let script_path = temp_dir.join("aimcamp_run.ps1");
 
@@ -1349,7 +1396,7 @@ async fn run_config_as_admin(config: OptimizationConfig, section: Option<String>
         .map_err(|e| format!("Failed to write temp script: {}", e))?;
     file.write_all(&bom)
         .map_err(|e| format!("BOM write error: {}", e))?;
-    file.write_all(script.as_bytes())
+    file.write_all(wrapped.as_bytes())
         .map_err(|e| format!("Script write error: {}", e))?;
 
     let path_str = script_path.to_string_lossy().to_string();
@@ -1579,6 +1626,188 @@ $sorted = @($unique.Values) | Sort-Object @{Expression={
     let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(stdout.trim())
         .map_err(|e| format!("Driver JSON parse: {} — {}", e, &stdout[..stdout.len().min(300)]))
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Check for available driver updates via Windows Update API
+// ────────────────────────────────────────────────────────────────────
+#[tauri::command]
+async fn check_driver_updates() -> Result<serde_json::Value, String> {
+    let script = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+
+# Use Windows Update COM API to find available driver updates
+try {
+    $session = New-Object -ComObject Microsoft.Update.Session
+    $searcher = $session.CreateUpdateSearcher()
+    $searcher.ServiceID = '7971f918-a847-4430-9279-4a52d1efe18d'  # Microsoft Update
+    $searcher.SearchScope = 1
+    $searcher.ServerSelection = 3  # Third-party (includes manufacturer drivers)
+
+    $result = $searcher.Search("IsInstalled=0 AND Type='Driver'")
+    $updates = @()
+
+    foreach ($u in $result.Updates) {
+        $hwIds = @()
+        if ($u.DriverHardwareID) { $hwIds += $u.DriverHardwareID }
+
+        # Match device name from driver update
+        $devName = ''
+        if ($u.DriverModel) { $devName = $u.DriverModel }
+
+        $updates += @{
+            title         = $u.Title
+            description   = if ($u.Description) { $u.Description.Substring(0, [Math]::Min(200, $u.Description.Length)) } else { '' }
+            driver_model  = $devName
+            driver_ver    = if ($u.DriverVerDate) { $u.DriverVerDate.ToString('yyyy-MM-dd') } else { '' }
+            driver_class  = if ($u.DriverClass) { $u.DriverClass } else { '' }
+            driver_mfr    = if ($u.DriverManufacturer) { $u.DriverManufacturer } else { '' }
+            hw_ids        = $hwIds
+            update_id     = $u.Identity.UpdateID
+            size_mb       = [math]::Round($u.MaxDownloadSize / 1MB, 1)
+            download_url  = if ($u.MoreInfoUrls -and $u.MoreInfoUrls.Count -gt 0) { $u.MoreInfoUrls[0] } else { '' }
+            is_mandatory  = [bool]$u.IsMandatory
+        }
+    }
+
+    @{ available = @($updates); error = $null } | ConvertTo-Json -Depth 4
+} catch {
+    @{ available = @(); error = $_.Exception.Message } | ConvertTo-Json -Depth 4
+}
+"#;
+    let output = Command::new("powershell")
+        .args(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
+        .output()
+        .map_err(|e| format!("Driver update check failed: {}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(stdout.trim())
+        .map_err(|e| format!("Driver update JSON parse: {} — {}", e, &stdout[..stdout.len().min(300)]))
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Install a specific driver update via Windows Update API (as admin)
+// ────────────────────────────────────────────────────────────────────
+#[tauri::command]
+async fn install_driver_update(update_id: String) -> Result<serde_json::Value, String> {
+    let report_path = std::env::temp_dir().join("aimcamp_driver_install_report.json");
+    let report_path_str = report_path.to_string_lossy().to_string();
+
+    let script = format!(r#"
+$ErrorActionPreference = 'Stop'
+$report = @{{ update_id = '{}'; status = 'starting'; steps = @(); error = $null; start_time = (Get-Date).ToString('o') }}
+
+try {{
+    $session = New-Object -ComObject Microsoft.Update.Session
+    $searcher = $session.CreateUpdateSearcher()
+    $searcher.ServiceID = '7971f918-a847-4430-9279-4a52d1efe18d'
+    $searcher.SearchScope = 1
+    $searcher.ServerSelection = 3
+
+    $result = $searcher.Search("IsInstalled=0 AND Type='Driver'")
+    $target = $null
+    foreach ($u in $result.Updates) {{
+        if ($u.Identity.UpdateID -eq '{}') {{ $target = $u; break }}
+    }}
+
+    if (-not $target) {{
+        $report.status = 'not_found'
+        $report.error = 'Update not found. It may have already been installed.'
+        $report | ConvertTo-Json -Depth 3 | Set-Content -Path '{}' -Encoding UTF8
+        exit 1
+    }}
+
+    $report.steps += 'Update found: ' + $target.Title
+
+    # Accept EULA
+    if (-not $target.EulaAccepted) {{ $target.AcceptEula() }}
+    $report.steps += 'EULA accepted'
+
+    # Download
+    $report.status = 'downloading'
+    $report | ConvertTo-Json -Depth 3 | Set-Content -Path '{}' -Encoding UTF8
+    $dl = New-Object -ComObject Microsoft.Update.UpdateColl
+    $dl.Add($target) | Out-Null
+    $downloader = $session.CreateUpdateDownloader()
+    $downloader.Updates = $dl
+    $dlResult = $downloader.Download()
+    $report.steps += 'Downloaded (result: ' + $dlResult.ResultCode + ')'
+
+    # Install
+    $report.status = 'installing'
+    $report | ConvertTo-Json -Depth 3 | Set-Content -Path '{}' -Encoding UTF8
+    $inst = New-Object -ComObject Microsoft.Update.UpdateColl
+    $inst.Add($target) | Out-Null
+    $installer = $session.CreateUpdateInstaller()
+    $installer.Updates = $inst
+    $instResult = $installer.Install()
+    $resultCode = $instResult.GetUpdateResult(0).ResultCode
+    # 2 = Succeeded, 3 = SucceededWithErrors
+    if ($resultCode -eq 2 -or $resultCode -eq 3) {{
+        $report.status = 'success'
+        $report.steps += 'Installation completed successfully'
+        $report.needs_reboot = $instResult.RebootRequired
+    }} else {{
+        $report.status = 'failed'
+        $report.error = 'Install result code: ' + $resultCode
+    }}
+}} catch {{
+    $report.status = 'failed'
+    $report.error = $_.Exception.Message
+}}
+
+$report.end_time = (Get-Date).ToString('o')
+$report | ConvertTo-Json -Depth 3 | Set-Content -Path '{}' -Encoding UTF8
+"#, update_id, update_id, report_path_str, report_path_str, report_path_str, report_path_str);
+
+    let temp_dir = std::env::temp_dir();
+    let script_path = temp_dir.join("aimcamp_driver_install.ps1");
+
+    let bom: [u8; 3] = [0xEF, 0xBB, 0xBF];
+    let mut file = File::create(&script_path)
+        .map_err(|e| format!("Failed to write driver install script: {}", e))?;
+    file.write_all(&bom).map_err(|e| format!("BOM write error: {}", e))?;
+    file.write_all(script.as_bytes()).map_err(|e| format!("Script write error: {}", e))?;
+
+    let path_str = script_path.to_string_lossy().to_string();
+    Command::new("powershell")
+        .args(&[
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File \"{}\"' -Wait",
+                path_str.replace('\'', "''")
+            ),
+        ])
+        .output()
+        .map_err(|e| format!("Failed to launch driver install: {}", e))?;
+
+    // Read the report
+    if report_path.exists() {
+        let content = std::fs::read_to_string(&report_path)
+            .map_err(|e| format!("Failed to read report: {}", e))?;
+        let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
+        let _ = std::fs::remove_file(&report_path);
+        serde_json::from_str(content.trim())
+            .map_err(|e| format!("Report parse error: {}", e))
+    } else {
+        Ok(serde_json::json!({ "status": "unknown", "error": "No report file generated. The UAC prompt may have been declined." }))
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Get script execution report
+// ────────────────────────────────────────────────────────────────────
+#[tauri::command]
+async fn get_script_report() -> Result<serde_json::Value, String> {
+    let report_path = std::env::temp_dir().join("aimcamp_script_report.json");
+    if !report_path.exists() {
+        return Ok(serde_json::json!({ "status": "no_report" }));
+    }
+    let content = std::fs::read_to_string(&report_path)
+        .map_err(|e| format!("Failed to read report: {}", e))?;
+    let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
+    serde_json::from_str(content.trim())
+        .map_err(|e| format!("Report parse error: {}", e))
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1993,6 +2222,7 @@ async fn parse_benchmark_file(path: String) -> Result<BenchmarkResult, String> {
 fn parse_presentmon_csv(path: &str, file_name: &str) -> Result<BenchmarkResult, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Erro ao ler ficheiro: {}", e))?;
+    let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
     let mut lines = content.lines();
 
     // Parse header to find column indices
@@ -2066,7 +2296,8 @@ fn parse_presentmon_csv(path: &str, file_name: &str) -> Result<BenchmarkResult, 
 fn parse_capframex_json(path: &str, file_name: &str) -> Result<BenchmarkResult, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Erro ao ler ficheiro: {}", e))?;
-    let json: serde_json::Value = serde_json::from_str(&content)
+    let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
+    let json: serde_json::Value = serde_json::from_str(content)
         .map_err(|e| format!("JSON inválido: {}", e))?;
 
     // CapFrameX JSON format: { "Runs": [ { "CaptureData": { "MsBetweenPresents": [...], "Dropped": [...] } } ], "Info": { "ProcessName": "..." } }
@@ -2324,6 +2555,9 @@ fn main() {
             load_cfg,
             get_hardware_info,
             get_driver_info,
+            check_driver_updates,
+            install_driver_update,
+            get_script_report,
             list_processes,
             kill_process,
             ping_server,

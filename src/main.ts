@@ -930,6 +930,7 @@ async function runConfigAsAdmin() {
     toast("Generating & launching as Admin…");
     const msg = await invoke<string>("run_config_as_admin", { config });
     toast(msg);
+    pollScriptReport();
   } catch (e) {
     console.error(e);
     toast("Failed to run config as admin", true);
@@ -945,10 +946,83 @@ async function runSectionAsAdmin(section: string, label: string) {
     // Remove pending badge from the card
     const card = document.querySelector(`[data-section="${section}"]`);
     if (card) card.classList.remove("card-pending");
+    pollScriptReport();
   } catch (e) {
     console.error(e);
     toast(`Falha ao aplicar ${label}`, true);
   }
+}
+
+/** Poll for PS1 script report and show modal when ready */
+async function pollScriptReport() {
+  let attempts = 0;
+  const maxAttempts = 120; // ~2 minutes
+  const interval = setInterval(async () => {
+    attempts++;
+    if (attempts > maxAttempts) { clearInterval(interval); return; }
+    try {
+      const report = await invoke<ScriptReport>("get_script_report");
+      if (!report || report.status === "no_report") return;
+      clearInterval(interval);
+      showScriptReportModal(report);
+    } catch { /* keep polling */ }
+  }, 1000);
+}
+
+function showScriptReportModal(report: ScriptReport) {
+  const existing = document.getElementById("script-report-modal");
+  if (existing) existing.remove();
+
+  const durationStr = report.duration_secs ? `${report.duration_secs}s` : "N/A";
+  const startStr = report.start_time ? new Date(report.start_time).toLocaleTimeString() : "";
+  const endStr = report.end_time ? new Date(report.end_time).toLocaleTimeString() : "";
+  const statusIcon = report.status === "success" ? "✅" : report.status === "partial" ? "⚠️" : "❌";
+  const statusText = report.status === "success" ? "Sucesso" : report.status === "partial" ? "Parcial (com erros)" : "Falhou";
+
+  const errorsHtml = report.errors && report.errors.length > 0
+    ? `<div class="report-errors"><div class="report-errors-title">Erros (${report.errors.length}):</div>${report.errors.map((e) => `<div class="report-error-item">• ${e}</div>`).join("")}</div>`
+    : "";
+
+  const modal = document.createElement("div");
+  modal.id = "script-report-modal";
+  modal.className = "modal-overlay";
+  modal.innerHTML = `
+    <div class="modal-box report-modal">
+      <div class="modal-title">${statusIcon} Relatório de Execução</div>
+      <div class="report-grid">
+        <div class="report-stat">
+          <span class="report-stat-val">${statusText}</span>
+          <span class="report-stat-label">Estado</span>
+        </div>
+        <div class="report-stat">
+          <span class="report-stat-val">${durationStr}</span>
+          <span class="report-stat-label">Duração</span>
+        </div>
+        <div class="report-stat">
+          <span class="report-stat-val">${report.sections_run || 0}</span>
+          <span class="report-stat-label">Secções</span>
+        </div>
+        <div class="report-stat">
+          <span class="report-stat-val">${report.commands_run || 0}</span>
+          <span class="report-stat-label">Comandos</span>
+        </div>
+        <div class="report-stat">
+          <span class="report-stat-val">${startStr}</span>
+          <span class="report-stat-label">Início</span>
+        </div>
+        <div class="report-stat">
+          <span class="report-stat-val">${endStr}</span>
+          <span class="report-stat-label">Fim</span>
+        </div>
+      </div>
+      ${errorsHtml}
+      <button class="modal-close-btn" id="report-close-btn">Fechar</button>
+    </div>
+  `;
+  document.body.appendChild(modal);
+
+  modal.addEventListener("click", (e) => { if (e.target === modal) modal.remove(); });
+  document.getElementById("report-close-btn")?.addEventListener("click", () => modal.remove());
 }
 
 function copyLaunchOptions() {
@@ -1882,6 +1956,30 @@ interface DriverEntry {
   status: string; // 'current' | 'aging' | 'outdated' | 'unknown'
 }
 
+interface DriverUpdate {
+  title: string;
+  description: string;
+  driver_model: string;
+  driver_ver: string;
+  driver_class: string;
+  driver_mfr: string;
+  hw_ids: string[];
+  update_id: string;
+  size_mb: number;
+  download_url: string;
+  is_mandatory: boolean;
+}
+
+interface ScriptReport {
+  status: string;
+  duration_secs: number;
+  sections_run: number;
+  commands_run: number;
+  errors: string[];
+  start_time: string;
+  end_time: string;
+}
+
 const DRV_CATEGORY_ICONS: Record<string, string> = {
   GPU: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h4v4H6z"/><circle cx="16" cy="12" r="2"/></svg>',
   Monitor:
@@ -2778,6 +2876,15 @@ async function refreshDriverInfo() {
   el.innerHTML = '<div class="net-status">A analisar drivers do sistema e periféricos...</div>';
   try {
     const drivers = await invoke<DriverEntry[]>("get_driver_info");
+    el.innerHTML = '<div class="net-status">A verificar atualizações disponíveis...</div>';
+
+    // Fetch available updates in parallel
+    let updates: DriverUpdate[] = [];
+    try {
+      const uResult = await invoke<{ available: DriverUpdate[]; error: string | null }>("check_driver_updates");
+      if (uResult.available) updates = uResult.available;
+    } catch { /* non-fatal */ }
+
     el.innerHTML = "";
 
     // Summary stats
@@ -2795,6 +2902,7 @@ async function refreshDriverInfo() {
       <div class="drv-summary-item"><span class="drv-summary-val${outdatedCount > 0 ? " bad" : ""}">${outdatedCount}</span><span class="drv-summary-label">Desatualizados</span></div>
       <div class="drv-summary-item"><span class="drv-summary-val${agingCount > 0 ? " warn" : ""}">${agingCount}</span><span class="drv-summary-label">&gt;6 meses</span></div>
       <div class="drv-summary-item"><span class="drv-summary-val">${currentCount}</span><span class="drv-summary-label">Atuais</span></div>
+      <div class="drv-summary-item"><span class="drv-summary-val${updates.length > 0 ? " good" : ""}">${updates.length}</span><span class="drv-summary-label">Updates</span></div>
     `;
     el.appendChild(summary);
 
@@ -2875,18 +2983,71 @@ async function refreshDriverInfo() {
 
         const signedHtml = d.is_signed ? '<span class="drv-signed yes">✓ Assinado</span>' : '<span class="drv-signed no">✗ Não Assinado</span>';
 
+        // Match available update to this device
+        const devNameLower = d.device_name.toLowerCase();
+        const matchedUpdate = updates.find((u) => {
+          const modelLower = (u.driver_model || u.title || "").toLowerCase();
+          return modelLower.includes(devNameLower) || devNameLower.includes(modelLower) ||
+            (u.driver_mfr && d.manufacturer && u.driver_mfr.toLowerCase().includes(d.manufacturer.toLowerCase()) &&
+             u.driver_class && d.category && u.driver_class.toLowerCase().includes(d.category.toLowerCase()));
+        });
+
+        let updateHtml = "";
+        if (matchedUpdate) {
+          const dlLink = matchedUpdate.download_url
+            ? `<a class="drv-update-link" href="#" title="Abrir página de download"
+                onclick="event.preventDefault(); window.__TAURI__?.shell?.open?.('${matchedUpdate.download_url}') || window.open('${matchedUpdate.download_url}','_blank')">⬇ Download</a>`
+            : "";
+          const sizeTxt = matchedUpdate.size_mb > 0 ? ` (${matchedUpdate.size_mb} MB)` : "";
+          updateHtml = `
+            <div class="drv-update-row" title="${matchedUpdate.title}\n${matchedUpdate.description}">
+              <span class="drv-badge current">⬆ Update</span>
+              <span class="drv-update-title">${matchedUpdate.title}${sizeTxt}</span>
+              ${dlLink}
+              <button class="drv-install-btn" data-update-id="${matchedUpdate.update_id}" title="Instalar driver em background (requer Admin)">⚡ Instalar</button>
+            </div>`;
+        }
+
         devCard.innerHTML = `
           <div class="drv-dev-top">
+            ${typeBadge}${statusBadge}
             <span class="drv-dev-name" title="${d.device_name}">${d.device_name}</span>
-            <div class="drv-dev-badges">${typeBadge}${statusBadge}</div>
           </div>
           <div class="drv-dev-details">
-            <div class="drv-dev-row"><span class="drv-dev-label">v</span><span class="drv-dev-val mono">${d.driver_version}</span></div>
-            <div class="drv-dev-row"><span class="drv-dev-label">${d.driver_provider || d.manufacturer || "N/A"}</span></div>
-            <div class="drv-dev-row"><span class="drv-dev-val mono">${d.driver_date || ""}</span></div>
+            <span class="drv-dev-val mono">${d.driver_version}</span>
+            <span class="drv-dev-label">${d.driver_provider || d.manufacturer || ""}</span>
+            <span class="drv-dev-val mono">${d.driver_date || ""}</span>
+            ${signedHtml}
           </div>
-          <div class="drv-dev-footer">${signedHtml}</div>
+          ${updateHtml}
         `;
+
+        // Attach install button handler
+        const installBtn = devCard.querySelector(".drv-install-btn") as HTMLButtonElement | null;
+        if (installBtn) {
+          installBtn.addEventListener("click", async () => {
+            const uid = installBtn.dataset.updateId;
+            if (!uid) return;
+            installBtn.disabled = true;
+            installBtn.textContent = "⏳ A instalar...";
+            try {
+              const report = await invoke<{ status: string; error?: string; steps?: string[]; needs_reboot?: boolean }>("install_driver_update", { updateId: uid });
+              if (report.status === "success") {
+                installBtn.textContent = "✅ Instalado";
+                installBtn.classList.add("drv-install-done");
+                if (report.needs_reboot) toast("Driver instalado! Reinicia o PC para aplicar.");
+                else toast("Driver instalado com sucesso!");
+              } else {
+                installBtn.textContent = "❌ Falhou";
+                toast(report.error || "Falha na instalação da driver", true);
+              }
+            } catch (e) {
+              installBtn.textContent = "❌ Erro";
+              toast(`Erro ao instalar driver: ${e}`, true);
+            }
+          });
+        }
+
         devicesWrap.appendChild(devCard);
       }
       catDiv.appendChild(devicesWrap);

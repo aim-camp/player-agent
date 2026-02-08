@@ -1,6 +1,6 @@
 {
   "name": "aimcamp-player-agent",
-  "version": "1.0.7",
+  "version": "1.0.9",
   "description": "CS2 System Optimization Tool",
   "type": "module",
   "scripts": {

@@ -1149,8 +1149,9 @@ textarea:focus {
 }
 /* Device cards inside category */
 .drv-devices {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
   gap: 0;
   padding: 0;
 }
@@ -1159,12 +1160,13 @@ textarea:focus {
   border: none;
   border-bottom: 1px solid rgba(255, 255, 255, 0.03);
   border-radius: 0;
-  padding: 6px 10px;
+  padding: 7px 10px;
   display: flex;
-  flex-direction: row;
-  align-items: center;
-  gap: 10px;
+  flex-direction: column;
+  gap: 4px;
   transition: background 0.15s;
+  min-width: 220px;
+  flex: 1 1 auto;
 }
 .drv-device-card:last-child {
   border-bottom: none;
@@ -1182,19 +1184,20 @@ textarea:focus {
 .drv-dev-top {
   display: flex;
   align-items: center;
-  gap: 6px;
-  flex: 1;
+  gap: 5px;
+  width: 100%;
   min-width: 0;
 }
 .drv-dev-name {
   font-size: 10.5px;
   font-weight: 700;
   color: rgba(255, 255, 255, 0.88);
-  flex: 1;
   line-height: 1.2;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-width: 0;
+  flex: 1;
 }
 .drv-dev-badges {
   display: flex;
@@ -1204,36 +1207,28 @@ textarea:focus {
 .drv-dev-details {
   display: flex;
   flex-direction: row;
-  gap: 10px;
-  flex-shrink: 0;
-}
-.drv-dev-row {
-  display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 4px;
+  gap: 3px 8px;
+  width: 100%;
   font-size: 9px;
 }
 .drv-dev-label {
-  color: rgba(255, 255, 255, 0.25);
+  color: rgba(255, 255, 255, 0.3);
   font-weight: 600;
-  text-transform: uppercase;
-  font-size: 7.5px;
-  letter-spacing: 0.06em;
+  font-size: 8px;
+  letter-spacing: 0.04em;
 }
 .drv-dev-val {
-  color: rgba(255, 255, 255, 0.55);
+  color: rgba(255, 255, 255, 0.5);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 120px;
+  max-width: 180px;
 }
 .drv-dev-val.mono {
   font-family: "Orbitron", monospace;
   font-size: 8.5px;
-}
-.drv-dev-footer {
-  flex-shrink: 0;
-  font-size: 9px;
 }
 .drv-badge {
   display: inline-flex;
@@ -1291,6 +1286,164 @@ textarea:focus {
 .drv-signed.no {
   color: #ff6b6b;
 }
+
+/* ── Driver update row ── */
+.drv-update-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0 0;
+  width: 100%;
+  flex-wrap: wrap;
+  font-size: 9px;
+  border-top: 1px dashed rgba(0, 255, 170, 0.12);
+  margin-top: 3px;
+}
+.drv-update-title {
+  color: rgba(255, 255, 255, 0.55);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 200px;
+  font-size: 8px;
+}
+.drv-update-link {
+  color: #00ccff;
+  text-decoration: none;
+  font-size: 8px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 1px 5px;
+  border-radius: 2px;
+  background: rgba(0, 204, 255, 0.08);
+  border: 1px solid rgba(0, 204, 255, 0.2);
+  transition: background 0.15s;
+}
+.drv-update-link:hover {
+  background: rgba(0, 204, 255, 0.18);
+}
+.drv-install-btn {
+  font-size: 8px;
+  font-weight: 700;
+  color: #00ffaa;
+  background: rgba(0, 255, 170, 0.08);
+  border: 1px solid rgba(0, 255, 170, 0.25);
+  border-radius: 2px;
+  padding: 1px 6px;
+  cursor: pointer;
+  font-family: "Orbitron", monospace;
+  transition: background 0.15s, border-color 0.15s;
+  white-space: nowrap;
+}
+.drv-install-btn:hover {
+  background: rgba(0, 255, 170, 0.18);
+  border-color: rgba(0, 255, 170, 0.4);
+}
+.drv-install-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.drv-install-btn.drv-install-done {
+  color: #00ffaa;
+  background: rgba(0, 255, 170, 0.12);
+  border-color: rgba(0, 255, 170, 0.3);
+}
+
+/* ── Script Report modal ── */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9000;
+  background: rgba(0, 0, 0, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  backdrop-filter: blur(4px);
+  animation: fadeIn 0.15s ease-out;
+}
+.modal-box {
+  background: rgba(16, 16, 24, 0.98);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  padding: 16px 20px;
+  min-width: 280px;
+}
+.modal-title {
+  font-family: "Orbitron", monospace;
+  font-size: 13px;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.9);
+  margin-bottom: 4px;
+  text-align: center;
+}
+.report-modal {
+  max-width: 420px;
+}
+.report-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 8px;
+  margin: 12px 0;
+}
+.report-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+.report-stat-val {
+  font-family: "Orbitron", monospace;
+  font-size: 13px;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.9);
+}
+.report-stat-label {
+  font-size: 8px;
+  color: rgba(255, 255, 255, 0.35);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.report-errors {
+  margin: 8px 0;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: rgba(255, 60, 60, 0.06);
+  border: 1px solid rgba(255, 60, 60, 0.15);
+}
+.report-errors-title {
+  font-size: 9px;
+  font-weight: 700;
+  color: #ff6b6b;
+  margin-bottom: 4px;
+}
+.report-error-item {
+  font-size: 8px;
+  color: rgba(255, 255, 255, 0.5);
+  padding: 1px 0;
+}
+.modal-close-btn {
+  display: block;
+  width: 100%;
+  padding: 8px;
+  margin-top: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: "Orbitron", monospace;
+  transition: background 0.15s;
+}
+.modal-close-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
 .drv-summary {
   display: flex;
   gap: 12px;
@@ -1327,6 +1480,9 @@ textarea:focus {
 }
 .drv-summary-val.bad {
   color: #ff6b6b;
+}
+.drv-summary-val.good {
+  color: #00ffaa;
 }
 
 /* ── Driver Tips ────────────────────────────────────────────────── */
