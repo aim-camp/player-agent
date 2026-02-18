@@ -7641,6 +7641,8 @@ function build() {
   restoreRow.appendChild(btnRestoreAll);
   netPanel1.appendChild(restoreRow);
 
+  for (const p of netSub.panels) tabNet.appendChild(p);
+
   const netSig = document.createElement("section");
   netSig.className = "cfg-actions";
   netSig.style.marginTop = "auto";
