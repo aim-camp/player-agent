@@ -4,6 +4,30 @@ import { appWindow } from "@tauri-apps/api/window";
 import "./style.css";
 
 /* ================================================================
+   Global error handler — catch-all for uncaught errors & rejections
+   ================================================================ */
+globalThis.onerror = (_msg, _src, _line, _col, err) => {
+  console.error("[Global]", err);
+  try {
+    const t = document.createElement("div");
+    t.className = "status-toast toast-error";
+    t.textContent = `Unexpected error: ${err?.message ?? "unknown"}`;
+    document.body.appendChild(t);
+    setTimeout(() => t.remove(), 5000);
+  } catch { /* avoid infinite loop */ }
+};
+globalThis.onunhandledrejection = (ev: PromiseRejectionEvent) => {
+  console.error("[UnhandledRejection]", ev.reason);
+  try {
+    const t = document.createElement("div");
+    t.className = "status-toast toast-error";
+    t.textContent = `Unhandled promise: ${ev.reason?.message ?? String(ev.reason)}`;
+    document.body.appendChild(t);
+    setTimeout(() => t.remove(), 5000);
+  } catch { /* avoid infinite loop */ }
+};
+
+/* ================================================================
    TypeScript interfaces – mirrors Rust structs
    ================================================================ */
 
@@ -111,6 +135,7 @@ interface LaunchOptionsConfig {
   tickrate_128: boolean;
   nojoy: boolean;
   high_priority: boolean;
+  allow_third_party: boolean;
   threads: string;
   exec_autoexec: boolean;
   custom_args: string;
@@ -151,6 +176,309 @@ interface OptimizationConfig {
 let _currentScriptPath = "";
 
 /* ================================================================
+   Schema System — layout customization for CFG tabs
+   ================================================================ */
+interface SchemaTabLayout {
+  /** Ordered list of command IDs visible in this tab view */
+  commands: string[];
+}
+
+interface Schema {
+  id: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+  /** Maps tab view names to their layouts.
+   *  Keys: "Principal", "sec_Performance", "sec_Crosshair", "sec_HUD & Radar",
+   *        "sec_Audio", "sec_Input & Rede", "sec_Outros" */
+  cfgLayout: Record<string, SchemaTabLayout>;
+  /** SYS + CFG input values snapshot (checkbox states + text values) */
+  values?: Record<string, string | boolean>;
+}
+
+const SCHEMA_STORAGE_KEY = "aimcamp_schemas";
+const SCHEMA_ACTIVE_KEY = "aimcamp_schema_active";
+
+function getSchemas(): Schema[] {
+  try {
+    return JSON.parse(localStorage.getItem(SCHEMA_STORAGE_KEY) || "[]");
+  } catch { return []; }
+}
+function saveSchemas(schemas: Schema[]): void {
+  localStorage.setItem(SCHEMA_STORAGE_KEY, JSON.stringify(schemas));
+}
+function getActiveSchemaId(): string | null {
+  return localStorage.getItem(SCHEMA_ACTIVE_KEY);
+}
+function setActiveSchemaId(id: string | null): void {
+  if (id) localStorage.setItem(SCHEMA_ACTIVE_KEY, id);
+  else localStorage.removeItem(SCHEMA_ACTIVE_KEY);
+}
+function getActiveSchema(): Schema | null {
+  const id = getActiveSchemaId();
+  if (!id) return null;
+  return getSchemas().find((s) => s.id === id) || null;
+}
+function generateSchemaId(): string {
+  return "sch_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+}
+function createSchema(name: string): Schema {
+  const schemas = getSchemas();
+  const now = new Date().toISOString();
+  // Build default layout from current CFG pri flags
+  const priCmds: string[] = [];
+  const secMap: Record<string, string[]> = {
+    sec_Performance: [], sec_Crosshair: [], "sec_HUD & Radar": [],
+    sec_Audio: [], "sec_Input & Rede": [], sec_Outros: [],
+  };
+  const catToSec = CAT_TO_SEC_KEY;
+  for (const cat of CFG) {
+    for (const cmd of cat.commands) {
+      if (cmd.pri) priCmds.push(cmd.id);
+      else {
+        const key = catToSec[cat.name] || "sec_Outros";
+        if (secMap[key]) secMap[key].push(cmd.id);
+      }
+    }
+  }
+  const cfgLayout: Record<string, SchemaTabLayout> = { Principal: { commands: priCmds } };
+  for (const [k, v] of Object.entries(secMap)) cfgLayout[k] = { commands: v };
+
+  const schema: Schema = { id: generateSchemaId(), name, createdAt: now, updatedAt: now, cfgLayout, values: {} };
+  schemas.push(schema);
+  saveSchemas(schemas);
+  return schema;
+}
+
+/** Save current SYS+CFG input values into the active schema */
+function saveSchemaValues(schemaId: string, vals: Record<string, string | boolean>): void {
+  const schemas = getSchemas();
+  const s = schemas.find((x) => x.id === schemaId);
+  if (s) {
+    s.values = vals;
+    s.updatedAt = new Date().toISOString();
+    saveSchemas(schemas);
+  }
+}
+function deleteSchema(id: string): void {
+  const schemas = getSchemas().filter((s) => s.id !== id);
+  saveSchemas(schemas);
+  if (getActiveSchemaId() === id) setActiveSchemaId(null);
+}
+function renameSchema(id: string, newName: string): void {
+  const schemas = getSchemas();
+  const s = schemas.find((x) => x.id === id);
+  if (s) { s.name = newName; s.updatedAt = new Date().toISOString(); saveSchemas(schemas); }
+}
+function updateSchemaTabLayout(schemaId: string, tabView: string, commandIds: string[]): void {
+  const schemas = getSchemas();
+  const s = schemas.find((x) => x.id === schemaId);
+  if (s) {
+    s.cfgLayout[tabView] = { commands: commandIds };
+    s.updatedAt = new Date().toISOString();
+    saveSchemas(schemas);
+  }
+}
+function _schemaToJson(schema: Schema): string {
+  return JSON.stringify(schema, null, 2);
+}
+function schemaFromJson(json: string): Schema | null {
+  try {
+    const obj = JSON.parse(json);
+    if (obj?.id && obj.name && obj.cfgLayout) return obj as Schema;
+    return null;
+  } catch { return null; }
+}
+
+/** Import or update a schema from a .pla JSON string. Returns the schema. */
+function _importSchemaFromPla(plaJson: string): Schema | null {
+  const imported = schemaFromJson(plaJson);
+  if (!imported) return null;
+  const schemas = getSchemas();
+  const existing = schemas.find((s) => s.id === imported.id);
+  if (existing) {
+    existing.name = imported.name;
+    existing.cfgLayout = imported.cfgLayout;
+    if (imported.values) existing.values = imported.values;
+    existing.updatedAt = new Date().toISOString();
+    saveSchemas(schemas);
+    return existing;
+  }
+  imported.updatedAt = new Date().toISOString();
+  schemas.push(imported);
+  saveSchemas(schemas);
+  return imported;
+}
+
+/** Map CFG category name → schema sec_ key */
+const CAT_TO_SEC_KEY: Record<string, string> = {
+  Performance: "sec_Performance", Viewmodel: "sec_Performance",
+  Crosshair: "sec_Crosshair",
+  HUD: "sec_HUD & Radar", Radar: "sec_HUD & Radar",
+  Audio: "sec_Audio",
+  "Mouse & Input": "sec_Input & Rede", Network: "sec_Input & Rede",
+  "Voice & Comms": "sec_Outros", "Buy & Economy": "sec_Outros",
+  "Spectator & Demo": "sec_Outros", "Misc & QoL": "sec_Outros",
+};
+
+/** Find the category name for a given command ID */
+function findCmdCatName(cmdId: string): string {
+  for (const cat of CFG) {
+    if (cat.commands.some((c) => c.id === cmdId)) return cat.name;
+  }
+  return "Misc & QoL";
+}
+
+/** Create the "Default" schema with ALL commands included */
+function createDefaultSchema(): Schema {
+  const schemas = getSchemas();
+  const now = new Date().toISOString();
+  const priCmds: string[] = [];
+  const secMap: Record<string, string[]> = {
+    sec_Performance: [], sec_Crosshair: [], "sec_HUD & Radar": [],
+    sec_Audio: [], "sec_Input & Rede": [], sec_Outros: [],
+  };
+  const catToSec = CAT_TO_SEC_KEY;
+  for (const cat of CFG) {
+    for (const cmd of cat.commands) {
+      if (cmd.pri) priCmds.push(cmd.id);
+      else {
+        const key = catToSec[cat.name] || "sec_Outros";
+        if (secMap[key]) secMap[key].push(cmd.id);
+      }
+    }
+  }
+  const cfgLayout: Record<string, SchemaTabLayout> = { Principal: { commands: priCmds } };
+  for (const [k, v] of Object.entries(secMap)) cfgLayout[k] = { commands: v };
+  const schema: Schema = { id: generateSchemaId(), name: "Default", createdAt: now, updatedAt: now, cfgLayout, values: {} };
+  schemas.push(schema);
+  saveSchemas(schemas);
+  return schema;
+}
+
+/** Get active schema, creating a default one if none exists */
+function ensureActiveSchema(): Schema {
+  let schema = getActiveSchema();
+  if (!schema) {
+    // No active schema — check if any schemas exist
+    const schemas = getSchemas();
+    if (schemas.length > 0) {
+      // Activate the first available schema
+      schema = schemas[0];
+      setActiveSchemaId(schema.id);
+    } else {
+      // First run — create "Default" schema with all commands
+      schema = createDefaultSchema();
+      setActiveSchemaId(schema.id);
+    }
+  }
+  return schema;
+}
+
+/** Build a Set of command IDs that are in "Principal" based on active schema or defaults */
+function getPrincipalSet(): Set<string> {
+  const schema = getActiveSchema();
+  if (schema?.cfgLayout?.Principal) {
+    return new Set(schema.cfgLayout.Principal.commands);
+  }
+  // Default: use pri flags from CFG data
+  const s = new Set<string>();
+  for (const cat of CFG) {
+    for (const cmd of cat.commands) {
+      if (cmd.pri) s.add(cmd.id);
+    }
+  }
+  return s;
+}
+
+/** Toggle a command between Primary and Secondary in the active schema */
+function toggleCmdPrincipal(cmdId: string, makePrincipal: boolean): void {
+  const schema = ensureActiveSchema();
+  if (!schema.cfgLayout.Principal) schema.cfgLayout.Principal = { commands: [] };
+  if (makePrincipal) {
+    // Add to Principal
+    if (!schema.cfgLayout.Principal.commands.includes(cmdId)) {
+      schema.cfgLayout.Principal.commands.push(cmdId);
+    }
+    // Remove from all sec_ layouts
+    for (const key of Object.keys(schema.cfgLayout)) {
+      if (key.startsWith("sec_")) {
+        schema.cfgLayout[key].commands = schema.cfgLayout[key].commands.filter((id) => id !== cmdId);
+      }
+    }
+  } else {
+    // Remove from Principal
+    schema.cfgLayout.Principal.commands = schema.cfgLayout.Principal.commands.filter((id) => id !== cmdId);
+    // Add to appropriate sec_ layout
+    const catName = findCmdCatName(cmdId);
+    const secKey = CAT_TO_SEC_KEY[catName] || "sec_Outros";
+    if (!schema.cfgLayout[secKey]) schema.cfgLayout[secKey] = { commands: [] };
+    if (!schema.cfgLayout[secKey].commands.includes(cmdId)) {
+      schema.cfgLayout[secKey].commands.push(cmdId);
+    }
+  }
+  // Persist
+  const schemas = getSchemas();
+  const idx = schemas.findIndex((s) => s.id === schema.id);
+  if (idx >= 0) { schemas[idx] = schema; saveSchemas(schemas); }
+}
+
+/** Save the order of rows within a SYS card to localStorage */
+const SYS_ORDER_KEY = "aimcamp_sys_order_";
+function saveSysCardOrder(section: string, ids: string[]): void {
+  localStorage.setItem(SYS_ORDER_KEY + section, JSON.stringify(ids));
+}
+function restoreSysCardOrder(cardEl: HTMLElement): void {
+  const section = cardEl.dataset.section;
+  if (!section) return;
+  const saved = localStorage.getItem(SYS_ORDER_KEY + section);
+  if (!saved) return;
+  try {
+    const order: string[] = JSON.parse(saved);
+    const rows = Array.from(cardEl.querySelectorAll<HTMLElement>(":scope > .toggle-row"));
+    const rowMap = new Map<string, HTMLElement>();
+    rows.forEach((r) => {
+      const cb = r.querySelector<HTMLInputElement>("input[type=checkbox]");
+      if (cb) rowMap.set(cb.id, r);
+    });
+    const applyBtn = cardEl.querySelector(".card-apply-btn");
+    for (const id of order) {
+      const row = rowMap.get(id);
+      if (row) {
+        if (applyBtn) applyBtn.before(row);
+        else cardEl.appendChild(row);
+      }
+    }
+  } catch { /* ignore */ }
+}
+
+/* Layout edit state */
+let _layoutEditMode = false;
+let _layoutEditTabView = "";
+let _layoutEditOriginal: string[] = [];
+let _layoutEditContainer: HTMLElement | null = null;
+
+/** Get the current tab view name based on active CFG sub-tab state */
+function getCurrentCfgTabView(): string {
+  // Check CFG inner sub-tabs (Primary / Secondary)
+  const cfgPanel = document.getElementById("tab-cfg");
+  if (!cfgPanel) return "Principal";
+  const mainBtns = cfgPanel.querySelectorAll<HTMLButtonElement>(":scope > .sub-tab-bar > .sub-tab-btn");
+  const mainPanels = cfgPanel.querySelectorAll<HTMLElement>(":scope > .sub-tab-panel");
+  let mainActive = 0;
+  mainBtns.forEach((b, i) => { if (b.classList.contains("active")) mainActive = i; });
+  if (mainActive === 0) return "Principal";
+  // Secondary — find which inner sub-tab is active
+  const secPanel = mainPanels[1];
+  if (!secPanel) return "sec_Performance";
+  const innerBtns = secPanel.querySelectorAll<HTMLButtonElement>(".inner-sub-tab-bar .sub-tab-btn");
+  const innerLabels = ["sec_Performance", "sec_Crosshair", "sec_HUD & Radar", "sec_Audio", "sec_Input & Rede", "sec_Outros"];
+  let innerActive = 0;
+  innerBtns.forEach((b, i) => { if (b.classList.contains("active")) innerActive = i; });
+  return innerLabels[innerActive] || "sec_Performance";
+}
+
+/* ================================================================
    Color Themes
    ================================================================ */
 interface Theme {
@@ -188,102 +516,538 @@ const IMPACT: Record<string, number> = {
   /* BIOS — informational only (manual BIOS settings), not in estimate */
 
   /* Windows */
-  w_power: 3.0, // Ultimate Performance plan — 2-5%
+  w_power: 3, // Ultimate Performance plan — 2-5%
   w_dvr: 2.5, // Game DVR off — 2-4% (encoder overhead)
-  w_bar: 1.0, // Game Bar off — 0.5-1.5% overlay overhead
-  w_mode: 1.0, // Game Mode off — 0-2% inconsistent
+  w_bar: 1, // Game Bar off — 0.5-1.5% overlay overhead
+  w_mode: 1, // Game Mode off — 0-2% inconsistent
   w_hib: 0.5, // Hibernation off — stability, <1% FPS
-  w_mouse: 0.0, // Mouse accel — aim quality, no FPS
-  w_fso: 2.0, // Fullscreen Optim off — 1-3% + input lag
+  w_mouse: 0, // Mouse accel — aim quality, no FPS
+  w_fso: 2, // Fullscreen Optim off — 1-3% + input lag
   w_vis: 0.5, // Visual Effects off — <1% in-game
   w_trans: 0.5, // Transparency off — <1%
-  w_bgapps: 2.0, // Background apps off — 1-3%
+  w_bgapps: 2, // Background apps off — 1-3%
   w_notif: 0.5, // Notifications off — <0.5%
   w_cort: 0.5, // Cortana off — <1%
   w_idx: 1.5, // Search indexing off — 1-2% (disk I/O)
-  w_hgs: 2.0, // HAGS — 1-3% on RTX 30/40
-  w_hpet: 3.0, // HPET off — 2-5% DPC latency
-  w_pthrot: 1.0, // Power throttling off — 0.5-1.5%
+  w_hgs: 2, // HAGS — 1-3% on RTX 30/40
+  w_hpet: 3, // HPET off — 2-5% DPC latency
+  w_pthrot: 1, // Power throttling off — 0.5-1.5%
   w_park: 1.5, // Core parking off — 1-2%
-  w_temp: 0.0, // Cleanup — no FPS
-  w_cs2gpu: 1.0, // GPU preference — 0-2% (laptops)
-  w_deliver: 1.0, // Delivery Optimization off — reduces background bandwidth
+  w_temp: 0, // Cleanup — no FPS
+  w_cs2gpu: 1, // GPU preference — 0-2% (laptops)
+  w_deliver: 1, // Delivery Optimization off — reduces background bandwidth
   w_widgets: 0.5, // Widgets off — saves RAM + CPU (Win11)
-  w_memcomp: 1.0, // Memory Compression off — reduces CPU for mem management
+  w_memcomp: 1, // Memory Compression off — reduces CPU for mem management
   w_uxuser: 0.5, // Connected UX off — telemetry + background activity
-  w_spectre: 8.0, // CPU mitigations off — 5-30% (CPU-dependent, security risk)
+  w_spectre: 8, // CPU mitigations off — 5-30% (CPU-dependent, security risk)
   w_lastaccess: 0.5, // NTFS Last Access off — reduces disk writes
   w_8dot3: 0.5, // 8.3 name creation off — reduces NTFS overhead
   w_mmcss: 1.5, // MMCSS gaming priority — scheduler boost for games
-  w_largecache: 1.0, // Large System Cache off — frees RAM for games
+  w_largecache: 1, // Large System Cache off — frees RAM for games
 
   /* Network — latency, not FPS */
-  n_nagle: 0.0,
-  n_tcp: 0.0,
-  n_dns: 0.0,
-  n_wifi: 0.0,
-  n_throttle: 1.0, // Network Throttling off — 10 default packets/ms → unlimited
-  n_ecn: 0.0, // ECN off — latency, not FPS
-  n_rss: 0.0, // RSS on — latency, not FPS
-  n_netbios: 0.0, // NetBIOS off — legacy protocol, latency only
-  n_lmhosts: 0.0, // LMHOSTS off — legacy DNS, latency only
-  n_ctcp: 0.0, // CTCP — congestion control, latency only
+  n_nagle: 0,
+  n_tcp: 0,
+  n_dns: 0,
+  n_wifi: 0,
+  n_throttle: 1, // Network Throttling off — 10 default packets/ms → unlimited
+  n_ecn: 0, // ECN off — latency, not FPS
+  n_rss: 0, // RSS on — latency, not FPS
+  n_netbios: 0, // NetBIOS off — legacy protocol, latency only
+  n_lmhosts: 0, // LMHOSTS off — legacy DNS, latency only
+  n_ctcp: 0, // CTCP — congestion control, latency only
 
   /* NVIDIA */
-  nv_perf: 3.0, // Max perf — 2-5% prevents downclocking
-  nv_vsync: 2.0, // VSync off — removes frame cap, less queue
+  nv_perf: 3, // Max perf — 2-5% prevents downclocking
+  nv_vsync: 2, // VSync off — removes frame cap, less queue
   nv_lat: 1.5, // Ultra low latency — <1% FPS, big input lag win
   nv_thread: 1.5, // Threaded optimization — 1-2%
   nv_aniso: 0.5, // App-controlled AF — <1%
-  nv_shader: 0.0, // Cache clear — no lasting FPS gain
+  nv_shader: 0, // Cache clear — no lasting FPS gain
   nv_reflex: 1.5, // Reflex On+Boost — input latency + slight FPS variance
   nv_sharp: 0.5, // Image Sharpening off — frees GPU post-process
   nv_texfilt: 0.5, // Texture filtering perf — less GPU filtering work
-  nv_prerender: 1.0, // Pre-rendered frames 1 — lower input lag
-  nv_ambient: 1.0, // Ambient Occlusion off — saves GPU cycles
+  nv_prerender: 1, // Pre-rendered frames 1 — lower input lag
+  nv_ambient: 1, // Ambient Occlusion off — saves GPU cycles
   nv_fxaa: 0.5, // FXAA off — removes forced antialiasing
 
   /* Services */
   s_sys: 1.5, // SysMain off — 1-2% (RAM/disk)
   s_diag: 0.5, // DiagTrack off — <1%
-  s_ws: 1.0, // WSearch off — 0.5-1.5%
-  s_print: 0.0, // Print Spooler — 0%
-  s_fax: 0.0, // Fax — 0%
+  s_ws: 1, // WSearch off — 0.5-1.5%
+  s_print: 0, // Print Spooler — 0%
+  s_fax: 0, // Fax — 0%
   s_xbox: 0.5, // Xbox services — <1%
   s_cdp: 0.5, // Connected Devices Platform — <1%
   s_wpn: 0.5, // WpnUserService — push notifications <1%
   s_diagpol: 0.5, // Diagnostic Policy — <1%
-  s_remote: 0.0, // Remote Registry — security, 0 FPS
+  s_remote: 0, // Remote Registry — security, 0 FPS
   s_maps: 0.5, // MapsBroker — background data <1%
-  s_phonesvc: 0.0, // Phone Service — 0 FPS
-  s_retaildemo: 0.0, // RetailDemo — 0 FPS
+  s_phonesvc: 0, // Phone Service — 0 FPS
+  s_retaildemo: 0, // RetailDemo — 0 FPS
 
   /* Autoexec — marginal in-game */
-  ae_on: 0.0,
-  ae_raw: 0.0,
+  ae_on: 0,
+  ae_raw: 0,
 
   /* Launch options */
-  lo_exec: 0.0,
-  lo_nvid: 0.0,
+  lo_exec: 0,
+  lo_nvid: 0,
   lo_joy: 0.5,
-  lo_high: 2.0, // -high priority — 1-3%
-  lo_allow: 0.0,
+  lo_high: 2, // -high priority — 1-3%
+  lo_allow: 0,
 
   /* Extras */
-  x_faceit: 0.0,
+  x_faceit: 0,
   x_steam: 1.5, // Steam overlay off — 1-2%
-  x_disc: 1.0, // Discord overlay off — 0.5-1.5%
-  x_resp: 2.0, // SystemResponsiveness=0 — 1-3%
-  x_gpup: 1.0, // GPU priority — 0.5-1.5%
+  x_disc: 1, // Discord overlay off — 0.5-1.5%
+  x_resp: 2, // SystemResponsiveness=0 — 1-3%
+  x_gpup: 1, // GPU priority — 0.5-1.5%
   x_prio: 1.5, // PrioritySeparation — 1-2%
   x_cs2p: 1.5, // CS2 high priority — 1-2%
   x_telem: 0.5, // Telemetry tasks — <1%
-  x_timer: 1.0, // Timer resolution — 0.5-1.5% input lag improvement
+  x_timer: 1, // Timer resolution — 0.5-1.5% input lag improvement
   x_msimode: 1.5, // MSI mode GPU — reduces DPC latency 50-200us
-  x_pcie: 1.0, // PCIe Link State off — prevents GPU bus downclocking
+  x_pcie: 1, // PCIe Link State off — prevents GPU bus downclocking
   x_ndis: 0.5, // Interrupt Moderation off — lower network latency
-  x_large: 1.0, // Large Pages — reduces TLB misses
+  x_large: 1, // Large Pages — reduces TLB misses
 };
+
+/* ================================================================
+   Hardware-Aware Recommendation Engine
+   ================================================================ */
+
+interface HwProfile {
+  cpuName: string;
+  cpuCores: number;
+  cpuThreads: number;
+  cpuClockMhz: number;
+  gpuName: string;
+  gpuVramMb: number;
+  gpuDriver: string;
+  ramTotalGb: number;
+  ramSpeedMhz: number;
+  refreshRate: number;
+  osName: string;
+  osBuild: string;
+  isNvidia: boolean;
+  isAmd: boolean;
+  isIntel: boolean;
+  hasHags: boolean;
+  hasRebar: boolean;
+  isWin11: boolean;
+  isLowEnd: boolean;
+  isMidRange: boolean;
+  isHighEnd: boolean;
+}
+
+/** Safely convert an unknown value to string (avoids [object Object] coercion) */
+function str(v: unknown, fallback = ""): string {
+  if (v == null) return fallback;
+  return typeof v === "string" ? v : `${v}`;
+}
+
+let _hwCache: HwProfile | null = null;
+
+async function getHwProfile(): Promise<HwProfile> {
+  if (_hwCache) return _hwCache;
+  try {
+    const hw = await invoke<Record<string, unknown>>("get_hardware_info");
+    const gpuName = str(hw.gpu_name, "").toUpperCase();
+    const cpuName = str(hw.cpu_name, "").toUpperCase();
+    const vram = Number(hw.gpu_vram_mb) || 0;
+    const cores = Number(hw.cpu_cores) || 4;
+    const ramGb = Number(hw.ram_total_gb) || 8;
+    // Tier detection: low < 4GB VRAM or < 4 cores, high > 8GB VRAM and > 6 cores
+    const isLowEnd = vram < 4096 || cores < 4 || ramGb < 8;
+    const isHighEnd = vram >= 8192 && cores >= 6 && ramGb >= 16;
+    _hwCache = {
+      cpuName: str(hw.cpu_name, "Unknown"),
+      cpuCores: cores,
+      cpuThreads: Number(hw.cpu_threads) || cores * 2,
+      cpuClockMhz: Number(hw.cpu_clock_mhz) || 0,
+      gpuName: str(hw.gpu_name, "Unknown"),
+      gpuVramMb: vram,
+      gpuDriver: str(hw.gpu_driver, ""),
+      ramTotalGb: ramGb,
+      ramSpeedMhz: Number(hw.ram_speed_mhz) || 0,
+      refreshRate: Number(hw.refresh_rate) || 60,
+      osName: str(hw.os_name, ""),
+      osBuild: str(hw.os_build, ""),
+      isNvidia: gpuName.includes("NVIDIA") || gpuName.includes("GEFORCE") || gpuName.includes("RTX") || gpuName.includes("GTX"),
+      isAmd: gpuName.includes("AMD") || gpuName.includes("RADEON"),
+      isIntel: gpuName.includes("INTEL") || cpuName.includes("INTEL"),
+      hasHags: str(hw.hags, "").toUpperCase().includes("ON") || str(hw.hags, "").toUpperCase().includes("ENABLED"),
+      hasRebar: (() => {
+        const rb = str(hw.rebar, "");
+        if (rb === "N/A") return false;
+        const mbVal = Number(rb.replace(" MB", ""));
+        return mbVal > 256;
+      })(),
+      isWin11: str(hw.os_name, "").includes("11"),
+      isLowEnd,
+      isMidRange: !isLowEnd && !isHighEnd,
+      isHighEnd,
+    };
+    return _hwCache;
+  } catch {
+    // Fallback profile for when HW detection fails
+    return {
+      cpuName: "Unknown", cpuCores: 4, cpuThreads: 8, cpuClockMhz: 3000,
+      gpuName: "Unknown", gpuVramMb: 4096, gpuDriver: "", ramTotalGb: 16,
+      ramSpeedMhz: 2400, refreshRate: 60, osName: "Windows", osBuild: "",
+      isNvidia: false, isAmd: false, isIntel: false, hasHags: false,
+      hasRebar: false, isWin11: false, isLowEnd: false, isMidRange: true, isHighEnd: false,
+    };
+  }
+}
+
+/**
+ * Returns recommended SYS toggle values per card section.
+ * Keys are toggle IDs, values are recommended boolean state.
+ */
+function getSysRecommendations(hw: HwProfile): Record<string, boolean> {
+  const rec: Record<string, boolean> = {
+    /* ── Windows ── */
+    w_power: true,     // Ultimate Performance — always recommended
+    w_dvr: true,       // Game DVR off — saves encoder overhead
+    w_bar: true,       // Game Bar off — overlay overhead
+    w_mode: true,      // Game Mode off — inconsistent behavior
+    w_hib: true,       // Hibernation off — stability
+    w_mouse: true,     // Mouse accel off — essential for FPS
+    w_fso: true,       // Fullscreen Optim off — input lag
+    w_vis: true,       // Visual Effects off — minor gain
+    w_trans: true,     // Transparency off — minor gain
+    w_bgapps: true,    // Background apps off — frees RAM+CPU
+    w_notif: true,     // Notifications off — no interruptions
+    w_cort: true,      // Cortana off — useless for gaming
+    w_idx: false,      // Search indexing — keep for daily use, minor impact
+    w_hgs: hw.isNvidia && hw.gpuVramMb >= 6144, // HAGS only for modern NVIDIA w/ 6GB+
+    w_hpet: true,      // HPET off — big DPC latency win
+    w_pthrot: true,    // Power throttling off — maintain clocks
+    w_park: true,      // Core parking off — keep all cores active
+    w_temp: false,     // Clean temp — not for auto-apply, too invasive
+    w_cs2gpu: true,    // CS2 high perf GPU — always
+    w_deliver: true,   // Delivery Optimization off — stops background bandwidth
+    w_widgets: hw.isWin11, // Widgets only matter on Win11
+    w_memcomp: hw.ramTotalGb >= 16, // Only disable mem compression if 16GB+ RAM
+    w_uxuser: true,    // Connected UX off — telemetry
+    w_spectre: false,  // CPU mitigations — DO NOT auto-enable, security risk
+    w_lastaccess: true, // NTFS last access — safe optimization
+    w_8dot3: true,     // 8.3 name creation off — safe
+    w_mmcss: true,     // MMCSS gaming priority — scheduler boost
+    w_largecache: true, // Large system cache off — frees RAM
+
+    /* ── Network ── */
+    n_nagle: true,     // Nagle off — essential for low latency
+    n_tcp: true,       // TCP optimization — always
+    n_dns: true,       // Flush DNS — fresh DNS cache
+    n_wifi: false,     // Wi-Fi power save — only enable if on Wi-Fi
+    n_throttle: true,  // Network throttle off — always
+    n_ecn: true,       // ECN off — reduces overhead
+    n_rss: true,       // RSS on — better multi-core network handling
+    n_netbios: true,   // NetBIOS off — legacy, not needed
+    n_lmhosts: true,   // LMHOSTS off — legacy
+    n_ctcp: true,      // CTCP on — better congestion control
+
+    /* ── NVIDIA ── (only apply if NVIDIA GPU) */
+    nv_perf: hw.isNvidia,    // Max perf mode
+    nv_vsync: hw.isNvidia,   // VSync off
+    nv_lat: hw.isNvidia,     // Ultra low latency
+    nv_thread: hw.isNvidia,  // Threaded optimization
+    nv_aniso: false,         // App-controlled AF — leave to game
+    nv_shader: false,        // Shader cache clear — not auto
+    nv_reflex: hw.isNvidia,  // Reflex On+Boost
+    nv_sharp: false,         // Image sharpening off — preference
+    nv_texfilt: hw.isNvidia, // Texture filtering perf
+    nv_prerender: hw.isNvidia, // Pre-rendered frames = 1
+    nv_ambient: hw.isNvidia, // Ambient occlusion off
+    nv_fxaa: hw.isNvidia,    // FXAA off
+
+    /* ── Services ── */
+    s_sys: true,       // SysMain off — RAM/disk freed
+    s_diag: true,      // DiagTrack off — telemetry
+    s_ws: false,       // Windows Search — keep for daily use
+    s_print: false,    // Print Spooler — keep if user prints
+    s_fax: true,       // Fax off — nobody uses fax
+    s_xbox: true,      // Xbox services off — unless using Xbox
+    s_cdp: true,       // Connected Devices off — Bluetooth/sharing
+    s_wpn: true,       // Push notifications off — no distractions
+    s_diagpol: false,  // Diagnostic Policy — keep for troubleshooting
+    s_remote: true,    // Remote Registry off — security
+    s_maps: true,      // MapsBroker off — nobody needs Win maps
+    s_phonesvc: true,  // Phone service off — not needed
+    s_retaildemo: true, // RetailDemo off — certainly not needed
+
+    /* ── Extras ── */
+    x_steam: true,     // Steam overlay off — FPS gain
+    x_disc: true,      // Discord overlay off — FPS gain
+    x_resp: true,      // SystemResponsiveness=0 — more CPU for games
+    x_gpup: true,      // GPU priority for games
+    x_prio: true,      // PrioritySeparation tuned
+    x_cs2p: true,      // CS2 high process priority
+    x_telem: true,     // Telemetry tasks off
+    x_timer: false,    // Timer resolution — advanced, may flag AC
+    x_msimode: false,  // MSI mode — advanced, needs manual verification
+    x_pcie: true,      // PCIe link state off — prevent downclocking
+    x_ndis: false,     // Interrupt moderation off — advanced
+    x_large: false,    // Large pages — advanced, needs admin rights
+  };
+  return rec;
+}
+
+/**
+ * Returns recommended autoexec / launch options values.
+ */
+function getAutoexecRecommendations(hw: HwProfile): Record<string, { checked?: boolean; value?: string }> {
+  const fps = hw.refreshRate >= 240 ? "0" : String(Math.min(999, hw.refreshRate * 2));
+  return {
+    ae_on:  { checked: true },
+    ae_fps: { value: fps },
+    ae_rate: { value: "786432" },
+    ae_int: { value: "0" },
+    ae_ir:  { value: "1" },
+    ae_ur:  { value: "128" },
+    ae_cr:  { value: "128" },
+    ae_raw: { checked: true },
+    // Launch options
+    lo_exec: { checked: true },
+    lo_nvid: { checked: true },
+    lo_joy:  { checked: true },
+    lo_high: { checked: true },
+    lo_allow: { checked: false },
+    lo_thr:  { value: String(hw.cpuCores) },
+  };
+}
+
+/**
+ * Returns competitive CS2 recommended CFG values.
+ * Based on pro player averages and community best practices.
+ */
+function getCfgRecommendations(hw: HwProfile): Record<string, { on: boolean; val?: string }> {
+  const fps = hw.refreshRate >= 240 ? "0" : String(Math.min(999, hw.refreshRate * 2));
+  return {
+    /* Performance */
+    cf_fpsmax: { on: true, val: fps },
+    cf_fpsmaxui: { on: true, val: "120" },
+    cf_particles: { on: false },
+    cf_tracers: { on: false },
+    cf_preload: { on: true, val: "1" },
+    cf_lowlat: { on: true, val: "1" },
+    cf_shadows: { on: true, val: hw.isHighEnd ? "1" : "0" },
+    cf_ragdolls: { on: true, val: "0" },
+    cf_nofocus: { on: true, val: "50" },
+    cf_postproc: { on: true, val: "0" },
+    cf_dynimg: { on: true, val: "0" },
+    cf_animavatar: { on: true, val: "0" },
+    cf_newbob: { on: true, val: "1" },
+
+    /* Crosshair — competitive defaults (style 4, green, small, tight) */
+    cf_xhstyle: { on: true, val: "4" },
+    cf_xhsize: { on: true, val: "2" },
+    cf_xhgap: { on: true, val: "-2" },
+    cf_xhthick: { on: true, val: "0.5" },
+    cf_xhcolor: { on: true, val: "1" },
+    cf_xhdot: { on: false },
+    cf_xhoutline: { on: true, val: "1" },
+    cf_xhoutthick: { on: true, val: "1" },
+    cf_xhalpha: { on: true, val: "255" },
+    cf_xht: { on: false },
+    cf_xhrecoil: { on: false },
+    cf_xhfriend: { on: true, val: "1" },
+
+    /* Viewmodel — competitive preset */
+    cf_vmfov: { on: true, val: "68" },
+    cf_rhand: { on: true, val: "1" },
+
+    /* HUD — clean competitive setup */
+    cf_hudscale: { on: true, val: "0.85" },
+    cf_showfps: { on: true, val: "1" },
+    cf_teamid: { on: true, val: "1" },
+    cf_teamidcolor: { on: true, val: "1" },
+    cf_showequip: { on: true },
+    cf_tmcolors: { on: true, val: "1" },
+    cf_loadout: { on: true, val: "1" },
+    cf_fastswitch: { on: true, val: "1" },
+    cf_targetid: { on: true, val: "1" },
+
+    /* Radar — competitive defaults */
+    cf_radarscale: { on: true, val: "0.4" },
+    cf_radarctr: { on: true, val: "0" },
+    cf_radarrotate: { on: true, val: "1" },
+    cf_radarsquare: { on: true, val: "1" },
+
+    /* Audio — competitive: HRTF, no music, focus on game sounds */
+    cf_vol: { on: true, val: "0.5" },
+    cf_musicvol: { on: true, val: "0" },
+    cf_hppan: { on: true, val: "2" },
+    cf_hpfront: { on: true, val: "45" },
+    cf_hprear: { on: true, val: "135" },
+    cf_10sec: { on: true, val: "1" },
+    cf_mvpvol: { on: true, val: "0" },
+    cf_rstarvol: { on: true, val: "0" },
+    cf_rendvol: { on: true, val: "0" },
+    cf_menumus: { on: true, val: "0" },
+    cf_mainstep: { on: true, val: "0.025" },
+    cf_voice: { on: true, val: "1" },
+
+    /* Mouse & Input */
+    cf_raw: { on: true, val: "1" },
+    cf_sens: { on: true, val: "1.8" },
+
+    /* Network — max rate competitive */
+    cf_rate: { on: true, val: "786432" },
+    cf_interp: { on: true, val: "0" },
+    cf_interpr: { on: true, val: "1" },
+    cf_updrate: { on: true, val: "128" },
+    cf_cmdrate: { on: true, val: "128" },
+    cf_steamdg: { on: true, val: "1" },
+    cf_predict: { on: true, val: "1" },
+    cf_lagcomp: { on: true, val: "1" },
+
+    /* Buy & Economy */
+    cf_autowep: { on: true, val: "0" },
+
+    /* Misc & QoL */
+    cf_console: { on: true, val: "1" },
+    cf_autohelp: { on: true, val: "0" },
+    cf_instructor: { on: true, val: "0" },
+    cf_maxping: { on: true, val: "80" },
+  };
+}
+
+/**
+ * Apply recommended SYS toggle values for a specific card section.
+ */
+async function applySysRecommendations(section: string) {
+  const hw = await getHwProfile();
+  const rec = getSysRecommendations(hw);
+  let count = 0;
+
+  // Map section name to toggle ID prefixes
+  const prefixMap: Record<string, string[]> = {
+    windows: ["w_"],
+    network: ["n_"],
+    nvidia: ["nv_"],
+    services: ["s_"],
+    extras: ["x_"],
+  };
+
+  const prefixes = prefixMap[section];
+  if (!prefixes) return;
+
+  for (const [id, val] of Object.entries(rec)) {
+    if (!prefixes.some((p) => id.startsWith(p))) continue;
+    const el = document.getElementById(id) as HTMLInputElement | null;
+    if (el?.type === "checkbox") {
+      el.checked = val;
+      count++;;
+    }
+  }
+  updateImpact();
+  toast(`⚡ ${count} recommended settings applied to "${section}"`);
+}
+
+/**
+ * Apply recommended autoexec/launch option values.
+ */
+async function applyAutoexecRecommendations() {
+  const hw = await getHwProfile();
+  const rec = getAutoexecRecommendations(hw);
+  let count = 0;
+  for (const [id, r] of Object.entries(rec)) {
+    if (r.checked !== undefined) {
+      setChecked(id, r.checked);
+      count++;
+    }
+    if (r.value !== undefined) {
+      setVal(id, r.value);
+      count++;
+    }
+  }
+  updateImpact();
+  toast(`⚡ ${count} recommended autoexec settings applied (fps_max based on ${hw.refreshRate}Hz)`);
+}
+
+/**
+ * Apply recommended launch option values.
+ */
+async function applyLaunchRecommendations() {
+  const hw = await getHwProfile();
+  const rec = getAutoexecRecommendations(hw);
+  let count = 0;
+  const launchIds = ["lo_exec", "lo_nvid", "lo_joy", "lo_high", "lo_allow", "lo_thr"];
+  for (const id of launchIds) {
+    const r = rec[id];
+    if (!r) continue;
+    if (r.checked !== undefined) { setChecked(id, r.checked); count++; }
+    if (r.value !== undefined) { setVal(id, r.value); count++; }
+  }
+  updateImpact();
+  toast(`⚡ ${count} recommended launch options applied (threads=${hw.cpuCores})`);
+}
+
+/**
+ * Apply all recommended CFG values.
+ */
+async function applyCfgRecommendations() {
+  const hw = await getHwProfile();
+  const rec = getCfgRecommendations(hw);
+  let count = 0;
+  for (const [id, r] of Object.entries(rec)) {
+    const el = document.getElementById(id) as HTMLInputElement | null;
+    if (el?.type === "checkbox") {
+      el.checked = r.on;
+      count++;
+    }
+    if (r.val !== undefined) {
+      const valEl = document.getElementById(`${id}_v`) as HTMLInputElement | null;
+      if (valEl) valEl.value = r.val;
+    }
+  }
+  updateCfgCounter();
+  drawCrosshair();
+  toast(`⚡ ${count} competitive CS2 commands applied (fps_max based on ${hw.refreshRate}Hz)`);
+}
+
+/**
+ * Apply ALL SYS recommendations across all cards at once.
+ */
+async function applyAllSysRecommendations() {
+  const hw = await getHwProfile();
+  const rec = getSysRecommendations(hw);
+  let count = 0;
+  for (const [id, val] of Object.entries(rec)) {
+    const el = document.getElementById(id) as HTMLInputElement | null;
+    if (el?.type === "checkbox") {
+      el.checked = val;
+      count++;
+    }
+  }
+  // Also apply autoexec + launch recs
+  const aRec = getAutoexecRecommendations(hw);
+  for (const [id, r] of Object.entries(aRec)) {
+    if (r.checked !== undefined) { setChecked(id, r.checked); count++; }
+    if (r.value !== undefined) { setVal(id, r.value); count++; }
+  }
+  updateImpact();
+  let tier = "MID-RANGE";
+  if (hw.isHighEnd) tier = "HIGH-END";
+  else if (hw.isLowEnd) tier = "LOW-END";
+  toast(`⚡ ${count} settings optimized for ${tier}: ${hw.gpuName} / ${hw.cpuCores}C / ${hw.ramTotalGb}GB`);
+}
+
+/**
+ * Helper to create a "Recommend" button for SYS cards.
+ */
+function cardRecommendBtn(section: string): HTMLButtonElement {
+  const btn = document.createElement("button");
+  btn.className = "card-apply-btn card-recommend-btn";
+  btn.innerHTML = "⚡ Recommended Config";
+  btn.title = `Apply recommended settings for "${section}" based on your hardware`;
+  btn.addEventListener("click", () => applySysRecommendations(section));
+  return btn;
+}
 
 /* ================================================================
    Color helpers
@@ -333,6 +1097,16 @@ function applyTheme(idx: number) {
   s.setProperty("--border-glow", hexToRgba(pc, 0.12));
   s.setProperty("--glow-sm", `0 0 6px ${hexToRgba(pc, 0.3)}`);
   s.setProperty("--glow-md", `0 0 14px ${hexToRgba(pc, 0.25)}, 0 0 40px ${hexToRgba(pc, 0.08)}`);
+
+  /* Theme-harmonious button colors */
+  s.setProperty("--btn-schema-bg", hexToRgba(sc, 0.12));
+  s.setProperty("--btn-schema-border", hexToRgba(sc, 0.2));
+  s.setProperty("--btn-schema-bg-hover", hexToRgba(sc, 0.22));
+  s.setProperty("--edit-mode-border", hexToRgba(pc, 0.35));
+  s.setProperty("--edit-mode-row-hover", hexToRgba(pc, 0.06));
+  s.setProperty("--recommend-bg", `linear-gradient(135deg, ${sc}, ${darken(sc, 20)})`);
+  s.setProperty("--recommend-shadow", `0 2px 8px ${hexToRgba(sc, 0.25)}`);
+  s.setProperty("--recommend-shadow-hover", `0 3px 12px ${hexToRgba(sc, 0.4)}`);
 
   /* Apply special theme body class */
   document.body.classList.remove("theme-raz", "theme-space");
@@ -451,6 +1225,10 @@ function applyTheme(idx: number) {
     .sub-tab-bar { border-bottom-color: ${hexToRgba(pc, 0.12)} !important; }
     .cfg-counter { border-color: ${hexToRgba(pc, 0.18)} !important; background: ${hexToRgba(pc, 0.04)} !important; color: ${pc} !important; }
     .cfg-actions { border-top-color: ${hexToRgba(pc, 0.12)} !important; }
+    .schema-item.schema-active { border-color: ${hexToRgba(pc, 0.35)} !important; background: ${hexToRgba(pc, 0.04)} !important; }
+    .schema-item-tabs { color: ${hexToRgba(pc, 0.7)} !important; }
+    .btn-schema-save { color: ${pc} !important; border-color: ${hexToRgba(pc, 0.2)} !important; background: ${hexToRgba(pc, 0.12)} !important; }
+    .cfg-grid-edit-mode .card-balloon { border-color: ${hexToRgba(pc, 0.35)} !important; }
     .hw-row { border-bottom-color: ${hexToRgba(pc, 0.06)} !important; }
     .hw-status.on { background: ${hexToRgba(pc, 0.15)} !important; color: ${pc} !important; border-color: ${hexToRgba(pc, 0.3)} !important; }
     .hw-status.off { background: rgba(239,68,68,0.15) !important; color: #ef4444 !important; }
@@ -474,10 +1252,8 @@ function applyTheme(idx: number) {
     .ping-bad { color: #ef4444 !important; }
     .ping-header { border-bottom-color: ${hexToRgba(pc, 0.15)} !important; color: ${pc} !important; }
     .ping-row { border-bottom-color: ${hexToRgba(pc, 0.06)} !important; }
-    .profile-bar select, .profile-bar input { border-color: ${hexToRgba(pc, 0.15)} !important; color: ${pc} !important; }
-    .profile-bar select:focus, .profile-bar input:focus { border-color: ${pc} !important; box-shadow: 0 0 6px ${hexToRgba(pc, 0.25)} !important; }
-    .profile-bar button { background: ${hexToRgba(pc, 0.12)} !important; border-color: ${hexToRgba(pc, 0.2)} !important; color: ${pc} !important; }
-    .profile-bar button:hover { background: ${hexToRgba(pc, 0.2)} !important; }
+    .config-schema-bar select, .config-schema-bar input { border-color: ${hexToRgba(pc, 0.15)} !important; color: ${pc} !important; }
+    .config-schema-bar select:focus, .config-schema-bar input:focus { border-color: ${pc} !important; box-shadow: 0 0 6px ${hexToRgba(pc, 0.25)} !important; }
     .pro-select { border-color: ${hexToRgba(pc, 0.15)} !important; color: ${pc} !important; }
     .pro-select:focus { border-color: ${pc} !important; box-shadow: 0 0 6px ${hexToRgba(pc, 0.25)} !important; }
     .xhair-preview { border-color: ${hexToRgba(pc, 0.12)} !important; }
@@ -494,19 +1270,47 @@ function applyTheme(idx: number) {
     .demo-list-header { color: ${pc} !important; border-bottom-color: ${hexToRgba(pc, 0.12)} !important; }
     .demo-path { border-color: ${hexToRgba(pc, 0.12)} !important; }
     .demo-empty { color: ${hexToRgba(sc, 0.5)} !important; }
-    .ai-btn:hover { border-color: ${pc} !important; color: ${pc} !important; }
-    .ai-modal h3 { color: ${pc} !important; }
-    .ai-modal input:focus, .ai-modal select:focus { border-color: ${pc} !important; box-shadow: 0 0 6px ${hexToRgba(pc, 0.2)} !important; }
-    .ai-modal-actions .ai-save { background: ${pc} !important; }
-    .btn-ai { background: linear-gradient(135deg, ${hexToRgba(sc, 0.2)}, ${hexToRgba(sc, 0.1)}) !important; border-color: ${hexToRgba(sc, 0.25)} !important; color: ${sc} !important; }
-    .btn-ai:hover { box-shadow: 0 0 12px ${hexToRgba(sc, 0.2)} !important; }
-    .ai-response { border-color: ${hexToRgba(sc, 0.12)} !important; background: ${hexToRgba(sc, 0.04)} !important; }
-    .ai-response strong { color: ${pc} !important; }
-    .ai-response h3, .ai-response h4 { color: ${sc} !important; }
-    .ai-loading { color: ${sc} !important; }
-    .ai-loading::before { border-top-color: ${sc} !important; border-color: ${hexToRgba(sc, 0.2)} !important; border-top-color: ${sc} !important; }
-    .ai-status.connected { background: ${pc} !important; box-shadow: 0 0 4px ${pc} !important; }
+    .adv-btn:hover { border-color: ${pc} !important; color: ${pc} !important; }
+    .adv-modal h3 { color: ${pc} !important; }
+    .adv-modal input:focus, .adv-modal select:focus { border-color: ${pc} !important; box-shadow: 0 0 6px ${hexToRgba(pc, 0.2)} !important; }
+    .adv-modal-actions .adv-save { background: ${pc} !important; }
+    .btn-adv { background: linear-gradient(135deg, ${hexToRgba(sc, 0.2)}, ${hexToRgba(sc, 0.1)}) !important; border-color: ${hexToRgba(sc, 0.25)} !important; color: ${sc} !important; }
+    .btn-adv:hover { box-shadow: 0 0 12px ${hexToRgba(sc, 0.2)} !important; }
+    .adv-response { border-color: ${hexToRgba(sc, 0.12)} !important; background: ${hexToRgba(sc, 0.04)} !important; }
+    .adv-response strong { color: ${pc} !important; }
+    .adv-response h3, .adv-response h4 { color: ${sc} !important; }
+    .adv-loading { color: ${sc} !important; }
+    .adv-loading::before { border-top-color: ${sc} !important; border-color: ${hexToRgba(sc, 0.2)} !important; border-top-color: ${sc} !important; }
+    .adv-status.connected { background: ${pc} !important; box-shadow: 0 0 4px ${pc} !important; }
     .share-copy:hover { color: ${pc} !important; border-color: ${hexToRgba(pc, 0.3)} !important; background: ${hexToRgba(pc, 0.06)} !important; }
+    .donate-popup { border-color: ${hexToRgba(pc, 0.2)} !important; box-shadow: 0 -6px 32px rgba(0,0,0,0.6), 0 0 20px ${hexToRgba(pc, 0.08)} !important; }
+    .donate-popup::after { border-top-color: ${hexToRgba(pc, 0.2)} !important; }
+    .donate-title { color: ${pc} !important; }
+    .add-feature-btn { border-color: ${hexToRgba(pc, 0.25)} !important; background: ${hexToRgba(pc, 0.04)} !important; color: ${hexToRgba(pc, 0.6)} !important; }
+    .add-feature-btn:hover { background: ${hexToRgba(pc, 0.1)} !important; border-color: ${hexToRgba(pc, 0.45)} !important; color: ${pc} !important; }
+    .add-feature-menu { border-color: ${hexToRgba(pc, 0.2)} !important; }
+    .add-feature-menu button:hover { background: ${hexToRgba(pc, 0.08)} !important; }
+    .schema-bar-btn { border-color: ${hexToRgba(pc, 0.2)} !important; color: ${hexToRgba(pc, 0.7)} !important; }
+    .schema-bar-btn:hover { background: ${hexToRgba(pc, 0.12)} !important; color: ${pc} !important; border-color: ${hexToRgba(pc, 0.35)} !important; }
+    .schema-bar-btn-del:hover { background: rgba(239,68,68,0.15) !important; color: #ef4444 !important; border-color: rgba(239,68,68,0.3) !important; }
+    .schema-bar-btn-new { border-color: ${hexToRgba(pc, 0.2)} !important; color: ${hexToRgba(pc, 0.6)} !important; }
+    .schema-bar-btn-new:hover { background: ${hexToRgba(pc, 0.12)} !important; border-color: ${hexToRgba(pc, 0.4)} !important; color: ${pc} !important; }
+    .config-schema-bar .btn-schema { border-color: ${hexToRgba(sc, 0.25)} !important; color: ${sc} !important; background: ${hexToRgba(sc, 0.08)} !important; }
+    .config-schema-bar .btn-schema:hover { background: ${hexToRgba(sc, 0.18)} !important; }
+    .card-recommend-btn {
+      background: linear-gradient(135deg, ${sc}, ${darken(sc, 20)}) !important;
+      color: #111 !important;
+      box-shadow: 0 2px 8px ${hexToRgba(sc, 0.25)} !important;
+    }
+    .card-recommend-btn:hover { box-shadow: 0 3px 12px ${hexToRgba(sc, 0.4)} !important; }
+    .btn-recommend-all {
+      background: linear-gradient(135deg, ${sc}, ${darken(sc, 20)}) !important;
+      color: #111 !important;
+      box-shadow: 0 2px 8px ${hexToRgba(sc, 0.25)} !important;
+    }
+    .btn-recommend-all:hover { box-shadow: 0 3px 12px ${hexToRgba(sc, 0.4)} !important; }
+    .card-apply-save { background: ${pc} !important; color: #111 !important; }
+    .card-apply-copy { background: ${sc} !important; color: #111 !important; }
   `;
 
   /* Theme dropdown active state */
@@ -530,7 +1334,7 @@ function updateImpact() {
   for (const [id, pct] of Object.entries(IMPACT)) {
     if (pct <= 0) continue;
     const el = document.getElementById(id) as HTMLInputElement | null;
-    if (!el || el.type !== "checkbox" || !el.checked) continue;
+    if (!el?.type || el.type !== "checkbox" || !el.checked) continue;
     /* Skip if LED shows this is already applied on the system */
     const led = document.getElementById(`led_${id}`);
     if (led?.classList.contains("active")) continue;
@@ -602,15 +1406,17 @@ function tipHtml(title: string, desc: string, impact?: string, method?: string):
 function tipFromLegacy(raw: string): string {
   const isAuto = raw.startsWith("✔");
   const isManual = raw.startsWith("⚠");
-  const isInfo = raw.startsWith("ℹ");
-  const badge = isAuto ? '<span class="tt-badge auto">AUTO</span>' : isManual ? '<span class="tt-badge manual">MANUAL</span>' : '<span class="tt-badge info">INFO</span>';
+  let badge: string;
+  if (isAuto) badge = '<span class="tt-badge auto">AUTO</span>';
+  else if (isManual) badge = '<span class="tt-badge manual">MANUAL</span>';
+  else badge = '<span class="tt-badge info">INFO</span>';
 
   // extract method in parens e.g. (Registry), (PowerShell), (Service)
-  const methodMatch = raw.match(/\(([^)]+)\)/);
+  const methodMatch = /\(([^)]+)\)/.exec(raw);
   const method = methodMatch ? methodMatch[1] : "";
 
   // extract impact e.g. +3.0% (+8 FPS) or 0 FPS
-  const impactMatch = raw.match(/([+\d.]+%\s*\([^)]+\)|0 FPS[^.]*)/);
+  const impactMatch = /([+\d.]+%\s*\([^)]+\)|0 FPS[^.]*)/.exec(raw);
   const impact = impactMatch ? impactMatch[1] : "";
 
   // remaining description: strip the prefix markers and extracted parts
@@ -619,7 +1425,8 @@ function tipFromLegacy(raw: string): string {
   // remove trailing dot
   desc = desc.replace(/\.\s*$/, "");
 
-  let h = `<div class="tt-header">${badge}${method ? `<span class="tt-via">${method}</span>` : ""}</div>`;
+  const viaSpan = method ? '<span class="tt-via">' + method + "</span>" : "";
+  let h = '<div class="tt-header">' + badge + viaSpan + "</div>";
   h += `<div class="tt-desc">${desc}</div>`;
   if (impact && impact !== "0 FPS") h += `<div class="tt-impact">⚡ ${impact}</div>`;
   return h;
@@ -723,7 +1530,7 @@ function setVal(id: string, v: string) {
 }
 
 function toast(message: string, isError = false) {
-  document.querySelectorAll(".status-toast").forEach((e) => e.remove());
+  document.querySelectorAll(".status-toast").forEach((e) => { e.remove(); });
   const t = document.createElement("div");
   t.className = "status-toast" + (isError ? " toast-error" : "");
   t.textContent = message;
@@ -823,12 +1630,16 @@ function collectConfig(): OptimizationConfig {
       cl_interp_ratio: vl("ae_ir", "1"),
       cl_updaterate: vl("ae_ur", "128"),
       cl_cmdrate: vl("ae_cr", "128"),
+      sensitivity: vl("ae_sens", "2"),
+      viewmodel_fov: vl("ae_vmfov", "68"),
       m_rawinput: ck("ae_raw"),
+      net_graph: ck("ae_netgraph"),
       custom_commands: (document.getElementById("ae_custom") as HTMLTextAreaElement)?.value || "",
     },
     launch_options: {
       exec_autoexec: ck("lo_exec"),
       novid: ck("lo_nvid"),
+      tickrate_128: ck("lo_tick"),
       nojoy: ck("lo_joy"),
       high_priority: ck("lo_high"),
       allow_third_party: ck("lo_allow"),
@@ -931,21 +1742,21 @@ function parsePs1AndSetToggles(content: string) {
   setChecked("s_retaildemo", has("'RetailDemo'"));
 
   setChecked("ae_on", has("autoexecLines"));
-  const fpsMatch = content.match(/fps_max (\d+)/);
+  const fpsMatch = /fps_max (\d+)/.exec(content);
   if (fpsMatch) setVal("ae_fps", fpsMatch[1]);
-  const rateMatch = content.match(/rate (\d+)/);
+  const rateMatch = /rate (\d+)/.exec(content);
   if (rateMatch) setVal("ae_rate", rateMatch[1]);
-  const interpMatch = content.match(/cl_interp (\S+)/);
+  const interpMatch = /cl_interp (\S+)/.exec(content);
   if (interpMatch) setVal("ae_int", interpMatch[1]);
-  const irMatch = content.match(/cl_interp_ratio (\S+)/);
+  const irMatch = /cl_interp_ratio (\S+)/.exec(content);
   if (irMatch) setVal("ae_ir", irMatch[1]);
-  const urMatch = content.match(/cl_updaterate (\d+)/);
+  const urMatch = /cl_updaterate (\d+)/.exec(content);
   if (urMatch) setVal("ae_ur", urMatch[1]);
-  const crMatch = content.match(/cl_cmdrate (\d+)/);
+  const crMatch = /cl_cmdrate (\d+)/.exec(content);
   if (crMatch) setVal("ae_cr", crMatch[1]);
-  const sensMatch = content.match(/sensitivity (\S+)/);
+  const sensMatch = /sensitivity (\S+)/.exec(content);
   if (sensMatch) setVal("ae_sns", sensMatch[1]);
-  const fovMatch = content.match(/viewmodel_fov (\S+)/);
+  const fovMatch = /viewmodel_fov (\S+)/.exec(content);
   if (fovMatch) setVal("ae_fov", fovMatch[1]);
   setChecked("ae_raw", has("m_rawinput 1"));
 
@@ -954,7 +1765,7 @@ function parsePs1AndSetToggles(content: string) {
   setChecked("lo_joy", has("-nojoy"));
   setChecked("lo_high", has("-high"));
   setChecked("lo_allow", has("-allow_third_party_software"));
-  const threadMatch = content.match(/-threads (\d+)/);
+  const threadMatch = /-threads (\d+)/.exec(content);
   if (threadMatch) setVal("lo_thr", threadMatch[1]);
 
   setChecked("x_faceit", has("FACEITService"));
@@ -1018,7 +1829,7 @@ async function runConfigAsAdmin() {
 async function runSectionAsAdmin(section: string, label: string) {
   try {
     const config = collectConfig();
-    toast(`A aplicar ${label}…`);
+    toast(`Applying ${label}…`);
     const msg = await invoke<string>("run_config_as_admin", { config, section });
     toast(msg);
     // Remove pending badge from the card
@@ -1027,7 +1838,7 @@ async function runSectionAsAdmin(section: string, label: string) {
     pollScriptReport();
   } catch (e) {
     console.error(e);
-    toast(`Falha ao aplicar ${label}`, true);
+    toast(`Failed to apply ${label}`, true);
   }
 }
 
@@ -1054,11 +1865,17 @@ function showScriptReportModal(report: ScriptReport) {
   const durationStr = report.duration_secs ? `${report.duration_secs}s` : "N/A";
   const startStr = report.start_time ? new Date(report.start_time).toLocaleTimeString() : "";
   const endStr = report.end_time ? new Date(report.end_time).toLocaleTimeString() : "";
-  const statusIcon = report.status === "success" ? "✅" : report.status === "partial" ? "⚠️" : "❌";
-  const statusText = report.status === "success" ? "Sucesso" : report.status === "partial" ? "Parcial (com erros)" : "Falhou";
+  let statusIcon: string;
+  if (report.status === "success") statusIcon = "✅";
+  else if (report.status === "partial") statusIcon = "⚠️";
+  else statusIcon = "❌";
+  let statusText: string;
+  if (report.status === "success") statusText = "Success";
+  else if (report.status === "partial") statusText = "Partial (with errors)";
+  else statusText = "Failed";
 
   const errorsHtml = report.errors && report.errors.length > 0
-    ? `<div class="report-errors"><div class="report-errors-title">Erros (${report.errors.length}):</div>${report.errors.map((e) => `<div class="report-error-item">• ${e}</div>`).join("")}</div>`
+    ? '<div class="report-errors"><div class="report-errors-title">Errors (' + report.errors.length + '):</div>' + report.errors.map((e) => '<div class="report-error-item">• ' + e + "</div>").join("") + "</div>"
     : "";
 
   const modal = document.createElement("div");
@@ -1066,35 +1883,35 @@ function showScriptReportModal(report: ScriptReport) {
   modal.className = "modal-overlay";
   modal.innerHTML = `
     <div class="modal-box report-modal">
-      <div class="modal-title">${statusIcon} Relatório de Execução</div>
+      <div class="modal-title">${statusIcon} Execution Report</div>
       <div class="report-grid">
         <div class="report-stat">
           <span class="report-stat-val">${statusText}</span>
-          <span class="report-stat-label">Estado</span>
+          <span class="report-stat-label">Status</span>
         </div>
         <div class="report-stat">
           <span class="report-stat-val">${durationStr}</span>
-          <span class="report-stat-label">Duração</span>
+          <span class="report-stat-label">Duration</span>
         </div>
         <div class="report-stat">
           <span class="report-stat-val">${report.sections_run || 0}</span>
-          <span class="report-stat-label">Secções</span>
+          <span class="report-stat-label">Sections</span>
         </div>
         <div class="report-stat">
           <span class="report-stat-val">${report.commands_run || 0}</span>
-          <span class="report-stat-label">Comandos</span>
+          <span class="report-stat-label">Commands</span>
         </div>
         <div class="report-stat">
           <span class="report-stat-val">${startStr}</span>
-          <span class="report-stat-label">Início</span>
+          <span class="report-stat-label">Start</span>
         </div>
         <div class="report-stat">
           <span class="report-stat-val">${endStr}</span>
-          <span class="report-stat-label">Fim</span>
+          <span class="report-stat-label">End</span>
         </div>
       </div>
       ${errorsHtml}
-      <button class="modal-close-btn" id="report-close-btn">Fechar</button>
+      <button class="modal-close-btn" id="report-close-btn">Close</button>
     </div>
   `;
   document.body.appendChild(modal);
@@ -1116,14 +1933,14 @@ function copyLaunchOptions() {
   if (custom) opts.push(custom);
   const str = opts.join(" ");
   navigator.clipboard.writeText(str);
-  toast(`Launch options copiadas: ${str}`);
+  toast(`Launch options copied: ${str}`);
 }
 
 function cardApplyBtn(label: string, section: string, icon: string): HTMLButtonElement {
   const btn = document.createElement("button");
   btn.className = "card-apply-btn";
   btn.innerHTML = `${icon} ${label}`;
-  btn.title = `Aplicar apenas as alterações de "${section}" como Admin`;
+  btn.title = `Apply only the "${section}" changes as Admin`;
   btn.addEventListener("click", () => runSectionAsAdmin(section, label));
   return btn;
 }
@@ -1283,6 +2100,8 @@ interface CfgCmd {
   on: boolean;
   val: string;
   tip: string;
+  /** If true, this command appears in the "Principal" quick-access tab */
+  pri?: boolean;
 }
 interface CfgCat {
   name: string;
@@ -1294,14 +2113,14 @@ const CFG: CfgCat[] = [
   {
     name: "Performance",
     commands: [
-      { id: "cf_fpsmax", cmd: "fps_max", label: "fps_max", type: "value", on: true, val: "400", tip: "Maximum framerate. 0 = unlimited." },
+      { id: "cf_fpsmax", cmd: "fps_max", label: "fps_max", type: "value", on: true, val: "400", tip: "Maximum framerate. 0 = unlimited.", pri: true },
       { id: "cf_fpsmaxui", cmd: "fps_max_ui", label: "fps_max_ui", type: "value", on: false, val: "120", tip: "Max FPS in menus. Saves GPU power." },
       { id: "cf_particles", cmd: "r_drawparticles", label: "r_drawparticles", type: "toggle", on: false, val: "0", tip: "Disable particles for clarity/FPS." },
       { id: "cf_tracers", cmd: "r_drawtracers", label: "r_drawtracers", type: "toggle", on: false, val: "0", tip: "Disable bullet tracers." },
-      { id: "cf_preload", cmd: "cl_forcepreload", label: "cl_forcepreload", type: "toggle", on: true, val: "1", tip: "Preload all resources. Reduces mid-game stutters." },
-      { id: "cf_lowlat", cmd: "engine_low_latency_sleep_after_client_tick", label: "Low Latency Sleep", type: "toggle", on: true, val: "1", tip: "Reflex-style low latency. Reduces input lag." },
-      { id: "cf_shadows", cmd: "cl_csm_enabled", label: "cl_csm_enabled", type: "toggle", on: true, val: "1", tip: "Cascaded shadow maps. Disable for FPS boost." },
-      { id: "cf_ragdolls", cmd: "cl_ragdoll_physics_enable", label: "cl_ragdoll_physics_enable", type: "toggle", on: true, val: "0", tip: "Disable ragdolls on death. Reduces GPU load." },
+      { id: "cf_preload", cmd: "cl_forcepreload", label: "cl_forcepreload", type: "toggle", on: true, val: "1", tip: "Preload all resources. Reduces mid-game stutters.", pri: true },
+      { id: "cf_lowlat", cmd: "engine_low_latency_sleep_after_client_tick", label: "Low Latency Sleep", type: "toggle", on: true, val: "1", tip: "Reflex-style low latency. Reduces input lag.", pri: true },
+      { id: "cf_shadows", cmd: "cl_csm_enabled", label: "cl_csm_enabled", type: "toggle", on: true, val: "1", tip: "Cascaded shadow maps. Disable for FPS boost.", pri: true },
+      { id: "cf_ragdolls", cmd: "cl_ragdoll_physics_enable", label: "cl_ragdoll_physics_enable", type: "toggle", on: true, val: "0", tip: "Disable ragdolls on death. Reduces GPU load.", pri: true },
       { id: "cf_nofocus", cmd: "engine_no_focus_sleep", label: "engine_no_focus_sleep", type: "value", on: false, val: "0", tip: "Sleep ms when alt-tabbed. 0=no throttle." },
       { id: "cf_gamma", cmd: "r_fullscreen_gamma", label: "r_fullscreen_gamma", type: "value", on: false, val: "2.2", tip: "Fullscreen gamma. 1.6-2.6." },
       {
@@ -1325,19 +2144,19 @@ const CFG: CfgCat[] = [
   {
     name: "Crosshair",
     commands: [
-      { id: "cf_xhstyle", cmd: "cl_crosshairstyle", label: "cl_crosshairstyle", type: "value", on: true, val: "4", tip: "0=default, 1=static, 2=classic, 3=classic dyn, 4=classic static, 5=hybrid." },
-      { id: "cf_xhsize", cmd: "cl_crosshairsize", label: "cl_crosshairsize", type: "value", on: true, val: "2.5", tip: "Crosshair line length." },
-      { id: "cf_xhgap", cmd: "cl_crosshairgap", label: "cl_crosshairgap", type: "value", on: true, val: "-1", tip: "Center gap. Negative = tighter." },
-      { id: "cf_xhthick", cmd: "cl_crosshairthickness", label: "cl_crosshairthickness", type: "value", on: true, val: "0.5", tip: "Line thickness." },
-      { id: "cf_xhcolor", cmd: "cl_crosshaircolor", label: "cl_crosshaircolor", type: "value", on: true, val: "1", tip: "0=red, 1=green, 2=yellow, 3=blue, 4=cyan, 5=custom." },
+      { id: "cf_xhstyle", cmd: "cl_crosshairstyle", label: "cl_crosshairstyle", type: "value", on: true, val: "4", tip: "0=default, 1=static, 2=classic, 3=classic dyn, 4=classic static, 5=hybrid.", pri: true },
+      { id: "cf_xhsize", cmd: "cl_crosshairsize", label: "cl_crosshairsize", type: "value", on: true, val: "2.5", tip: "Crosshair line length.", pri: true },
+      { id: "cf_xhgap", cmd: "cl_crosshairgap", label: "cl_crosshairgap", type: "value", on: true, val: "-1", tip: "Center gap. Negative = tighter.", pri: true },
+      { id: "cf_xhthick", cmd: "cl_crosshairthickness", label: "cl_crosshairthickness", type: "value", on: true, val: "0.5", tip: "Line thickness.", pri: true },
+      { id: "cf_xhcolor", cmd: "cl_crosshaircolor", label: "cl_crosshaircolor", type: "value", on: true, val: "1", tip: "0=red, 1=green, 2=yellow, 3=blue, 4=cyan, 5=custom.", pri: true },
       { id: "cf_xhcolorr", cmd: "cl_crosshaircolor_r", label: "cl_crosshaircolor_r", type: "value", on: false, val: "50", tip: "Red channel (0-255). Needs crosshaircolor 5." },
       { id: "cf_xhcolorg", cmd: "cl_crosshaircolor_g", label: "cl_crosshaircolor_g", type: "value", on: false, val: "250", tip: "Green channel (0-255). Needs crosshaircolor 5." },
       { id: "cf_xhcolorb", cmd: "cl_crosshaircolor_b", label: "cl_crosshaircolor_b", type: "value", on: false, val: "50", tip: "Blue channel (0-255). Needs crosshaircolor 5." },
-      { id: "cf_xhdot", cmd: "cl_crosshairdot", label: "cl_crosshairdot", type: "toggle", on: false, val: "0", tip: "Center dot on crosshair." },
-      { id: "cf_xhoutline", cmd: "cl_crosshair_drawoutline", label: "Draw outline", type: "toggle", on: true, val: "1", tip: "Draw crosshair outline for visibility." },
+      { id: "cf_xhdot", cmd: "cl_crosshairdot", label: "cl_crosshairdot", type: "toggle", on: false, val: "0", tip: "Center dot on crosshair.", pri: true },
+      { id: "cf_xhoutline", cmd: "cl_crosshair_drawoutline", label: "Draw outline", type: "toggle", on: true, val: "1", tip: "Draw crosshair outline for visibility.", pri: true },
       { id: "cf_xhoutthick", cmd: "cl_crosshair_outlinethickness", label: "Outline thickness", type: "value", on: true, val: "1", tip: "Crosshair outline thickness." },
-      { id: "cf_xhalpha", cmd: "cl_crosshairalpha", label: "cl_crosshairalpha", type: "value", on: true, val: "255", tip: "Transparency. 0-255." },
-      { id: "cf_xht", cmd: "cl_crosshair_t", label: "cl_crosshair_t", type: "toggle", on: false, val: "0", tip: "T-shaped crosshair (no top line)." },
+      { id: "cf_xhalpha", cmd: "cl_crosshairalpha", label: "cl_crosshairalpha", type: "value", on: true, val: "255", tip: "Transparency. 0-255.", pri: true },
+      { id: "cf_xht", cmd: "cl_crosshair_t", label: "cl_crosshair_t", type: "toggle", on: false, val: "0", tip: "T-shaped crosshair (no top line).", pri: true },
       { id: "cf_xhsniper", cmd: "cl_crosshair_sniper_width", label: "Sniper width", type: "value", on: false, val: "1", tip: "Sniper scope crosshair width." },
       { id: "cf_xhfriend", cmd: "cl_crosshair_friendly_warning", label: "Friendly warning", type: "value", on: true, val: "1", tip: "0=off, 1=icon, 2=both." },
       { id: "cf_xhrecoil", cmd: "cl_crosshair_recoil", label: "cl_crosshair_recoil", type: "toggle", on: false, val: "0", tip: "Crosshair follows recoil pattern." },
@@ -1350,11 +2169,11 @@ const CFG: CfgCat[] = [
   {
     name: "Viewmodel",
     commands: [
-      { id: "cf_vmfov", cmd: "viewmodel_fov", label: "viewmodel_fov", type: "value", on: true, val: "68", tip: "Viewmodel FOV. 54-68." },
-      { id: "cf_vmx", cmd: "viewmodel_offset_x", label: "viewmodel_offset_x", type: "value", on: false, val: "2.5", tip: "Horizontal offset. -2.5 to 2.5." },
-      { id: "cf_vmy", cmd: "viewmodel_offset_y", label: "viewmodel_offset_y", type: "value", on: false, val: "0", tip: "Forward/back offset. -2 to 2." },
-      { id: "cf_vmz", cmd: "viewmodel_offset_z", label: "viewmodel_offset_z", type: "value", on: false, val: "-1.5", tip: "Vertical offset. -2 to 2." },
-      { id: "cf_rhand", cmd: "cl_righthand", label: "cl_righthand", type: "toggle", on: true, val: "1", tip: "0=left, 1=right hand." },
+      { id: "cf_vmfov", cmd: "viewmodel_fov", label: "viewmodel_fov", type: "value", on: true, val: "68", tip: "Viewmodel FOV. 54-68.", pri: true },
+      { id: "cf_vmx", cmd: "viewmodel_offset_x", label: "viewmodel_offset_x", type: "value", on: false, val: "2.5", tip: "Horizontal offset. -2.5 to 2.5.", pri: true },
+      { id: "cf_vmy", cmd: "viewmodel_offset_y", label: "viewmodel_offset_y", type: "value", on: false, val: "0", tip: "Forward/back offset. -2 to 2.", pri: true },
+      { id: "cf_vmz", cmd: "viewmodel_offset_z", label: "viewmodel_offset_z", type: "value", on: false, val: "-1.5", tip: "Vertical offset. -2 to 2.", pri: true },
+      { id: "cf_rhand", cmd: "cl_righthand", label: "cl_righthand", type: "toggle", on: true, val: "1", tip: "0=left, 1=right hand.", pri: true },
       { id: "cf_bob", cmd: "cl_bob_lower_amt", label: "cl_bob_lower_amt", type: "value", on: false, val: "21", tip: "Weapon bob when running. 5-30." },
       { id: "cf_vmsl", cmd: "cl_viewmodel_shift_left_amt", label: "Shift left amt", type: "value", on: false, val: "1.5", tip: "Move-left shift. 0.5-2." },
       { id: "cf_vmsr", cmd: "cl_viewmodel_shift_right_amt", label: "Shift right amt", type: "value", on: false, val: "0.75", tip: "Move-right shift. 0.25-2." },
@@ -1409,8 +2228,8 @@ const CFG: CfgCat[] = [
   {
     name: "Audio",
     commands: [
-      { id: "cf_vol", cmd: "volume", label: "volume", type: "value", on: false, val: "0.5", tip: "Master volume. 0-1." },
-      { id: "cf_musicvol", cmd: "snd_musicvolume", label: "snd_musicvolume", type: "value", on: false, val: "0", tip: "Music volume. 0=muted." },
+      { id: "cf_vol", cmd: "volume", label: "volume", type: "value", on: false, val: "0.5", tip: "Master volume. 0-1.", pri: true },
+      { id: "cf_musicvol", cmd: "snd_musicvolume", label: "snd_musicvolume", type: "value", on: false, val: "0", tip: "Music volume. 0=muted.", pri: true },
       { id: "cf_hppan", cmd: "snd_headphone_pan_exponent", label: "HP pan exponent", type: "value", on: true, val: "2", tip: "Headphone stereo separation." },
       { id: "cf_hpfront", cmd: "snd_front_headphone_position", label: "Front HP pos", type: "value", on: true, val: "45", tip: "Front virtual speaker angle." },
       { id: "cf_hprear", cmd: "snd_rear_headphone_position", label: "Rear HP pos", type: "value", on: true, val: "135", tip: "Rear virtual speaker angle." },
@@ -1444,9 +2263,9 @@ const CFG: CfgCat[] = [
   {
     name: "Mouse & Input",
     commands: [
-      { id: "cf_sens", cmd: "sensitivity", label: "sensitivity", type: "value", on: true, val: "1.8", tip: "Mouse sensitivity." },
-      { id: "cf_raw", cmd: "m_rawinput", label: "m_rawinput", type: "toggle", on: true, val: "1", tip: "Raw mouse input. Bypasses OS accel." },
-      { id: "cf_zoom", cmd: "zoom_sensitivity_ratio", label: "Zoom sensitivity", type: "value", on: false, val: "1.0", tip: "Scoped sensitivity multiplier." },
+      { id: "cf_sens", cmd: "sensitivity", label: "sensitivity", type: "value", on: true, val: "1.8", tip: "Mouse sensitivity.", pri: true },
+      { id: "cf_raw", cmd: "m_rawinput", label: "m_rawinput", type: "toggle", on: true, val: "1", tip: "Raw mouse input. Bypasses OS accel.", pri: true },
+      { id: "cf_zoom", cmd: "zoom_sensitivity_ratio", label: "Zoom sensitivity", type: "value", on: false, val: "1.0", tip: "Scoped sensitivity multiplier.", pri: true },
       { id: "cf_pitch", cmd: "m_pitch", label: "m_pitch", type: "value", on: false, val: "0.022", tip: "Mouse pitch (vertical) speed." },
       { id: "cf_yaw", cmd: "m_yaw", label: "m_yaw", type: "value", on: false, val: "0.022", tip: "Mouse yaw (horizontal) speed." },
       { id: "cf_radialimm", cmd: "cl_inventory_radial_immediate_select", label: "Radial quick select", type: "toggle", on: false, val: "1", tip: "Select weapon on highlight in radial menu." },
@@ -1459,11 +2278,11 @@ const CFG: CfgCat[] = [
   {
     name: "Network",
     commands: [
-      { id: "cf_rate", cmd: "rate", label: "rate", type: "value", on: true, val: "786432", tip: "Max bytes/sec from server. 786432=max." },
-      { id: "cf_interp", cmd: "cl_interp", label: "cl_interp", type: "value", on: true, val: "0", tip: "Interpolation delay. 0=auto." },
-      { id: "cf_interpr", cmd: "cl_interp_ratio", label: "cl_interp_ratio", type: "value", on: true, val: "1", tip: "1=minimal, 2=safe." },
-      { id: "cf_updrate", cmd: "cl_updaterate", label: "cl_updaterate", type: "value", on: true, val: "128", tip: "Packets/sec from server." },
-      { id: "cf_cmdrate", cmd: "cl_cmdrate", label: "cl_cmdrate", type: "value", on: true, val: "128", tip: "Packets/sec to server." },
+      { id: "cf_rate", cmd: "rate", label: "rate", type: "value", on: true, val: "786432", tip: "Max bytes/sec from server. 786432=max.", pri: true },
+      { id: "cf_interp", cmd: "cl_interp", label: "cl_interp", type: "value", on: true, val: "0", tip: "Interpolation delay. 0=auto.", pri: true },
+      { id: "cf_interpr", cmd: "cl_interp_ratio", label: "cl_interp_ratio", type: "value", on: true, val: "1", tip: "1=minimal, 2=safe.", pri: true },
+      { id: "cf_updrate", cmd: "cl_updaterate", label: "cl_updaterate", type: "value", on: true, val: "128", tip: "Packets/sec from server.", pri: true },
+      { id: "cf_cmdrate", cmd: "cl_cmdrate", label: "cl_cmdrate", type: "value", on: true, val: "128", tip: "Packets/sec to server.", pri: true },
       { id: "cf_steamdg", cmd: "net_client_steamdatagram_enable_override", label: "Steam Datagram", type: "value", on: true, val: "1", tip: "1=force SDR relay. Lower ping to Valve servers." },
       { id: "cf_predict", cmd: "cl_predict", label: "cl_predict", type: "toggle", on: true, val: "1", tip: "Client-side prediction. Always keep on." },
       { id: "cf_lagcomp", cmd: "cl_lagcompensation", label: "cl_lagcompensation", type: "toggle", on: true, val: "1", tip: "Lag compensation. Always keep on." },
@@ -1499,7 +2318,7 @@ const CFG: CfgCat[] = [
     name: "Buy & Economy",
     commands: [
       { id: "cf_buymenu", cmd: "cl_use_opens_buy_menu", label: "Use opens buy", type: "toggle", on: false, val: "0", tip: "Prevent E from opening buy menu." },
-      { id: "cf_autowep", cmd: "cl_autowepswitch", label: "Auto weapon switch", type: "toggle", on: false, val: "0", tip: "Auto-switch to picked up weapons." },
+      { id: "cf_autowep", cmd: "cl_autowepswitch", label: "Auto weapon switch", type: "toggle", on: false, val: "0", tip: "Auto-switch to picked up weapons.", pri: true },
       { id: "cf_silencer", cmd: "cl_silencer_mode", label: "Silencer mode", type: "value", on: false, val: "0", tip: "0=toggle, 1=always on, 2=always off." },
       { id: "cf_buywarn", cmd: "cl_buywheel_nomousecentering", label: "Buy wheel no recentering", type: "toggle", on: false, val: "0", tip: "Prevent mouse recentering in buy menu." },
       { id: "cf_buydonate", cmd: "cl_buywheel_donate_key", label: "Donate key", type: "value", on: false, val: "0", tip: "Key to donate weapons in buy menu." },
@@ -1522,7 +2341,7 @@ const CFG: CfgCat[] = [
   {
     name: "Misc & QoL",
     commands: [
-      { id: "cf_console", cmd: "con_enable", label: "con_enable", type: "toggle", on: true, val: "1", tip: "Enable developer console (~)." },
+      { id: "cf_console", cmd: "con_enable", label: "con_enable", type: "toggle", on: true, val: "1", tip: "Enable developer console (~).", pri: true },
       { id: "cf_autohelp", cmd: "cl_autohelp", label: "cl_autohelp", type: "toggle", on: false, val: "0", tip: "Disable in-game help messages." },
       { id: "cf_instructor", cmd: "gameinstructor_enable", label: "Game instructor", type: "toggle", on: false, val: "0", tip: "Disable tutorial tips." },
       { id: "cf_joinadv", cmd: "cl_join_advertise", label: "Friends can join", type: "value", on: false, val: "2", tip: "0=no, 1=friends, 2=friends of friends." },
@@ -1611,8 +2430,7 @@ function collectCfgContent(): string {
       // category banner
       const tag = ` ${cat.name.toUpperCase()} `;
       const half = Math.max(1, Math.floor((W - 4 - tag.length) / 2));
-      L.push(`//${" "}${"─".repeat(half)}${tag}${"─".repeat(W - 4 - half - tag.length)}`);
-      L.push("");
+      L.push(`//${" "}${"─".repeat(half)}${tag}${"─".repeat(W - 4 - half - tag.length)}`, "");
       // find longest command for alignment
       const maxLen = Math.max(...cl.map((x) => x.cmd.length));
       for (const { cmd, comment } of cl) {
@@ -1627,9 +2445,7 @@ function collectCfgContent(): string {
     }
   }
 
-  L.push(`//${border("─")}`);
-  L.push("// End of autoexec.cfg");
-  L.push(`//${border("─")}`);
+  L.push(`//${border("─")}`, "// End of autoexec.cfg", `//${border("─")}`);
   return L.join("\n");
 }
 
@@ -1644,8 +2460,8 @@ function parseCfgContent(content: string) {
     if (!t || t.startsWith("//")) continue;
     for (const cat of CFG)
       for (const c of cat.commands) {
-        const rx = new RegExp(`^${c.cmd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s+(.+)$`, "i");
-        const m = t.match(rx);
+        const rx = new RegExp(`^${c.cmd.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s+(.+)$`, "i");
+        const m = rx.exec(t);
         if (m) {
           setChecked(c.id, true);
           if (c.type === "value") setVal(`${c.id}_v`, m[1].trim());
@@ -2004,7 +2820,7 @@ const NET_SERVERS = [
 ];
 
 /* ================================================================
-   Config Profiles — save/load SYS+CFG state to localStorage
+   Config State — collect / restore SYS+CFG input values
    ================================================================ */
 function collectFullState(): Record<string, string | boolean> {
   const s: Record<string, string | boolean> = {};
@@ -2031,29 +2847,37 @@ function restoreFullState(s: Record<string, string | boolean>) {
   drawCrosshair();
 }
 
-function saveProfile(name: string) {
-  const profiles = JSON.parse(localStorage.getItem("csmooth_profiles") || "{}");
-  profiles[name] = collectFullState();
-  localStorage.setItem("csmooth_profiles", JSON.stringify(profiles));
+/** Migrate legacy csmooth_profiles to schemas (run once) */
+function migrateProfilesToSchemas(): void {
+  const raw = localStorage.getItem("csmooth_profiles");
+  if (!raw) return;
+  try {
+    const profiles: Record<string, Record<string, string | boolean>> = JSON.parse(raw);
+    for (const [name, values] of Object.entries(profiles)) {
+      // Check if a schema with this name already exists
+      const existing = getSchemas().find((s) => s.name === name);
+      if (existing) {
+        // Merge values into existing schema
+        existing.values = values;
+        existing.updatedAt = new Date().toISOString();
+        const schemas = getSchemas();
+        const idx = schemas.findIndex((s) => s.id === existing.id);
+        if (idx >= 0) { schemas[idx] = existing; saveSchemas(schemas); }
+      } else {
+        // Create new schema from profile
+        const s = createSchema(name);
+        saveSchemaValues(s.id, values);
+        // If no active schema, activate the first migrated one
+        if (!getActiveSchemaId()) setActiveSchemaId(s.id);
+      }
+    }
+    // Remove old profiles key
+    localStorage.removeItem("csmooth_profiles");
+  } catch { /* ignore bad data */ }
 }
 
-function loadProfile(name: string) {
-  const profiles = JSON.parse(localStorage.getItem("csmooth_profiles") || "{}");
-  if (profiles[name]) {
-    restoreFullState(profiles[name]);
-    toast(`Profile: ${name}`);
-  }
-}
-
-function deleteProfile(name: string) {
-  const profiles = JSON.parse(localStorage.getItem("csmooth_profiles") || "{}");
-  delete profiles[name];
-  localStorage.setItem("csmooth_profiles", JSON.stringify(profiles));
-}
-
-function getProfileNames(): string[] {
-  return Object.keys(JSON.parse(localStorage.getItem("csmooth_profiles") || "{}"));
-}
+// Run migration on load
+migrateProfilesToSchemas();
 
 /* ================================================================
    HW / PROC / NET tab builders (called from build)
@@ -2069,7 +2893,10 @@ function hwRow(label: string, value: string): HTMLDivElement {
 function hwStatus(label: string, state: string): HTMLDivElement {
   const r = document.createElement("div");
   r.className = "hw-row";
-  const cls = state === "ON" ? "on" : state === "OFF" ? "off" : "unknown";
+  let cls: string;
+  if (state === "ON") cls = "on";
+  else if (state === "OFF") cls = "off";
+  else cls = "unknown";
   r.innerHTML = `<span class="hw-label">${label}</span><span class="hw-status ${cls}">${state}</span>`;
   return r;
 }
@@ -2133,13 +2960,13 @@ const DRV_CATEGORY_ICONS: Record<string, string> = {
 };
 
 const DRV_CATEGORY_LABELS: Record<string, string> = {
-  GPU: "Placa Gráfica (GPU)",
+  GPU: "Graphics Card (GPU)",
   Monitor: "Monitor",
-  Audio: "Áudio",
-  Network: "Rede",
-  Mouse: "Rato / Mouse",
-  Keyboard: "Teclado",
-  Controller: "Controlador de Jogo",
+  Audio: "Audio",
+  Network: "Network",
+  Mouse: "Mouse",
+  Keyboard: "Keyboard",
+  Controller: "Game Controller",
 };
 
 /* ================================================================
@@ -2156,11 +2983,11 @@ interface FeedbackEntry {
 }
 
 const FEEDBACK_CATEGORIES = [
-  { value: "bug", label: "🐛 Bug / Erro", color: "#ef4444" },
-  { value: "feature", label: "💡 Sugestão / Feature", color: "#3b82f6" },
+  { value: "bug", label: "🐛 Bug / Error", color: "#ef4444" },
+  { value: "feature", label: "💡 Suggestion / Feature", color: "#3b82f6" },
   { value: "ui", label: "🎨 Interface / UI", color: "#a855f7" },
   { value: "perf", label: "⚡ Performance", color: "#f59e0b" },
-  { value: "other", label: "📝 Outro", color: "#6b7280" },
+  { value: "other", label: "📝 Other", color: "#6b7280" },
 ];
 
 function getCurrentTabName(): string {
@@ -2193,7 +3020,7 @@ function showFeedbackModal(preScreenshot?: string) {
   overlay.innerHTML = `
     <div class="fdbk-modal">
       <div class="fdbk-modal-header">
-        <h3>📝 Nova Sugestão / Feedback</h3>
+        <h3>📝 New Suggestion / Feedback</h3>
         <button class="fdbk-close" id="fdbk-close">&times;</button>
       </div>
 
@@ -2202,26 +3029,26 @@ function showFeedbackModal(preScreenshot?: string) {
           ${
             feedbackScreenshotB64
               ? `<img src="data:image/png;base64,${feedbackScreenshotB64}" class="fdbk-screenshot-preview" />`
-              : '<div class="fdbk-screenshot-placeholder">📷 A capturar screenshot...</div>'
+              : '<div class="fdbk-screenshot-placeholder">📷 Capturing screenshot...</div>'
           }
         </div>
 
         <div class="fdbk-form">
-          <label class="fdbk-label">Categoria</label>
+          <label class="fdbk-label">Category</label>
           <select id="fdbk-category" class="fdbk-select">
             ${FEEDBACK_CATEGORIES.map((c) => `<option value="${c.value}">${c.label}</option>`).join("")}
           </select>
 
-          <label class="fdbk-label">Tab Atual</label>
+          <label class="fdbk-label">Current Tab</label>
           <input type="text" id="fdbk-tab" class="fdbk-input" value="${currentTab}" readonly />
 
-          <label class="fdbk-label">Descrição</label>
-          <textarea id="fdbk-desc" class="fdbk-textarea" rows="5" placeholder="Descreve o problema, sugestão ou feedback...\n\nExemplo: O botão X não funciona quando..."></textarea>
+          <label class="fdbk-label">Description</label>
+          <textarea id="fdbk-desc" class="fdbk-textarea" rows="5" placeholder="Describe the issue, suggestion or feedback...\n\nExample: Button X does not work when..."></textarea>
 
           <div class="fdbk-actions">
-            <button class="fdbk-btn fdbk-btn-save" id="fdbk-save">💾 Guardar Local</button>
-            <button class="fdbk-btn fdbk-btn-discord" id="fdbk-send-discord">🎮 Enviar Discord</button>
-            <button class="fdbk-btn fdbk-btn-github" id="fdbk-send-github">🐙 Enviar GitHub</button>
+            <button class="fdbk-btn fdbk-btn-save" id="fdbk-save">💾 Save Locally</button>
+            <button class="fdbk-btn fdbk-btn-discord" id="fdbk-send-discord">🎮 Send to Discord</button>
+            <button class="fdbk-btn fdbk-btn-github" id="fdbk-send-github">🐙 Send to GitHub</button>
           </div>
         </div>
       </div>
@@ -2238,7 +3065,7 @@ function showFeedbackModal(preScreenshot?: string) {
       if (area && b64) {
         area.innerHTML = `<img src="data:image/png;base64,${b64}" class="fdbk-screenshot-preview" />`;
       } else if (area) {
-        area.innerHTML = '<div class="fdbk-screenshot-placeholder">⚠ Não foi possível capturar screenshot</div>';
+        area.innerHTML = '<div class="fdbk-screenshot-placeholder">⚠ Could not capture screenshot</div>';
       }
     });
   }
@@ -2255,7 +3082,7 @@ function showFeedbackModal(preScreenshot?: string) {
     const cat = (document.getElementById("fdbk-category") as HTMLSelectElement).value;
     const tab = (document.getElementById("fdbk-tab") as HTMLInputElement).value;
     if (!desc) {
-      toast("Escreve uma descrição");
+      toast("Please write a description");
       return;
     }
 
@@ -2268,11 +3095,11 @@ function showFeedbackModal(preScreenshot?: string) {
         screenshotB64: feedbackScreenshotB64,
         sent: "local",
       });
-      toast("✅ Feedback guardado localmente");
+      toast("✅ Feedback saved locally");
       overlay.remove();
       refreshFeedbackHistory();
     } catch (e) {
-      toast(`Erro ao guardar: ${e}`);
+      toast(`Error saving: ${e}`);
     }
   });
 
@@ -2282,13 +3109,13 @@ function showFeedbackModal(preScreenshot?: string) {
     const cat = (document.getElementById("fdbk-category") as HTMLSelectElement).value;
     const tab = (document.getElementById("fdbk-tab") as HTMLInputElement).value;
     if (!desc) {
-      toast("Escreve uma descrição");
+      toast("Please write a description");
       return;
     }
 
     const wh = getDiscordWebhook();
     if (!wh) {
-      showDiscordModal(() => toast("Webhook guardado. Tenta enviar novamente."));
+      showDiscordModal(() => toast("Webhook saved. Try sending again."));
       return;
     }
 
@@ -2298,7 +3125,7 @@ function showFeedbackModal(preScreenshot?: string) {
     try {
       const btn = document.getElementById("fdbk-send-discord") as HTMLButtonElement;
       btn.disabled = true;
-      btn.textContent = "⏳ A enviar...";
+      btn.textContent = "⏳ Sending...";
 
       await invoke("send_feedback_discord_with_image", {
         webhookUrl: wh,
@@ -2316,15 +3143,15 @@ function showFeedbackModal(preScreenshot?: string) {
         sent: "discord",
       });
 
-      toast("✅ Feedback enviado para Discord!");
+      toast("✅ Feedback sent to Discord!");
       overlay.remove();
       refreshFeedbackHistory();
     } catch (e) {
-      toast(`Erro Discord: ${e}`);
+      toast(`Discord error: ${e}`);
       const btn = document.getElementById("fdbk-send-discord") as HTMLButtonElement;
       if (btn) {
         btn.disabled = false;
-        btn.textContent = "🎮 Enviar Discord";
+        btn.textContent = "🎮 Send to Discord";
       }
     }
   });
@@ -2335,7 +3162,7 @@ function showFeedbackModal(preScreenshot?: string) {
     const cat = (document.getElementById("fdbk-category") as HTMLSelectElement).value;
     const tab = (document.getElementById("fdbk-tab") as HTMLInputElement).value;
     if (!desc) {
-      toast("Escreve uma descrição");
+      toast("Please write a description");
       return;
     }
 
@@ -2349,12 +3176,12 @@ function showFeedbackModal(preScreenshot?: string) {
     const id = crypto.randomUUID();
     const catLabel = FEEDBACK_CATEGORIES.find((c) => c.value === cat)?.label || cat;
     const title = `[${catLabel}] ${desc.substring(0, 80)}`;
-    const body = `## Feedback — Player Agent\n\n**Categoria:** ${catLabel}\n**Tab:** ${tab}\n**Data:** ${new Date().toLocaleString("pt-PT")}\n\n### Descrição\n${desc}\n\n---\n*Enviado automaticamente pelo Player Agent*`;
+    const body = `## Feedback — Player Agent\n\n**Category:** ${catLabel}\n**Tab:** ${tab}\n**Date:** ${new Date().toISOString().slice(0, 16).replace("T", " ")}\n\n### Description\n${desc}\n\n---\n*Sent automatically by Player Agent*`;
 
     try {
       const btn = document.getElementById("fdbk-send-github") as HTMLButtonElement;
       btn.disabled = true;
-      btn.textContent = "⏳ A criar issue...";
+      btn.textContent = "⏳ Creating issue...";
 
       await invoke("send_feedback_github", {
         token,
@@ -2373,15 +3200,15 @@ function showFeedbackModal(preScreenshot?: string) {
         sent: "github",
       });
 
-      toast("✅ Issue criada no GitHub!");
+      toast("✅ Issue created on GitHub!");
       overlay.remove();
       refreshFeedbackHistory();
     } catch (e) {
-      toast(`Erro GitHub: ${e}`);
+      toast(`GitHub error: ${e}`);
       const btn = document.getElementById("fdbk-send-github") as HTMLButtonElement;
       if (btn) {
         btn.disabled = false;
-        btn.textContent = "🐙 Enviar GitHub";
+        btn.textContent = "🐙 Send to GitHub";
       }
     }
   });
@@ -2397,18 +3224,18 @@ function showGitHubConfigModal() {
   const overlay = document.createElement("div");
   overlay.className = "gh-overlay";
   overlay.innerHTML = `
-    <div class="ai-modal">
+    <div class="adv-modal">
       <h3>🐙 GitHub Configuration</h3>
       <label>Personal Access Token</label>
       <input type="password" id="gh-token" value="${token}" placeholder="ghp_xxxxxxxxxxxx" />
       <label>Repository (owner/repo)</label>
       <input type="text" id="gh-repo" value="${repo}" placeholder="username/aim.camp" />
       <div style="font-size:9px;opacity:0.4;margin-top:6px;">
-        Cria um <a href="#" id="gh-link" style="color:var(--primary);text-decoration:underline;">Personal Access Token</a> no GitHub com permissão "repo" → Issues.
+        Create a <a href="#" id="gh-link" style="color:var(--primary);text-decoration:underline;">Personal Access Token</a> on GitHub with "repo" → Issues permission.
       </div>
-      <div class="ai-modal-actions">
-        <button class="ai-cancel" id="gh-cancel">Cancelar</button>
-        <button class="ai-save" id="gh-save">Guardar</button>
+      <div class="adv-modal-actions">
+        <button class="adv-cancel" id="gh-cancel">Cancel</button>
+        <button class="adv-save" id="gh-save">Save</button>
       </div>
     </div>
   `;
@@ -2430,7 +3257,7 @@ function showGitHubConfigModal() {
     if (t) localStorage.setItem("csmooth_github_token", t);
     if (r) localStorage.setItem("csmooth_github_repo", r);
     overlay.remove();
-    toast("GitHub configurado!");
+    toast("GitHub configured!");
   });
 }
 
@@ -2445,8 +3272,8 @@ async function refreshFeedbackHistory() {
       el.innerHTML = `
         <div class="fdbk-empty">
           <div class="fdbk-empty-icon">📝</div>
-          <div class="fdbk-empty-text">Sem feedback registado</div>
-          <div class="fdbk-empty-hint">Clique direito em qualquer parte da app para enviar sugestões, ou usa o botão abaixo.</div>
+          <div class="fdbk-empty-text">No feedback recorded</div>
+          <div class="fdbk-empty-hint">Right-click anywhere in the app to send suggestions, or use the button below.</div>
         </div>`;
       return;
     }
@@ -2454,18 +3281,16 @@ async function refreshFeedbackHistory() {
     // Sort newest first
     entries.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
 
-    el.innerHTML = `<div class="fdbk-count">${entries.length} feedback${entries.length !== 1 ? "s" : ""} registado${entries.length !== 1 ? "s" : ""}</div>`;
+    el.innerHTML = `<div class="fdbk-count">${entries.length} feedback${entries.length === 1 ? "" : "s"} recorded</div>`;
 
     for (const entry of entries) {
       const card = document.createElement("div");
       card.className = "fdbk-card";
 
-      const sentBadge =
-        entry.sent === "discord"
-          ? '<span class="fdbk-sent-badge discord">🎮 Discord</span>'
-          : entry.sent === "github"
-            ? '<span class="fdbk-sent-badge github">🐙 GitHub</span>'
-            : '<span class="fdbk-sent-badge local">💾 Local</span>';
+      let sentBadge: string;
+      if (entry.sent === "discord") sentBadge = '<span class="fdbk-sent-badge discord">🎮 Discord</span>';
+      else if (entry.sent === "github") sentBadge = '<span class="fdbk-sent-badge github">🐙 GitHub</span>';
+      else sentBadge = '<span class="fdbk-sent-badge local">💾 Local</span>';
 
       const dateStr = entry.timestamp ? new Date(entry.timestamp).toLocaleString("pt-PT", { day: "2-digit", month: "2-digit", year: "2-digit", hour: "2-digit", minute: "2-digit" }) : "N/A";
 
@@ -2474,7 +3299,7 @@ async function refreshFeedbackHistory() {
           <span class="fdbk-card-tab">${entry.tab}</span>
           ${sentBadge}
           <span class="fdbk-card-date">${dateStr}</span>
-          <button class="fdbk-card-delete" data-id="${entry.id}" title="Apagar">🗑</button>
+          <button class="fdbk-card-delete" data-id="${entry.id}" title="Delete">🗑</button>
         </div>
         ${entry.screenshot_b64 ? `<img src="data:image/png;base64,${entry.screenshot_b64}" class="fdbk-card-thumb" loading="lazy" />` : ""}
         <div class="fdbk-card-desc">${entry.description}</div>
@@ -2488,10 +3313,10 @@ async function refreshFeedbackHistory() {
         if (!id) return;
         try {
           await invoke("delete_feedback", { id });
-          toast("Feedback apagado");
+          toast("Feedback deleted");
           refreshFeedbackHistory();
         } catch (e) {
-          toast(`Erro ao apagar: ${e}`);
+          toast(`Error deleting: ${e}`);
         }
       });
 
@@ -2503,7 +3328,9 @@ async function refreshFeedbackHistory() {
       });
     }
   } catch (e) {
-    el.innerHTML = `<div class="fdbk-empty"><div class="fdbk-empty-text">Erro ao carregar histórico: ${e}</div></div>`;
+    el.innerHTML = `<div class="fdbk-empty"><div class="fdbk-empty-text"></div></div>`;
+    const errText = el.querySelector(".fdbk-empty-text");
+    if (errText) errText.textContent = `Error loading history: ${str(e)}`;
   }
 }
 
@@ -2532,11 +3359,11 @@ function setupFeedbackContextMenu() {
     ctxMenu.innerHTML = `
       <div class="fdbk-ctx-item" id="fdbk-ctx-suggest">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
-        <span>📝 Enviar Sugestão</span>
+        <span>📝 Send Suggestion</span>
       </div>
       <div class="fdbk-ctx-item" id="fdbk-ctx-bug">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-        <span>🐛 Reportar Bug</span>
+        <span>🐛 Report Bug</span>
       </div>
     `;
 
@@ -2637,12 +3464,12 @@ function drawFrametimeChart(canvas: HTMLCanvasElement, result: BenchmarkResult, 
 
   // Find range
   const sorted = [...data].sort((a, b) => a - b);
-  const yMin = mode === "fps" ? 0 : 0;
+  const yMin = 0;
   // Use P99.5 as max to avoid extreme outliers dominating the chart
   const p995idx = Math.floor(data.length * 0.995);
   const yMax = sorted[Math.min(p995idx, sorted.length - 1)] * 1.15;
   const tMin = ts[0] || 0;
-  const tMax = ts[ts.length - 1] || 1;
+  const tMax = ts.at(-1) || 1;
 
   // Background
   ctx.fillStyle = "rgba(10,10,18,0.95)";
@@ -2787,7 +3614,9 @@ function drawFpsHistogram(canvas: HTMLCanvasElement, result: BenchmarkResult) {
     const isLow = fps < result.p1_fps;
     const isAvg = fps >= result.avg_fps - binWidth && fps <= result.avg_fps + binWidth;
 
-    ctx.fillStyle = isLow ? "rgba(255,107,107,0.6)" : isAvg ? "rgba(0,255,170,0.6)" : "rgba(0,150,255,0.4)";
+    if (isLow) ctx.fillStyle = "rgba(255,107,107,0.6)";
+    else if (isAvg) ctx.fillStyle = "rgba(0,255,170,0.6)";
+    else ctx.fillStyle = "rgba(0,150,255,0.4)";
     ctx.fillRect(x, y, barW, barH);
   }
 
@@ -2813,9 +3642,9 @@ async function importBenchmarkFile() {
     _currentBenchResult = result;
     benchHistory.push(result);
     displayBenchmarkResult(result);
-    toast(`Benchmark carregado: ${result.file_name}`);
+    toast(`Benchmark loaded: ${result.file_name}`);
   } catch (e) {
-    if (String(e) !== "Cancelled") toast(`Erro: ${e}`, true);
+    if (String(e) !== "Cancelled") toast(`Error: ${e}`, true);
   }
 }
 
@@ -2823,12 +3652,12 @@ async function scanCapFrameX() {
   try {
     const files = await invoke<string[]>("scan_capframex_folder");
     if (files.length === 0) {
-      toast("CapFrameX não encontrado ou sem capturas");
+      toast("CapFrameX not found or no captures");
       return;
     }
     showCapFrameXPicker(files);
   } catch (e) {
-    toast(`Erro: ${e}`, true);
+    toast(`Error: ${e}`, true);
   }
 }
 
@@ -2871,12 +3700,18 @@ function showCapFrameXPicker(files: string[]) {
         _currentBenchResult = result;
         benchHistory.push(result);
         displayBenchmarkResult(result);
-        toast(`Benchmark carregado: ${result.file_name}`);
+        toast(`Benchmark loaded: ${result.file_name}`);
       } catch (e) {
-        toast(`Erro ao analisar: ${e}`, true);
+        toast(`Error parsing: ${e}`, true);
       }
     });
   });
+}
+
+function stutterCls(pct: number): string {
+  if (pct > 2) return "bad";
+  if (pct > 0.5) return "warn";
+  return "";
 }
 
 function displayBenchmarkResult(r: BenchmarkResult) {
@@ -2909,7 +3744,7 @@ function displayBenchmarkResult(r: BenchmarkResult) {
     { label: "MIN", value: r.min_fps.toFixed(0), cls: r.min_fps < 30 ? "bad" : "" },
     { label: "AVG FT", value: r.avg_frametime.toFixed(2) + "ms", cls: "" },
     { label: "P99 FT", value: r.p99_frametime.toFixed(2) + "ms", cls: r.p99_frametime > 33.3 ? "bad" : "" },
-    { label: "STUTTERS", value: `${r.stutter_count} (${r.stutter_pct.toFixed(1)}%)`, cls: r.stutter_pct > 2 ? "bad" : r.stutter_pct > 0.5 ? "warn" : "" },
+    { label: "STUTTERS", value: `${r.stutter_count} (${r.stutter_pct.toFixed(1)}%)`, cls: stutterCls(r.stutter_pct) },
     { label: "DROPPED", value: `${r.dropped_frames}`, cls: r.dropped_frames > 0 ? "warn" : "" },
   ];
 
@@ -2925,17 +3760,17 @@ function displayBenchmarkResult(r: BenchmarkResult) {
   const assessment = document.createElement("div");
   assessment.className = "bench-assessment";
   const tips: string[] = [];
-  if (r.avg_fps >= 300) tips.push("✅ Excelente! FPS médio acima de 300 — ideal para monitores de 240Hz+.");
-  else if (r.avg_fps >= 200) tips.push("👍 Bom desempenho. FPS médio adequado para monitores de 144Hz-240Hz.");
-  else if (r.avg_fps >= 144) tips.push("⚠ FPS médio ok para 144Hz, mas podes sentir drops em fights intensos.");
-  else tips.push("🔴 FPS médio baixo para CS2 competitivo. Considera baixar definições gráficas.");
+  if (r.avg_fps >= 300) tips.push("✅ Excellent! Average FPS above 300 — ideal for 240Hz+ monitors.");
+  else if (r.avg_fps >= 200) tips.push("👍 Good performance. Average FPS suitable for 144Hz-240Hz monitors.");
+  else if (r.avg_fps >= 144) tips.push("⚠ Average FPS ok for 144Hz, but you may feel drops during intense fights.");
+  else tips.push("🔴 Average FPS too low for competitive CS2. Consider lowering graphics settings.");
 
-  if (r.p1_fps < r.avg_fps * 0.4) tips.push("⚠ 1% Low muito abaixo da média — indica micro-stutters significativos.");
-  if (r.stutter_pct > 2) tips.push("🔴 Taxa de stutters elevada (>" + r.stutter_pct.toFixed(1) + "%). Verifica processos em background e drivers.");
-  if (r.stutter_pct <= 0.5 && r.p1_fps > r.avg_fps * 0.6) tips.push("✅ Frame pacing consistente — experiência fluida.");
-  if (r.dropped_frames > 5) tips.push("⚠ Frames dropped detectados — pode indicar bottleneck de GPU ou VSync issues.");
+  if (r.p1_fps < r.avg_fps * 0.4) tips.push("⚠ 1% Low well below the average — indicates significant micro-stutters.");
+  if (r.stutter_pct > 2) tips.push("🔴 High stutter rate (>" + r.stutter_pct.toFixed(1) + "%). Check background processes and drivers.");
+  if (r.stutter_pct <= 0.5 && r.p1_fps > r.avg_fps * 0.6) tips.push("✅ Consistent frame pacing — smooth experience.");
+  if (r.dropped_frames > 5) tips.push("⚠ Dropped frames detected — may indicate GPU bottleneck or VSync issues.");
 
-  assessment.innerHTML = `<div class="bench-assessment-title">🎮 Análise CS2</div>` + tips.map((t) => `<div class="bench-tip">${t}</div>`).join("");
+  assessment.innerHTML = `<div class="bench-assessment-title">🎮 CS2 Analysis</div>` + tips.map((t) => `<div class="bench-tip">${t}</div>`).join("");
   el.appendChild(assessment);
 
   // Chart mode toggle
@@ -2968,7 +3803,7 @@ function displayBenchmarkResult(r: BenchmarkResult) {
   // Chart mode toggle handlers
   chartControls.querySelectorAll(".bench-chart-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
-      chartControls.querySelectorAll(".bench-chart-btn").forEach((b) => b.classList.remove("active"));
+      chartControls.querySelectorAll(".bench-chart-btn").forEach((b) => { b.classList.remove("active"); });
       btn.classList.add("active");
       const mode = (btn as HTMLElement).dataset.mode as "frametime" | "fps";
       drawFrametimeChart(chartCanvas, r, mode);
@@ -2979,12 +3814,12 @@ function displayBenchmarkResult(r: BenchmarkResult) {
   if (benchHistory.length > 1) {
     const cmpDiv = document.createElement("div");
     cmpDiv.className = "bench-comparison";
-    cmpDiv.innerHTML = `<div class="bench-assessment-title">📊 Comparação (${benchHistory.length} capturas)</div>`;
+    cmpDiv.innerHTML = `<div class="bench-assessment-title">📊 Comparison (${benchHistory.length} captures)</div>`;
 
     const cmpTable = document.createElement("table");
     cmpTable.className = "drv-table";
     cmpTable.innerHTML = `
-      <thead><tr><th>Ficheiro</th><th>Processo</th><th>AVG FPS</th><th>1% Low</th><th>0.1% Low</th><th>Stutters</th><th>Duração</th></tr></thead>
+      <thead><tr><th>File</th><th>Process</th><th>AVG FPS</th><th>1% Low</th><th>0.1% Low</th><th>Stutters</th><th>Duration</th></tr></thead>
       <tbody>${benchHistory
         .map(
           (b) => `
@@ -3009,10 +3844,10 @@ function displayBenchmarkResult(r: BenchmarkResult) {
 async function refreshDriverInfo() {
   const el = document.getElementById("drv-content");
   if (!el) return;
-  el.innerHTML = '<div class="net-status">A analisar drivers do sistema e periféricos...</div>';
+  el.innerHTML = '<div class="net-status">Analyzing system drivers and peripherals...</div>';
   try {
     const drivers = await invoke<DriverEntry[]>("get_driver_info");
-    el.innerHTML = '<div class="net-status">A verificar atualizações disponíveis...</div>';
+    el.innerHTML = '<div class="net-status">Checking for available updates...</div>';
 
     // Fetch available updates in parallel
     let updates: DriverUpdate[] = [];
@@ -3034,10 +3869,10 @@ async function refreshDriverInfo() {
     summary.className = "drv-summary";
     summary.innerHTML = `
       <div class="drv-summary-item"><span class="drv-summary-val">${totalCount}</span><span class="drv-summary-label">Total</span></div>
-      <div class="drv-summary-item"><span class="drv-summary-val${genericCount > 0 ? " warn" : ""}">${genericCount}</span><span class="drv-summary-label">Genéricos</span></div>
-      <div class="drv-summary-item"><span class="drv-summary-val${outdatedCount > 0 ? " bad" : ""}">${outdatedCount}</span><span class="drv-summary-label">Desatualizados</span></div>
-      <div class="drv-summary-item"><span class="drv-summary-val${agingCount > 0 ? " warn" : ""}">${agingCount}</span><span class="drv-summary-label">&gt;6 meses</span></div>
-      <div class="drv-summary-item"><span class="drv-summary-val">${currentCount}</span><span class="drv-summary-label">Atuais</span></div>
+      <div class="drv-summary-item"><span class="drv-summary-val${genericCount > 0 ? " warn" : ""}">${genericCount}</span><span class="drv-summary-label">Generic</span></div>
+      <div class="drv-summary-item"><span class="drv-summary-val${outdatedCount > 0 ? " bad" : ""}">${outdatedCount}</span><span class="drv-summary-label">Outdated</span></div>
+      <div class="drv-summary-item"><span class="drv-summary-val${agingCount > 0 ? " warn" : ""}">${agingCount}</span><span class="drv-summary-label">&gt;6 months</span></div>
+      <div class="drv-summary-item"><span class="drv-summary-val">${currentCount}</span><span class="drv-summary-label">Current</span></div>
       <div class="drv-summary-item"><span class="drv-summary-val${updates.length > 0 ? " good" : ""}">${updates.length}</span><span class="drv-summary-label">Updates</span></div>
     `;
     el.appendChild(summary);
@@ -3050,29 +3885,29 @@ async function refreshDriverInfo() {
     const netDrivers = drivers.filter((d) => d.category === "Network");
 
     for (const gd of gpuDrivers) {
-      if (gd.is_generic) tips.push("⚠ A tua GPU usa uma driver <b>genérica Microsoft</b>. Instala a driver oficial da NVIDIA/AMD para teres o melhor desempenho em CS2.");
-      if (gd.status === "outdated") tips.push("⚠ A driver da GPU tem <b>mais de 1 ano</b>. Considera atualizar para a versão Game Ready mais recente para CS2.");
+      if (gd.is_generic) tips.push("⚠ Your GPU uses a <b>generic Microsoft</b> driver. Install the official NVIDIA/AMD driver for the best CS2 performance.");
+      if (gd.status === "outdated") tips.push("⚠ GPU driver is <b>over 1 year old</b>. Consider updating to the latest Game Ready version for CS2.");
       if (gd.driver_provider?.toLowerCase().includes("nvidia") && gd.status !== "current")
-        tips.push("💡 Para NVIDIA: usa <b>GeForce Experience</b> ou <b>nvidia.com/drivers</b> para obter drivers Game Ready otimizados para CS2.");
+        tips.push("💡 For NVIDIA: use <b>GeForce Experience</b> or <b>nvidia.com/drivers</b> to get Game Ready drivers optimized for CS2.");
       if (gd.driver_provider?.toLowerCase().includes("amd") && gd.status !== "current")
-        tips.push("💡 Para AMD: usa <b>AMD Adrenalin</b> para instalar drivers otimizados. Ativa <b>Anti-Lag</b> para CS2.");
+        tips.push("💡 For AMD: use <b>AMD Adrenalin</b> to install optimized drivers. Enable <b>Anti-Lag</b> for CS2.");
     }
     for (const md of mouseDrivers) {
-      if (md.is_generic) tips.push(`⚠ O rato "<b>${md.device_name}</b>" usa driver genérico. Instala o software do fabricante para polling rate e DPI corretos.`);
+      if (md.is_generic) tips.push(`⚠ Mouse "<b>${md.device_name}</b>" uses a generic driver. Install the manufacturer's software for correct polling rate and DPI.`);
     }
     for (const ad of audioDrivers) {
       if (ad.is_generic)
-        tips.push(`💡 Dispositivo de áudio "<b>${ad.device_name}</b>" usa driver genérico. Para menor latência sonora, instala a driver do fabricante (ex: Realtek HD Audio, SteelSeries Sonar).`);
+        tips.push(`💡 Audio device "<b>${ad.device_name}</b>" uses a generic driver. For lower audio latency, install the manufacturer's driver (e.g., Realtek HD Audio, SteelSeries Sonar).`);
     }
     for (const nd of netDrivers) {
-      if (nd.is_generic) tips.push(`💡 Adaptador de rede "<b>${nd.device_name}</b>" usa driver genérico. A driver do fabricante (Intel, Realtek, Killer) pode melhorar a latência de rede.`);
+      if (nd.is_generic) tips.push(`💡 Network adapter "<b>${nd.device_name}</b>" uses a generic driver. The manufacturer's driver (Intel, Realtek, Killer) can improve network latency.`);
     }
-    if (genericCount === 0 && outdatedCount === 0) tips.push("✅ Excelente! Todos os teus drivers são do fabricante e estão atualizados. O teu setup está otimizado.");
+    if (genericCount === 0 && outdatedCount === 0) tips.push("✅ Excellent! All your drivers are from the manufacturer and up to date. Your setup is optimized.");
 
     if (tips.length > 0) {
       const tipsDiv = document.createElement("div");
       tipsDiv.className = "drv-tips";
-      tipsDiv.innerHTML = `<div class="drv-tips-header">🎮 Recomendações para CS2</div>` + tips.map((t) => `<div class="drv-tip-item">${t}</div>`).join("");
+      tipsDiv.innerHTML = `<div class="drv-tips-header">🎮 CS2 Recommendations</div>` + tips.map((t) => `<div class="drv-tip-item">${t}</div>`).join("");
       el.appendChild(tipsDiv);
     }
 
@@ -3110,14 +3945,14 @@ async function refreshDriverInfo() {
         if (d.is_generic || d.status === "outdated") devCard.classList.add("drv-dev-warn");
         if (d.status === "current" && !d.is_generic) devCard.classList.add("drv-dev-ok");
 
-        const typeBadge = d.is_generic ? '<span class="drv-badge generic">Genérico</span>' : '<span class="drv-badge manufacturer">OEM</span>';
+        const typeBadge = d.is_generic ? '<span class="drv-badge generic">Generic</span>' : '<span class="drv-badge manufacturer">OEM</span>';
 
         let statusBadge = '<span class="drv-badge unknown">?</span>';
-        if (d.status === "current") statusBadge = '<span class="drv-badge current">Atual</span>';
+        if (d.status === "current") statusBadge = '<span class="drv-badge current">Current</span>';
         if (d.status === "aging") statusBadge = '<span class="drv-badge aging">&gt;6m</span>';
-        if (d.status === "outdated") statusBadge = '<span class="drv-badge outdated">Desatual.</span>';
+        if (d.status === "outdated") statusBadge = '<span class="drv-badge outdated">Outdated</span>';
 
-        const signedHtml = d.is_signed ? '<span class="drv-signed yes">✓ Assinado</span>' : '<span class="drv-signed no">✗ Não Assinado</span>';
+        const signedHtml = d.is_signed ? '<span class="drv-signed yes">✓ Signed</span>' : '<span class="drv-signed no">✗ Not Signed</span>';
 
         // Match available update to this device
         const devNameLower = d.device_name.toLowerCase();
@@ -3131,7 +3966,7 @@ async function refreshDriverInfo() {
         let updateHtml = "";
         if (matchedUpdate) {
           const dlLink = matchedUpdate.download_url
-            ? `<a class="drv-update-link" href="#" title="Abrir página de download"
+            ? `<a class="drv-update-link" href="#" title="Open download page"
                 onclick="event.preventDefault(); window.__TAURI__?.shell?.open?.('${matchedUpdate.download_url}') || window.open('${matchedUpdate.download_url}','_blank')">⬇ Download</a>`
             : "";
           const sizeTxt = matchedUpdate.size_mb > 0 ? ` (${matchedUpdate.size_mb} MB)` : "";
@@ -3140,7 +3975,7 @@ async function refreshDriverInfo() {
               <span class="drv-badge current">⬆ Update</span>
               <span class="drv-update-title">${matchedUpdate.title}${sizeTxt}</span>
               ${dlLink}
-              <button class="drv-install-btn" data-update-id="${matchedUpdate.update_id}" title="Instalar driver em background (requer Admin)">⚡ Instalar</button>
+              <button class="drv-install-btn" data-update-id="${matchedUpdate.update_id}" title="Install driver in background (requires Admin)">⚡ Install</button>
             </div>`;
         }
 
@@ -3159,27 +3994,27 @@ async function refreshDriverInfo() {
         `;
 
         // Attach install button handler
-        const installBtn = devCard.querySelector(".drv-install-btn") as HTMLButtonElement | null;
+        const installBtn = devCard.querySelector<HTMLButtonElement>(".drv-install-btn");
         if (installBtn) {
           installBtn.addEventListener("click", async () => {
             const uid = installBtn.dataset.updateId;
             if (!uid) return;
             installBtn.disabled = true;
-            installBtn.textContent = "⏳ A instalar...";
+            installBtn.textContent = "⏳ Installing...";
             try {
               const report = await invoke<{ status: string; error?: string; steps?: string[]; needs_reboot?: boolean }>("install_driver_update", { updateId: uid });
               if (report.status === "success") {
-                installBtn.textContent = "✅ Instalado";
+                installBtn.textContent = "✅ Installed";
                 installBtn.classList.add("drv-install-done");
-                if (report.needs_reboot) toast("Driver instalado! Reinicia o PC para aplicar.");
-                else toast("Driver instalado com sucesso!");
+                if (report.needs_reboot) toast("Driver installed! Restart your PC to apply.");
+                else toast("Driver installed successfully!");
               } else {
-                installBtn.textContent = "❌ Falhou";
-                toast(report.error || "Falha na instalação da driver", true);
+                installBtn.textContent = "❌ Failed";
+                toast(report.error || "Driver installation failed", true);
               }
             } catch (e) {
-              installBtn.textContent = "❌ Erro";
-              toast(`Erro ao instalar driver: ${e}`, true);
+              installBtn.textContent = "❌ Error";
+              toast(`Error installing driver: ${e}`, true);
             }
           });
         }
@@ -3192,7 +4027,9 @@ async function refreshDriverInfo() {
 
     el.appendChild(grid);
   } catch (e) {
-    el.innerHTML = `<div class="net-status">Falha ao analisar drivers: ${e}</div>`;
+    el.innerHTML = `<div class="net-status"></div>`;
+    const errDiv = el.querySelector(".net-status");
+    if (errDiv) errDiv.textContent = `Failed to analyze drivers: ${str(e)}`;
   }
 }
 
@@ -3207,23 +4044,23 @@ async function refreshHardwareInfo() {
     grid.className = "hw-grid";
 
     const cCpu = card("CPU");
-    cCpu.appendChild(hwRow("Model", String(hw.cpu_name || "N/A")));
-    cCpu.appendChild(hwRow("Cores", String(hw.cpu_cores || "?")));
-    cCpu.appendChild(hwRow("Threads", String(hw.cpu_threads || "?")));
-    cCpu.appendChild(hwRow("Clock", `${hw.cpu_clock_mhz || "?"} MHz`));
+    cCpu.appendChild(hwRow("Model", str(hw.cpu_name, "N/A")));
+    cCpu.appendChild(hwRow("Cores", str(hw.cpu_cores, "?")));
+    cCpu.appendChild(hwRow("Threads", str(hw.cpu_threads, "?")));
+    cCpu.appendChild(hwRow("Clock", `${str(hw.cpu_clock_mhz, "?")} MHz`));
     grid.appendChild(cCpu);
 
     const cGpu = card("GPU");
-    cGpu.appendChild(hwRow("Model", String(hw.gpu_name || "N/A")));
-    cGpu.appendChild(hwRow("VRAM", `${hw.gpu_vram_mb || "?"} MB`));
-    cGpu.appendChild(hwRow("Driver", String(hw.gpu_driver || "N/A")));
-    cGpu.appendChild(hwRow("Refresh Rate", `${hw.refresh_rate || "?"} Hz`));
+    cGpu.appendChild(hwRow("Model", str(hw.gpu_name, "N/A")));
+    cGpu.appendChild(hwRow("VRAM", `${str(hw.gpu_vram_mb, "?")} MB`));
+    cGpu.appendChild(hwRow("Driver", str(hw.gpu_driver, "N/A")));
+    cGpu.appendChild(hwRow("Refresh Rate", `${str(hw.refresh_rate, "?")} Hz`));
     grid.appendChild(cGpu);
 
     const cRam = card("RAM / Storage");
-    cRam.appendChild(hwRow("Total RAM", `${hw.ram_total_gb || "?"} GB`));
-    cRam.appendChild(hwRow("Modules", String(hw.ram_modules || "?")));
-    cRam.appendChild(hwRow("Speed", `${hw.ram_speed_mhz || "?"} MHz`));
+    cRam.appendChild(hwRow("Total RAM", `${str(hw.ram_total_gb, "?")} GB`));
+    cRam.appendChild(hwRow("Modules", str(hw.ram_modules, "?")));
+    cRam.appendChild(hwRow("Speed", `${str(hw.ram_speed_mhz, "?")} MHz`));
     const disks = (hw.disks as Array<{ name: string; type: string; size_gb: number }>) || [];
     for (const d of disks) {
       cRam.appendChild(hwRow(d.name || "Disk", `${d.type} ${d.size_gb} GB`));
@@ -3231,16 +4068,22 @@ async function refreshHardwareInfo() {
     grid.appendChild(cRam);
 
     const cSys = card("System / Features");
-    cSys.appendChild(hwRow("OS", String(hw.os_name || "N/A")));
-    cSys.appendChild(hwRow("Build", String(hw.os_build || "?")));
-    cSys.appendChild(hwStatus("HAGS", String(hw.hags || "N/A")));
-    cSys.appendChild(hwStatus("ReBAR", hw.rebar === "N/A" ? "N/A" : Number(String(hw.rebar).replace(" MB", "")) > 256 ? "ON" : "OFF"));
-    cSys.appendChild(hwStatus("XMP", String(hw.xmp || "N/A") === "Likely" ? "ON" : "N/A"));
+    cSys.appendChild(hwRow("OS", str(hw.os_name, "N/A")));
+    cSys.appendChild(hwRow("Build", str(hw.os_build, "?")));
+    cSys.appendChild(hwStatus("HAGS", str(hw.hags, "N/A")));
+    let rebarVal: string;
+    if (hw.rebar === "N/A") rebarVal = "N/A";
+    else if (Number(String(hw.rebar).replace(" MB", "")) > 256) rebarVal = "ON";
+    else rebarVal = "OFF";
+    cSys.appendChild(hwStatus("ReBAR", rebarVal));
+    cSys.appendChild(hwStatus("XMP", str(hw.xmp, "N/A") === "Likely" ? "ON" : "N/A"));
     grid.appendChild(cSys);
 
     el.appendChild(grid);
   } catch (e) {
-    el.innerHTML = `<div class="net-status">Failed: ${e}</div>`;
+    el.innerHTML = `<div class="net-status"></div>`;
+    const errDiv = el.querySelector(".net-status");
+    if (errDiv) errDiv.textContent = `Failed: ${str(e)}`;
   }
 }
 
@@ -3271,7 +4114,9 @@ async function refreshProcesses() {
       list.appendChild(row);
     }
   } catch (e) {
-    list.innerHTML = `<div class="net-status">Failed: ${e}</div>`;
+    list.innerHTML = `<div class="net-status"></div>`;
+    const errDiv = list.querySelector(".net-status");
+    if (errDiv) errDiv.textContent = `Failed: ${str(e)}`;
   }
 }
 
@@ -3296,8 +4141,18 @@ async function runPingTests() {
   for (const r of results) {
     const row = document.createElement("div");
     row.className = "ping-row";
-    const cls = r.avg < 0 ? "ping-bad" : r.avg < 30 ? "ping-good" : r.avg < 80 ? "ping-ok" : "ping-bad";
-    const grade = r.avg < 0 ? "FAIL" : r.avg < 15 ? "A+" : r.avg < 30 ? "A" : r.avg < 50 ? "B" : r.avg < 80 ? "C" : "D";
+    let cls: string;
+    if (r.avg < 0) cls = "ping-bad";
+    else if (r.avg < 30) cls = "ping-good";
+    else if (r.avg < 80) cls = "ping-ok";
+    else cls = "ping-bad";
+    let grade: string;
+    if (r.avg < 0) grade = "FAIL";
+    else if (r.avg < 15) grade = "A+";
+    else if (r.avg < 30) grade = "A";
+    else if (r.avg < 50) grade = "B";
+    else if (r.avg < 80) grade = "C";
+    else grade = "D";
     row.innerHTML = `<span class="ping-host">${r.name}</span><span class="ping-val ${cls}">${r.avg < 0 ? "--" : r.avg + "ms"}</span><span class="ping-val">${r.min < 0 ? "--" : r.min + "ms"}</span><span class="ping-val">${r.max < 0 ? "--" : r.max + "ms"}</span><span class="ping-val ${cls}">${grade}</span>`;
     list.appendChild(row);
   }
@@ -3481,23 +4336,23 @@ function setDemoMeta(name: string, data: { notes?: string; rating?: number }) {
 }
 
 /* ================================================================
-   AI Integration — config, helpers, prompts
+   Cloud Advisor — config, helpers, prompts
    ================================================================ */
 
-interface AiConfig {
+interface AdvConfig {
   key: string;
   endpoint: string;
   model: string;
 }
 
-const AI_DEFAULTS: AiConfig = {
+const ADV_DEFAULTS: AdvConfig = {
   key: "",
   endpoint: "https://api.groq.com/openai/v1/chat/completions",
   model: "llama-3.3-70b-versatile",
 };
 
-function getAiConfig(): AiConfig {
-  const raw = localStorage.getItem("csmooth_ai_config");
+function getAdvConfig(): AdvConfig {
+  const raw = localStorage.getItem("csmooth_adv_config");
   if (raw) {
     try {
       return JSON.parse(raw);
@@ -3505,113 +4360,113 @@ function getAiConfig(): AiConfig {
       /* fall through */
     }
   }
-  return { ...AI_DEFAULTS };
+  return { ...ADV_DEFAULTS };
 }
 
-function setAiConfig(cfg: AiConfig) {
-  localStorage.setItem("csmooth_ai_config", JSON.stringify(cfg));
+function setAdvConfig(cfg: AdvConfig) {
+  localStorage.setItem("csmooth_adv_config", JSON.stringify(cfg));
 }
 
-function hasAiKey(): boolean {
-  return getAiConfig().key.length > 5;
+function hasAdvKey(): boolean {
+  return getAdvConfig().key.length > 5;
 }
 
-async function aiChat(systemPrompt: string, userContent: string): Promise<string> {
-  const cfg = getAiConfig();
-  if (!cfg.key) throw new Error("No API key configured. Click the AI icon in the header to set up.");
+async function advChat(systemPrompt: string, userContent: string): Promise<string> {
+  const cfg = getAdvConfig();
+  if (!cfg.key) throw new Error("No API key configured. Click the advisor icon in the header to set up.");
   const messages = [
     { role: "system", content: systemPrompt },
     { role: "user", content: userContent },
   ];
   try {
-    return await invoke<string>("ai_chat", {
+    return await invoke<string>("advisor_chat", {
       apiKey: cfg.key,
       endpoint: cfg.endpoint,
       model: cfg.model,
       messages,
     });
-  } catch (e: any) {
+  } catch (e: unknown) {
     const msg = String(e);
     if (msg.includes("401")) {
-      throw new Error("API key invalid or expired. Open AI settings (header icon) and regenerate your key at console.groq.com/keys");
+      throw new Error("API key invalid or expired. Open advisor settings (header icon) and regenerate your key at console.groq.com/keys");
     }
     throw e;
   }
 }
 
-// simple markdown-to-html for AI responses
+// simple markdown-to-html for advisor responses
 function mdToHtml(md: string): string {
   return md
-    .replace(/### (.+)/g, "<h4>$1</h4>")
-    .replace(/## (.+)/g, "<h3>$1</h3>")
-    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/^- (.+)/gm, "<li>$1</li>")
-    .replace(/(<li>.*<\/li>)/gs, "<ul>$1</ul>")
-    .replace(/<\/ul>\s*<ul>/g, "")
-    .replace(/\n{2,}/g, "<br><br>")
-    .replace(/\n/g, "<br>");
+    .replaceAll(/### (.+)/g, "<h4>$1</h4>")
+    .replaceAll(/## (.+)/g, "<h3>$1</h3>")
+    .replaceAll(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replaceAll(/`([^`]+)`/g, "<code>$1</code>")
+    .replaceAll(/^- (.+)/gm, "<li>$1</li>")
+    .replaceAll(/(<li>.*<\/li>)/gs, "<ul>$1</ul>")
+    .replaceAll(/<\/ul>\s*<ul>/g, "")
+    .replaceAll(/\n{2,}/g, "<br><br>")
+    .replaceAll("\n", "<br>");
 }
 
-function showAiModal() {
-  const existing = document.querySelector(".ai-overlay");
+function showAdvModal() {
+  const existing = document.querySelector(".adv-overlay");
   if (existing) existing.remove();
 
-  const cfg = getAiConfig();
+  const cfg = getAdvConfig();
   const overlay = document.createElement("div");
-  overlay.className = "ai-overlay";
+  overlay.className = "adv-overlay";
 
   overlay.innerHTML = `
-    <div class="ai-modal">
-      <h3>AI Configuration</h3>
+    <div class="adv-modal">
+      <h3>Advisor Settings</h3>
       <label>API Key</label>
-      <input type="password" id="ai-key" value="${cfg.key}" placeholder="gsk_... (Groq) or sk-... (OpenAI)" />
+      <input type="password" id="adv-key" value="${cfg.key}" placeholder="gsk_... (Groq) or sk-... (OpenAI)" />
       <label>Endpoint</label>
-      <input type="text" id="ai-endpoint" value="${cfg.endpoint}" placeholder="${AI_DEFAULTS.endpoint}" />
+      <input type="text" id="adv-endpoint" value="${cfg.endpoint}" placeholder="${ADV_DEFAULTS.endpoint}" />
       <label>Model</label>
-      <input type="text" id="ai-model" value="${cfg.model}" placeholder="${AI_DEFAULTS.model}" />
-      <div id="ai-test-result" style="font-size:10px;margin-top:6px;min-height:16px;"></div>
-      <div class="ai-providers">
-        <div class="ai-providers-label">Get a free API key from:</div>
-        <div class="ai-providers-grid">
-          <a href="#" class="ai-provider-link" data-url="https://console.groq.com/keys" data-endpoint="https://api.groq.com/openai/v1/chat/completions" data-model="llama-3.3-70b-versatile">
-            <span class="ai-prov-icon">⚡</span><span class="ai-prov-name">Groq</span><span class="ai-prov-tag">Free</span>
+      <input type="text" id="adv-model" value="${cfg.model}" placeholder="${ADV_DEFAULTS.model}" />
+      <div id="adv-test-result" style="font-size:10px;margin-top:6px;min-height:16px;"></div>
+      <div class="adv-providers">
+        <div class="adv-providers-label">Get a free API key from:</div>
+        <div class="adv-providers-grid">
+          <a href="#" class="adv-provider-link" data-url="https://console.groq.com/keys" data-endpoint="https://api.groq.com/openai/v1/chat/completions" data-model="llama-3.3-70b-versatile">
+            <span class="adv-prov-icon">⚡</span><span class="adv-prov-name">Groq</span><span class="adv-prov-tag">Free</span>
           </a>
-          <a href="#" class="ai-provider-link" data-url="https://platform.openai.com/api-keys" data-endpoint="https://api.openai.com/v1/chat/completions" data-model="gpt-4o-mini">
-            <span class="ai-prov-icon">🟢</span><span class="ai-prov-name">OpenAI</span><span class="ai-prov-tag">Paid</span>
+          <a href="#" class="adv-provider-link" data-url="https://platform.openai.com/api-keys" data-endpoint="https://api.openai.com/v1/chat/completions" data-model="gpt-4o-mini">
+            <span class="adv-prov-icon">🟢</span><span class="adv-prov-name">OpenAI</span><span class="adv-prov-tag">Paid</span>
           </a>
-          <a href="#" class="ai-provider-link" data-url="https://openrouter.ai/keys" data-endpoint="https://openrouter.ai/api/v1/chat/completions" data-model="meta-llama/llama-3.3-70b-instruct:free">
-            <span class="ai-prov-icon">🔀</span><span class="ai-prov-name">OpenRouter</span><span class="ai-prov-tag">Free tier</span>
+          <a href="#" class="adv-provider-link" data-url="https://openrouter.ai/keys" data-endpoint="https://openrouter.ai/api/v1/chat/completions" data-model="meta-llama/llama-3.3-70b-instruct:free">
+            <span class="adv-prov-icon">🔀</span><span class="adv-prov-name">OpenRouter</span><span class="adv-prov-tag">Free tier</span>
           </a>
-          <a href="#" class="ai-provider-link" data-url="https://aistudio.google.com/apikey" data-endpoint="https://generativelanguage.googleapis.com/v1beta/openai/chat/completions" data-model="gemini-2.0-flash">
-            <span class="ai-prov-icon">💎</span><span class="ai-prov-name">Google Gemini</span><span class="ai-prov-tag">Free</span>
+          <a href="#" class="adv-provider-link" data-url="https://aistudio.google.com/apikey" data-endpoint="https://generativelanguage.googleapis.com/v1beta/openai/chat/completions" data-model="gemini-2.0-flash">
+            <span class="adv-prov-icon">💎</span><span class="adv-prov-name">Google Gemini</span><span class="adv-prov-tag">Free</span>
           </a>
-          <a href="#" class="ai-provider-link" data-url="https://github.com/ollama/ollama" data-endpoint="http://localhost:11434/v1/chat/completions" data-model="llama3.3">
-            <span class="ai-prov-icon">🦙</span><span class="ai-prov-name">Ollama</span><span class="ai-prov-tag">Local</span>
+          <a href="#" class="adv-provider-link" data-url="https://github.com/ollama/ollama" data-endpoint="http://localhost:11434/v1/chat/completions" data-model="llama3.3">
+            <span class="adv-prov-icon">🦙</span><span class="adv-prov-name">Ollama</span><span class="adv-prov-tag">Local</span>
           </a>
-          <a href="#" class="ai-provider-link" data-url="https://console.mistral.ai/api-keys" data-endpoint="https://api.mistral.ai/v1/chat/completions" data-model="mistral-small-latest">
-            <span class="ai-prov-icon">🌀</span><span class="ai-prov-name">Mistral</span><span class="ai-prov-tag">Free tier</span>
+          <a href="#" class="adv-provider-link" data-url="https://console.mistral.ai/api-keys" data-endpoint="https://api.mistral.ai/v1/chat/completions" data-model="mistral-small-latest">
+            <span class="adv-prov-icon">🌀</span><span class="adv-prov-name">Mistral</span><span class="adv-prov-tag">Free tier</span>
           </a>
         </div>
-        <div style="font-size:8px;opacity:0.3;margin-top:4px;">Click a provider to open its key page and auto-fill endpoint + model. Works with any OpenAI-compatible API.</div>
+        <div style="font-size:8px;opacity:0.3;margin-top:4px;">Click a provider to open its key page and auto-fill endpoint + model. Works with any compatible chat API.</div>
       </div>
-      <div class="ai-modal-actions">
-        <button class="ai-cancel" id="ai-cancel">Cancel</button>
-        <button class="ai-test" id="ai-test-btn">⚡ Test</button>
-        <button class="ai-save" id="ai-save-cfg">Save</button>
+      <div class="adv-modal-actions">
+        <button class="adv-cancel" id="adv-cancel">Cancel</button>
+        <button class="adv-test" id="adv-test-btn">⚡ Test</button>
+        <button class="adv-save" id="adv-save-cfg">Save</button>
       </div>
     </div>
   `;
 
   document.body.appendChild(overlay);
 
-  document.getElementById("ai-cancel")!.addEventListener("click", () => overlay.remove());
+  document.getElementById("adv-cancel")!.addEventListener("click", () => overlay.remove());
   overlay.addEventListener("click", (e) => {
     if (e.target === overlay) overlay.remove();
   });
 
   // Provider quick-links: click opens key page + auto-fills endpoint and model
-  overlay.querySelectorAll(".ai-provider-link").forEach((link) => {
+  overlay.querySelectorAll(".adv-provider-link").forEach((link) => {
     link.addEventListener("click", (e) => {
       e.preventDefault();
       const el = link as HTMLElement;
@@ -3619,34 +4474,34 @@ function showAiModal() {
       const endpoint = el.dataset.endpoint || "";
       const model = el.dataset.model || "";
       if (url) shellOpen(url);
-      if (endpoint) (document.getElementById("ai-endpoint") as HTMLInputElement).value = endpoint;
-      if (model) (document.getElementById("ai-model") as HTMLInputElement).value = model;
+      if (endpoint) (document.getElementById("adv-endpoint") as HTMLInputElement).value = endpoint;
+      if (model) (document.getElementById("adv-model") as HTMLInputElement).value = model;
     });
   });
 
-  document.getElementById("ai-test-btn")!.addEventListener("click", async () => {
-    const key = (document.getElementById("ai-key") as HTMLInputElement).value.trim();
-    const endpoint = (document.getElementById("ai-endpoint") as HTMLInputElement).value.trim() || AI_DEFAULTS.endpoint;
-    const model = (document.getElementById("ai-model") as HTMLInputElement).value.trim() || AI_DEFAULTS.model;
-    const resultEl = document.getElementById("ai-test-result")!;
+  document.getElementById("adv-test-btn")!.addEventListener("click", async () => {
+    const key = (document.getElementById("adv-key") as HTMLInputElement).value.trim();
+    const endpoint = (document.getElementById("adv-endpoint") as HTMLInputElement).value.trim() || ADV_DEFAULTS.endpoint;
+    const model = (document.getElementById("adv-model") as HTMLInputElement).value.trim() || ADV_DEFAULTS.model;
+    const resultEl = document.getElementById("adv-test-result")!;
     if (!key || key.length < 5) {
       resultEl.innerHTML = `<span style="color:#ef4444">⚠ Enter an API key first</span>`;
       return;
     }
     resultEl.innerHTML = `<span style="color:var(--text-secondary)">Testing connection...</span>`;
     try {
-      const result = await invoke<string>("ai_chat", {
+      await invoke<string>("advisor_chat", {
         apiKey: key,
         endpoint,
         model,
         messages: [{ role: "user", content: "Reply with exactly: OK" }],
       });
       resultEl.innerHTML = `<span style="color:#22c55e">✓ Connected — model responded</span>`;
-    } catch (e: any) {
+    } catch (e: unknown) {
       const msg = String(e);
       if (msg.includes("401") || msg.toLowerCase().includes("invalid") || msg.toLowerCase().includes("expired")) {
-        resultEl.innerHTML = `<span style="color:#ef4444">✗ Invalid or expired API key — <a href="#" id="ai-regen-link" style="color:var(--primary);text-decoration:underline;">regenerate at Groq</a></span>`;
-        document.getElementById("ai-regen-link")?.addEventListener("click", (ev) => {
+        resultEl.innerHTML = `<span style="color:#ef4444">✗ Invalid or expired API key — <a href="#" id="adv-regen-link" style="color:var(--primary);text-decoration:underline;">regenerate at Groq</a></span>`;
+        document.getElementById("adv-regen-link")?.addEventListener("click", (ev) => {
           ev.preventDefault();
           shellOpen("https://console.groq.com/keys");
         });
@@ -3656,22 +4511,22 @@ function showAiModal() {
     }
   });
 
-  document.getElementById("ai-save-cfg")!.addEventListener("click", () => {
-    const key = (document.getElementById("ai-key") as HTMLInputElement).value.trim();
-    const endpoint = (document.getElementById("ai-endpoint") as HTMLInputElement).value.trim();
-    const model = (document.getElementById("ai-model") as HTMLInputElement).value.trim();
-    setAiConfig({ key, endpoint: endpoint || AI_DEFAULTS.endpoint, model: model || AI_DEFAULTS.model });
+  document.getElementById("adv-save-cfg")!.addEventListener("click", () => {
+    const key = (document.getElementById("adv-key") as HTMLInputElement).value.trim();
+    const endpoint = (document.getElementById("adv-endpoint") as HTMLInputElement).value.trim();
+    const model = (document.getElementById("adv-model") as HTMLInputElement).value.trim();
+    setAdvConfig({ key, endpoint: endpoint || ADV_DEFAULTS.endpoint, model: model || ADV_DEFAULTS.model });
     overlay.remove();
     // update status dot
-    document.querySelectorAll(".ai-status").forEach((d) => {
-      d.className = "ai-status " + (key.length > 5 ? "connected" : "disconnected");
+    document.querySelectorAll(".adv-status").forEach((d) => {
+      d.className = "adv-status " + (key.length > 5 ? "connected" : "disconnected");
     });
-    toast(key ? "AI configured" : "AI key removed");
+    toast(key ? "Advisor configured" : "Key removed");
   });
 }
 
-// AI system prompts per context
-const AI_PROMPTS = {
+// advisor system prompts per context
+const ADV_PROMPTS = {
   demo: `You are a CS2 coaching analyst. The user will provide demo metadata, notes, and a list of 18 review tips with IDs.
 For EACH tip, output a line in this exact format:
 [TIP_ID] ■■■□□ (X/5) — brief assessment
@@ -3726,23 +4581,23 @@ function setDiscordWebhook(url: string) {
 }
 
 function showDiscordModal(onSaved?: () => void) {
-  const existing = document.querySelector(".ai-overlay");
+  const existing = document.querySelector(".adv-overlay");
   if (existing) existing.remove();
 
   const current = getDiscordWebhook();
   const overlay = document.createElement("div");
-  overlay.className = "ai-overlay";
+  overlay.className = "adv-overlay";
   overlay.innerHTML = `
-    <div class="ai-modal">
+    <div class="adv-modal">
       <h3>Discord Webhook</h3>
       <label>Webhook URL</label>
       <input type="text" id="discord-wh-url" value="${current}" placeholder="https://discord.com/api/webhooks/..." />
       <div style="font-size:9px;opacity:0.4;margin-top:6px;">
         Server Settings → Integrations → Webhooks → New Webhook → Copy URL
       </div>
-      <div class="ai-modal-actions">
-        <button class="ai-cancel" id="discord-cancel">Cancel</button>
-        <button class="ai-save" id="discord-save">Save</button>
+      <div class="adv-modal-actions">
+        <button class="adv-cancel" id="discord-cancel">Cancel</button>
+        <button class="adv-save" id="discord-save">Save</button>
       </div>
     </div>
   `;
@@ -3872,7 +4727,9 @@ async function scanDemoFolder(folder: string) {
     currentDemos = await invoke<typeof currentDemos>("scan_demos", { folder });
     renderDemoList();
   } catch (e) {
-    listEl.innerHTML = `<div class="demo-empty">Error: ${e}</div>`;
+    listEl.innerHTML = `<div class="demo-empty"></div>`;
+    const errDiv = listEl.querySelector(".demo-empty");
+    if (errDiv) errDiv.textContent = `Error: ${str(e)}`;
   }
 }
 
@@ -3914,26 +4771,26 @@ async function selectDemo(idx: number) {
     const date = d.modified > 0 ? new Date(d.modified * 1000).toLocaleString() : "N/A";
 
     let html = '<div class="demo-info-grid">';
-    html += infoRowHtml("Format", String(hdr.format || "N/A"));
-    html += infoRowHtml("Map", String(hdr.map || d.map_hint || "N/A"));
-    if (hdr.server) html += infoRowHtml("Server", String(hdr.server));
-    if (hdr.client) html += infoRowHtml("Player", String(hdr.client));
+    html += infoRowHtml("Format", str(hdr.format, "N/A"));
+    html += infoRowHtml("Map", str(hdr.map, d.map_hint || "N/A"));
+    if (hdr.server) html += infoRowHtml("Server", str(hdr.server));
+    if (hdr.client) html += infoRowHtml("Player", str(hdr.client));
     html += infoRowHtml("Duration", durMin);
-    if (hdr.ticks) html += infoRowHtml("Ticks", String(hdr.ticks));
-    if (hdr.tickrate) html += infoRowHtml("Tickrate", String(hdr.tickrate));
-    if (hdr.est_rounds) html += infoRowHtml("Est. Rounds", String(hdr.est_rounds));
-    html += infoRowHtml("File Size", `${hdr.file_size_mb || d.size_mb} MB`);
+    if (hdr.ticks) html += infoRowHtml("Ticks", str(hdr.ticks));
+    if (hdr.tickrate) html += infoRowHtml("Tickrate", str(hdr.tickrate));
+    if (hdr.est_rounds) html += infoRowHtml("Est. Rounds", str(hdr.est_rounds));
+    html += infoRowHtml("File Size", `${str(hdr.file_size_mb, "") || str(d.size_mb, "")} MB`);
     html += infoRowHtml("Date", date);
     html += "</div>";
 
     // actions
     html += '<div class="demo-actions" style="display:flex;gap:6px;flex-wrap:wrap;">';
     html += `<button class="btn-export" id="demo-play-btn">Play in CS2</button>`;
-    html += `<button class="btn-ai" id="demo-ai-btn">🤖 Analyze with AI</button>`;
+    html += `<button class="btn-adv" id="demo-adv-btn">🤖 Analyze</button>`;
     html += "</div>";
 
-    // AI response area
-    html += '<div class="ai-response" id="demo-ai-response"></div>';
+    // response area
+    html += '<div class="adv-response" id="demo-adv-response"></div>';
 
     // share bar
     html += '<div id="demo-share-mount"></div>';
@@ -3957,16 +4814,16 @@ async function selectDemo(idx: number) {
     // mount share bar
     const demoShareMount = document.getElementById("demo-share-mount");
     if (demoShareMount) {
-      const mapName = String(hdr.map || d.map_hint || "unknown");
+      const mapName = str(hdr.map, d.map_hint || "unknown");
       const shareBar = buildShareBar(() => ({
         title: `CS2 Demo — ${mapName}`,
-        text: `${d.name}\nMap: ${mapName} | Duration: ${durMin} | Size: ${hdr.file_size_mb || d.size_mb} MB`,
+        text: `${d.name}\nMap: ${mapName} | Duration: ${durMin} | Size: ${str(hdr.file_size_mb, "") || str(d.size_mb, "")} MB`,
         fields: [
           { name: "Map", value: mapName, inline: true },
           { name: "Duration", value: durMin, inline: true },
-          { name: "Format", value: String(hdr.format || "N/A"), inline: true },
-          ...(hdr.tickrate ? [{ name: "Tickrate", value: String(hdr.tickrate), inline: true }] : []),
-          ...(hdr.server ? [{ name: "Server", value: String(hdr.server), inline: true }] : []),
+          { name: "Format", value: str(hdr.format, "N/A"), inline: true },
+          ...(hdr.tickrate ? [{ name: "Tickrate", value: str(hdr.tickrate), inline: true }] : []),
+          ...(hdr.server ? [{ name: "Server", value: str(hdr.server), inline: true }] : []),
           ...(meta.rating ? [{ name: "Rating", value: "★".repeat(meta.rating) + "☆".repeat(5 - meta.rating), inline: true }] : []),
         ],
       }));
@@ -4005,31 +4862,31 @@ async function selectDemo(idx: number) {
       });
     }
 
-    // event: AI analysis
-    document.getElementById("demo-ai-btn")?.addEventListener("click", async () => {
-      const btn = document.getElementById("demo-ai-btn") as HTMLButtonElement;
-      const respEl = document.getElementById("demo-ai-response");
+    // event: analysis
+    document.getElementById("demo-adv-btn")?.addEventListener("click", async () => {
+      const btn = document.getElementById("demo-adv-btn") as HTMLButtonElement;
+      const respEl = document.getElementById("demo-adv-response");
       if (!respEl || !btn) return;
-      if (!hasAiKey()) {
-        showAiModal();
+      if (!hasAdvKey()) {
+        showAdvModal();
         return;
       }
       btn.disabled = true;
-      respEl.innerHTML = '<div class="ai-loading">Analyzing demo...</div>';
+      respEl.innerHTML = '<div class="adv-loading">Analyzing demo...</div>';
       const notesNow = (document.getElementById("demo-notes-ta") as HTMLTextAreaElement)?.value || "";
       const ratingNow = getDemoMeta()[d.name]?.rating || 0;
       const tipsList = DEMO_TIPS.map((t, i) => `TIP_${i + 1}: ${t.title} — ${t.desc}`).join("\n");
       const context = [
         `Demo: ${d.name}`,
-        `Map: ${hdr.map || d.map_hint || "unknown"}`,
-        `Format: ${hdr.format || "unknown"}`,
-        hdr.server ? `Server: ${hdr.server}` : "",
-        hdr.client ? `Player: ${hdr.client}` : "",
+        `Map: ${str(hdr.map, "") || str(d.map_hint, "unknown")}`,
+        `Format: ${str(hdr.format, "unknown")}`,
+        hdr.server ? `Server: ${str(hdr.server)}` : "",
+        hdr.client ? `Player: ${str(hdr.client)}` : "",
         `Duration: ${durMin}`,
-        hdr.ticks ? `Ticks: ${hdr.ticks}` : "",
-        hdr.tickrate ? `Tickrate: ${hdr.tickrate}` : "",
-        hdr.est_rounds ? `Est. Rounds: ${hdr.est_rounds}` : "",
-        `File Size: ${hdr.file_size_mb || d.size_mb} MB`,
+        hdr.ticks ? `Ticks: ${str(hdr.ticks)}` : "",
+        hdr.tickrate ? `Tickrate: ${str(hdr.tickrate)}` : "",
+        hdr.est_rounds ? `Est. Rounds: ${str(hdr.est_rounds)}` : "",
+        `File Size: ${str(hdr.file_size_mb, "") || str(d.size_mb, "")} MB`,
         ratingNow ? `Player self-rating: ${ratingNow}/5` : "",
         notesNow ? `Player notes: ${notesNow}` : "",
         "",
@@ -4039,15 +4896,19 @@ async function selectDemo(idx: number) {
         .filter(Boolean)
         .join("\n");
       try {
-        const result = await aiChat(AI_PROMPTS.demo, context);
+        const result = await advChat(ADV_PROMPTS.demo, context);
         respEl.innerHTML = mdToHtml(result);
       } catch (e) {
-        respEl.innerHTML = `<span style="color:#ef4444">Error: ${e}</span>`;
+        respEl.innerHTML = `<span style="color:#ef4444"></span>`;
+        const errSpan = respEl.querySelector("span");
+        if (errSpan) errSpan.textContent = `Error: ${str(e)}`;
       }
       btn.disabled = false;
     });
   } catch (e) {
-    detailEl.innerHTML = `<div class="demo-empty">Parse error: ${e}</div>`;
+    detailEl.innerHTML = `<div class="demo-empty"></div>`;
+    const errDiv = detailEl.querySelector(".demo-empty");
+    if (errDiv) errDiv.textContent = `Parse error: ${str(e)}`;
   }
 }
 
@@ -4059,7 +4920,7 @@ function infoRowHtml(label: string, value: string): string {
    Build the UI
    ================================================================ */
 
-function buildSubTabs(labels: string[]): { bar: HTMLElement; panels: HTMLElement[]; switchSub: (i: number) => void } {
+function buildSubTabs(labels: string[], beforeSwitch?: () => boolean): { bar: HTMLElement; panels: HTMLElement[]; switchSub: (i: number) => void } {
   const bar = document.createElement("div");
   bar.className = "sub-tab-bar";
   const btns: HTMLButtonElement[] = [];
@@ -4076,10 +4937,68 @@ function buildSubTabs(labels: string[]): { bar: HTMLElement; panels: HTMLElement
     panels.push(panel);
   });
   function switchSub(idx: number) {
-    btns.forEach((b, i) => b.classList.toggle("active", i === idx));
-    panels.forEach((p, i) => p.classList.toggle("active", i === idx));
+    if (beforeSwitch && !beforeSwitch()) return;
+    btns.forEach((b, i) => { b.classList.toggle("active", i === idx); });
+    panels.forEach((p, i) => { p.classList.toggle("active", i === idx); });
   }
   return { bar, panels, switchSub };
+}
+
+/* ================================================================
+   Custom Modal Dialogs (replaces native prompt/confirm)
+   ================================================================ */
+function showInputModal(title: string, placeholder: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    overlay.innerHTML = `
+      <div class="modal-dialog">
+        <div class="modal-title">${title}</div>
+        <input type="text" class="modal-input" placeholder="${placeholder}" maxlength="32" autofocus />
+        <div class="modal-actions">
+          <button class="modal-btn modal-btn-ok">CREATE</button>
+          <button class="modal-btn modal-btn-cancel">CANCEL</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    const input = overlay.querySelector<HTMLInputElement>(".modal-input")!;
+    const btnOk = overlay.querySelector<HTMLButtonElement>(".modal-btn-ok")!;
+    const btnCancel = overlay.querySelector<HTMLButtonElement>(".modal-btn-cancel")!;
+    setTimeout(() => input.focus(), 50);
+    const close = (val: string | null) => { overlay.remove(); resolve(val); };
+    btnOk.addEventListener("click", () => close(input.value.trim() || null));
+    btnCancel.addEventListener("click", () => close(null));
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") close(input.value.trim() || null);
+      if (e.key === "Escape") close(null);
+    });
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) close(null); });
+  });
+}
+
+function showConfirmModal(title: string, message: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    overlay.innerHTML = `
+      <div class="modal-dialog">
+        <div class="modal-title">${title}</div>
+        <p class="modal-message">${message}</p>
+        <div class="modal-actions">
+          <button class="modal-btn modal-btn-danger">DELETE</button>
+          <button class="modal-btn modal-btn-cancel">CANCEL</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    const btnOk = overlay.querySelector<HTMLButtonElement>(".modal-btn-danger")!;
+    const btnCancel = overlay.querySelector<HTMLButtonElement>(".modal-btn-cancel")!;
+    const close = (val: boolean) => { overlay.remove(); resolve(val); };
+    btnOk.addEventListener("click", () => close(true));
+    btnCancel.addEventListener("click", () => close(false));
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) close(false); });
+  });
 }
 
 function build() {
@@ -4091,20 +5010,15 @@ function build() {
   const sidebar = document.createElement("nav");
   sidebar.className = "app-sidebar";
 
-  const btnSys = document.createElement("button");
-  btnSys.className = "sidebar-btn active";
-  btnSys.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg><span>SYS</span>`;
-  attachTooltip(btnSys, tipHtml("System Optimizer", "One-click Windows, BIOS, NVIDIA, Network & Services optimizations for CS2. Applies registry tweaks, power plans, and system tuning through auto-generated PowerShell scripts.", "Up to +40% cumulative FPS gain", "Registry / PowerShell / bcdedit"));
-
-  const btnCfgTab = document.createElement("button");
-  btnCfgTab.className = "sidebar-btn";
-  btnCfgTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 3h16a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M4 15h16a2 2 0 0 1 2 2v2a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-2a2 2 0 0 1 2-2z"/><path d="M6 7h.01"/><path d="M6 17h.01"/></svg><span>CFG</span>`;
-  attachTooltip(btnCfgTab, tipHtml("CFG Manager", "Full CS2 console command editor with 148+ commands across 12 categories — Performance, Crosshair, Viewmodel, HUD, Radar, Audio, Mouse, Network, Voice, Buy, Spectator & QoL. Export autoexec.cfg, import pro player configs, and preview crosshair live."));
+  const btnConfig = document.createElement("button");
+  btnConfig.className = "sidebar-btn active";
+  btnConfig.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg><span>CONFIG</span>`;
+  attachTooltip(btnConfig, tipHtml("Config", "System Optimizer (SYS) + CFG Manager — Windows, BIOS, NVIDIA, Network, Services optimizations and full CS2 console command editor with 148+ commands, autoexec export, pro player configs and more.", "Up to +40% cumulative FPS gain", "Registry / PowerShell / autoexec.cfg"));
 
   const btnHwTab = document.createElement("button");
   btnHwTab.className = "sidebar-btn";
   btnHwTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v2"/><path d="M15 2v2"/><path d="M9 20v2"/><path d="M15 20v2"/><path d="M20 9h2"/><path d="M20 14h2"/><path d="M2 9h2"/><path d="M2 14h2"/></svg><span>HW</span>`;
-  attachTooltip(btnHwTab, tipHtml("Hardware Info", "Scans your full system hardware — CPU, GPU, RAM, motherboard, storage and monitors via WMI queries. Detects XMP status, GPU scheduling, power plan, HPET timer and more. AI analysis available to identify bottlenecks."));
+  attachTooltip(btnHwTab, tipHtml("Hardware Info", "Scans your full system hardware — CPU, GPU, RAM, motherboard, storage and monitors via WMI queries. Detects XMP status, GPU scheduling, power plan, HPET timer and more. Smart analysis available to identify bottlenecks."));
 
   const btnDrvTab = document.createElement("button");
   btnDrvTab.className = "sidebar-btn";
@@ -4119,12 +5033,12 @@ function build() {
   const btnNetTab = document.createElement("button");
   btnNetTab.className = "sidebar-btn";
   btnNetTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><circle cx="12" cy="20" r="1"/></svg><span>NET</span>`;
-  attachTooltip(btnNetTab, tipHtml("Network Diagnostics", "Pings official Valve CS2 server regions worldwide and measures latency, jitter and packet loss. Helps identify the best server region for your connection. AI analysis suggests network config improvements."));
+  attachTooltip(btnNetTab, tipHtml("Network Diagnostics", "Pings official Valve CS2 server regions worldwide and measures latency, jitter and packet loss. Helps identify the best server region for your connection. Smart analysis suggests network config improvements."));
 
   const btnDemoTab = document.createElement("button");
   btnDemoTab.className = "sidebar-btn";
   btnDemoTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8"/></svg><span>DEMO</span>`;
-  attachTooltip(btnDemoTab, tipHtml("Demo Review", "Parses CS2 .dem files and extracts match metadata (map, duration, tickrate, rounds). Rate your performance and add notes. AI coaching analysis scores 18 gameplay review tips with personalized feedback."));
+  attachTooltip(btnDemoTab, tipHtml("Demo Review", "Parses CS2 .dem files and extracts match metadata (map, duration, tickrate, rounds). Rate your performance and add notes. Coaching analysis scores 18 gameplay review tips with personalized feedback."));
 
   const btnFdbkTab = document.createElement("button");
   btnFdbkTab.className = "sidebar-btn";
@@ -4168,8 +5082,7 @@ function build() {
   watermark.className = "sidebar-watermark";
   watermark.innerHTML = `<svg class="sidebar-watermark-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg><span class="sidebar-watermark-text">aim.camp</span>`;
 
-  sidebar.appendChild(btnSys);
-  sidebar.appendChild(btnCfgTab);
+  sidebar.appendChild(btnConfig);
   sidebar.appendChild(btnHwTab);
   sidebar.appendChild(btnDrvTab);
   sidebar.appendChild(btnProcTab);
@@ -4185,11 +5098,10 @@ function build() {
   sidebar.appendChild(btnHubTab);
   sidebar.appendChild(watermark);
 
-  type TabId = "sys" | "cfg" | "hw" | "drv" | "proc" | "net" | "demo" | "fdbk" | "bench" | "rank" | "servers" | "market" | "hub";
-  const allBtns = [btnSys, btnCfgTab, btnHwTab, btnDrvTab, btnProcTab, btnNetTab, btnDemoTab, btnFdbkTab, btnBenchTab, btnRankTab, btnServersTab, btnMarketTab, btnHubTab];
+  type TabId = "config" | "hw" | "drv" | "proc" | "net" | "demo" | "fdbk" | "bench" | "rank" | "servers" | "market" | "hub";
+  const allBtns = [btnConfig, btnHwTab, btnDrvTab, btnProcTab, btnNetTab, btnDemoTab, btnFdbkTab, btnBenchTab, btnRankTab, btnServersTab, btnMarketTab, btnHubTab];
   const tabIds: { btn: HTMLButtonElement; tabId: string }[] = [
-    { btn: btnSys, tabId: "tab-optimizer" },
-    { btn: btnCfgTab, tabId: "tab-cfg" },
+    { btn: btnConfig, tabId: "tab-config" },
     { btn: btnHwTab, tabId: "tab-hw" },
     { btn: btnDrvTab, tabId: "tab-drv" },
     { btn: btnProcTab, tabId: "tab-proc" },
@@ -4203,9 +5115,65 @@ function build() {
     { btn: btnHubTab, tabId: "tab-hub" },
   ];
 
+  /** Pulse the save button to alert the user they must save before leaving */
+  let _saveAlertTimeout: ReturnType<typeof setTimeout> | null = null;
+  function pulseLayoutSaveBtn() {
+    const saveBtn = document.querySelector<HTMLElement>(".btn-schema-save");
+    if (!saveBtn) return;
+
+    // 1) Pulse the save button itself
+    saveBtn.classList.remove("pulse-save");
+    const _r1 = saveBtn.offsetWidth; // reflow
+    saveBtn.classList.add("pulse-save");
+    saveBtn.scrollIntoView({ behavior: "smooth", block: "nearest" });
+
+    // 2) Don't stack multiple alerts
+    if (_saveAlertTimeout) return;
+
+    // 3) Dark overlay behind save area
+    const overlay = document.createElement("div");
+    overlay.className = "save-alert-overlay";
+    document.body.appendChild(overlay);
+    const _r2 = overlay.offsetWidth; // reflow
+    overlay.classList.add("show");
+
+    // 4) Floating toast warning
+    const toast = document.createElement("div");
+    toast.className = "save-alert-toast";
+    toast.innerHTML = `<span class="save-alert-icon">⚠️</span> <span>Save the layout before leaving!</span> <span class="save-alert-arrow">▼</span>`;
+    document.body.appendChild(toast);
+
+    // Position toast above the save button
+    const rect = saveBtn.getBoundingClientRect();
+    toast.style.left = rect.left + rect.width / 2 + "px";
+    toast.style.top = Math.max(8, rect.top - 54) + "px";
+    const _r3 = toast.offsetWidth; // reflow
+    toast.classList.add("show");
+
+    // Click overlay = dismiss
+    overlay.addEventListener("click", dismissSaveAlert);
+
+    // Auto-dismiss after 3s
+    _saveAlertTimeout = setTimeout(dismissSaveAlert, 3000);
+
+    function dismissSaveAlert() {
+      if (!_saveAlertTimeout) return;
+      clearTimeout(_saveAlertTimeout);
+      _saveAlertTimeout = null;
+      overlay.classList.remove("show");
+      toast.classList.remove("show");
+      setTimeout(() => { overlay.remove(); toast.remove(); }, 300);
+    }
+  }
+
   function switchTab(t: TabId) {
-    const idx = ["sys", "cfg", "hw", "drv", "proc", "net", "demo", "fdbk", "bench", "rank", "servers", "market", "hub"].indexOf(t);
-    allBtns.forEach((b, i) => b.classList.toggle("active", i === idx));
+    // Guard: block navigation away from CFG while in layout edit mode
+    if (_layoutEditMode && t !== "config") {
+      pulseLayoutSaveBtn();
+      return;
+    }
+    const idx = ["config", "hw", "drv", "proc", "net", "demo", "fdbk", "bench", "rank", "servers", "market", "hub"].indexOf(t);
+    allBtns.forEach((b, i) => { b.classList.toggle("active", i === idx); });
     tabIds.forEach((ti, i) => {
       document.getElementById(ti.tabId)?.classList.toggle("active", i === idx);
     });
@@ -4215,8 +5183,7 @@ function build() {
     if (t === "proc" && !document.querySelector(".proc-item")) refreshProcesses();
     if (t === "fdbk" && !document.querySelector(".fdbk-card") && !document.querySelector(".fdbk-empty")) refreshFeedbackHistory();
   }
-  btnSys.addEventListener("click", () => switchTab("sys"));
-  btnCfgTab.addEventListener("click", () => switchTab("cfg"));
+  btnConfig.addEventListener("click", () => switchTab("config"));
   btnHwTab.addEventListener("click", () => switchTab("hw"));
   btnDrvTab.addEventListener("click", () => switchTab("drv"));
   btnProcTab.addEventListener("click", () => switchTab("proc"));
@@ -4288,106 +5255,57 @@ function build() {
   themeWrap.appendChild(themeBtn);
   themeWrap.appendChild(dropdown);
 
-  /* ── Profile bar ─────────────────────────────────────────────── */
-  const profileBar = document.createElement("div");
-  profileBar.className = "profile-bar";
-
+  /* ── Schema profile selector (used inside Config tab) ──────── */
   const profileSel = document.createElement("select");
   profileSel.id = "profile-select";
-  profileSel.title = "Select profile";
-  const optEmpty = document.createElement("option");
-  optEmpty.value = "";
-  optEmpty.textContent = "-- Profiles --";
-  profileSel.appendChild(optEmpty);
-  for (const n of getProfileNames()) {
-    const o = document.createElement("option");
-    o.value = n;
-    o.textContent = n;
-    profileSel.appendChild(o);
-  }
-
-  const profileInput = document.createElement("input");
-  profileInput.id = "profile-name";
-  profileInput.type = "text";
-  profileInput.placeholder = "Name";
-  profileInput.maxLength = 20;
-
-  const btnProfSave = document.createElement("button");
-  btnProfSave.textContent = "Save";
-  btnProfSave.title = "Save current SYS+CFG state as profile";
-
-  const btnProfLoad = document.createElement("button");
-  btnProfLoad.textContent = "Load";
-  btnProfLoad.title = "Load selected profile";
-
-  const btnProfDel = document.createElement("button");
-  btnProfDel.textContent = "Del";
-  btnProfDel.title = "Delete selected profile";
+  profileSel.title = "Select schema";
 
   function refreshProfileDropdown() {
     profileSel.innerHTML = "";
-    const optE = document.createElement("option");
-    optE.value = "";
-    optE.textContent = "-- Profiles --";
-    profileSel.appendChild(optE);
-    for (const n of getProfileNames()) {
+    const schemas = getSchemas();
+    const activeId = getActiveSchemaId();
+    if (schemas.length === 0) {
+      const optE = document.createElement("option");
+      optE.value = "";
+      optE.textContent = "No schemas";
+      profileSel.appendChild(optE);
+      return;
+    }
+    for (const s of schemas) {
       const o = document.createElement("option");
-      o.value = n;
-      o.textContent = n;
+      o.value = s.id;
+      o.textContent = s.name;
       profileSel.appendChild(o);
     }
+    // Pre-select the active schema
+    if (activeId) profileSel.value = activeId;
   }
+  refreshProfileDropdown();
 
-  btnProfSave.addEventListener("click", () => {
-    const name = profileInput.value.trim() || profileSel.value;
-    if (!name) {
-      toast("Enter a name", true);
-      return;
-    }
-    saveProfile(name);
-    refreshProfileDropdown();
-    profileSel.value = name;
-    toast(`Profile saved: ${name}`);
+  // Auto-load schema on selection change
+  profileSel.addEventListener("change", () => {
+    const selectedId = profileSel.value;
+    if (!selectedId) return;
+    const schema = getSchemas().find((s) => s.id === selectedId);
+    if (!schema) return;
+    setActiveSchemaId(schema.id);
+    rebuildCfgLayout();
+    toast(`Schema "${schema.name}" loaded ✔`);
   });
 
-  btnProfLoad.addEventListener("click", () => {
-    const name = profileSel.value;
-    if (!name) {
-      toast("Select a profile", true);
-      return;
-    }
-    loadProfile(name);
-  });
-
-  btnProfDel.addEventListener("click", () => {
-    const name = profileSel.value;
-    if (!name) return;
-    deleteProfile(name);
-    refreshProfileDropdown();
-    toast(`Profile deleted: ${name}`);
-  });
-
-  profileBar.appendChild(profileSel);
-  profileBar.appendChild(profileInput);
-  profileBar.appendChild(btnProfSave);
-  profileBar.appendChild(btnProfLoad);
-  profileBar.appendChild(btnProfDel);
-
-  headerRight.appendChild(profileBar);
-
-  /* ── AI config button ──────────────────────────────────────── */
-  const aiBtn = document.createElement("button");
-  aiBtn.className = "ai-btn";
-  aiBtn.title = "AI settings (API key, endpoint, model)";
-  const aiDot = document.createElement("span");
-  aiDot.className = "ai-status " + (hasAiKey() ? "connected" : "disconnected");
-  aiBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2a4 4 0 0 0-4 4v2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10a2 2 0 0 0-2-2h-2V6a4 4 0 0 0-4-4z"/><circle cx="9" cy="15" r="1.5" fill="currentColor" stroke="none"/><circle cx="15" cy="15" r="1.5" fill="currentColor" stroke="none"/><path d="M9 15h6"/></svg>`;
-  aiBtn.prepend(aiDot);
-  const aiLabel = document.createElement("span");
-  aiLabel.textContent = "AI";
-  aiBtn.appendChild(aiLabel);
-  aiBtn.addEventListener("click", showAiModal);
-  headerRight.appendChild(aiBtn);
+  /* ── Advisor config button ──────────────────────────────────────── */
+  const advBtn = document.createElement("button");
+  advBtn.className = "adv-btn";
+  advBtn.title = "Advisor settings (credentials)";
+  const advDot = document.createElement("span");
+  advDot.className = "adv-status " + (hasAdvKey() ? "connected" : "disconnected");
+  advBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2a4 4 0 0 0-4 4v2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10a2 2 0 0 0-2-2h-2V6a4 4 0 0 0-4-4z"/><circle cx="9" cy="15" r="1.5" fill="currentColor" stroke="none"/><circle cx="15" cy="15" r="1.5" fill="currentColor" stroke="none"/><path d="M9 15h6"/></svg>`;
+  advBtn.prepend(advDot);
+  const advLabel = document.createElement("span");
+  advLabel.textContent = "ADV";
+  advBtn.appendChild(advLabel);
+  advBtn.addEventListener("click", showAdvModal);
+  headerRight.appendChild(advBtn);
 
   const btnMin = document.createElement("button");
   btnMin.className = "btn-minimize";
@@ -4414,7 +5332,7 @@ function build() {
 
   /* ── 1. BIOS (informational — must be set manually in BIOS/UEFI) ── */
   const c1 = card("BIOS (Manual)", "ℹ These are recommendations only — BIOS settings must be configured manually in your motherboard BIOS/UEFI setup. The app cannot change BIOS settings.");
-  c1.setAttribute("data-section", "bios");
+  c1.dataset.section = "bios";
   c1.appendChild(infoRow("Disable SVM / Virtualization + Hyper-V", TIP.b_svm));
   c1.appendChild(infoRow("Disable C-States + force CPU 100%", TIP.b_cst));
   c1.appendChild(infoRow("Disable Cool'n'Quiet / SpeedStep", TIP.b_cool));
@@ -4423,8 +5341,8 @@ function build() {
   c1.appendChild(infoRow("Enable Above 4G Decoding", TIP.b_4g));
 
   /* ── 2. Windows ── toggles are ONLY applied when you click the button below ── */
-  const c2 = card("Windows", '⚠ Alterações só são aplicadas ao clicar em "Aplicar Windows".');
-  c2.setAttribute("data-section", "windows");
+  const c2 = card("Windows", '⚠ Changes are only applied when you click "Apply Windows".');
+  c2.dataset.section = "windows";
   c2.appendChild(toggle("w_power", "Ultimate Performance Plan", true, TIP.w_power));
   c2.appendChild(toggle("w_dvr", "Disable Game DVR", true, TIP.w_dvr));
   c2.appendChild(toggle("w_bar", "Disable Game Bar", true, TIP.w_bar));
@@ -4453,11 +5371,12 @@ function build() {
   c2.appendChild(toggle("w_8dot3", "Disable 8.3 Name Creation", true, TIP.w_8dot3));
   c2.appendChild(toggle("w_mmcss", "MMCSS Gaming Priority", true, TIP.w_mmcss));
   c2.appendChild(toggle("w_largecache", "Disable Large System Cache", true, TIP.w_largecache));
-  c2.appendChild(cardApplyBtn("Aplicar Windows", "windows", "🛡"));
+  c2.appendChild(cardRecommendBtn("windows"));
+  c2.appendChild(cardApplyBtn("Apply Windows", "windows", "🛡"));
 
   /* ── 3. Network ──────────────────────────────────────────────── */
-  const c3 = card("Network", '⚠ Alterações só são aplicadas ao clicar em "Aplicar Network".');
-  c3.setAttribute("data-section", "network");
+  const c3 = card("Network", '⚠ Changes are only applied when you click "Apply Network".');
+  c3.dataset.section = "network";
   c3.appendChild(toggle("n_nagle", "Disable Nagle (TcpNoDelay)", true, TIP.n_nagle));
   c3.appendChild(toggle("n_tcp", "Optimize TCP stack", true, TIP.n_tcp));
   c3.appendChild(toggle("n_dns", "Flush DNS", true, TIP.n_dns));
@@ -4468,11 +5387,12 @@ function build() {
   c3.appendChild(toggle("n_netbios", "Disable NetBIOS over TCP", true, TIP.n_netbios));
   c3.appendChild(toggle("n_lmhosts", "Disable LMHOSTS Lookup", true, TIP.n_lmhosts));
   c3.appendChild(toggle("n_ctcp", "Enable CTCP Congestion", true, TIP.n_ctcp));
-  c3.appendChild(cardApplyBtn("Aplicar Network", "network", "🛡"));
+  c3.appendChild(cardRecommendBtn("network"));
+  c3.appendChild(cardApplyBtn("Apply Network", "network", "🛡"));
 
   /* ── 4. NVIDIA ───────────────────────────────────────────────── */
-  const c4 = card("NVIDIA", '⚠ Alterações só são aplicadas ao clicar em "Aplicar NVIDIA".');
-  c4.setAttribute("data-section", "nvidia");
+  const c4 = card("NVIDIA", '⚠ Changes are only applied when you click "Apply NVIDIA".');
+  c4.dataset.section = "nvidia";
   c4.appendChild(toggle("nv_perf", "Max Performance Mode", true, TIP.nv_perf));
   c4.appendChild(toggle("nv_vsync", "Disable V-Sync global", true, TIP.nv_vsync));
   c4.appendChild(toggle("nv_lat", "Ultra Low Latency", true, TIP.nv_lat));
@@ -4485,11 +5405,12 @@ function build() {
   c4.appendChild(toggle("nv_prerender", "Pre-Rendered Frames = 1", true, TIP.nv_prerender));
   c4.appendChild(toggle("nv_ambient", "Disable Ambient Occlusion", true, TIP.nv_ambient));
   c4.appendChild(toggle("nv_fxaa", "Disable Global FXAA", true, TIP.nv_fxaa));
-  c4.appendChild(cardApplyBtn("Aplicar NVIDIA", "nvidia", "🛡"));
+  c4.appendChild(cardRecommendBtn("nvidia"));
+  c4.appendChild(cardApplyBtn("Apply NVIDIA", "nvidia", "🛡"));
 
   /* ── 5. Services ─────────────────────────────────────────────── */
-  const c5 = card("Services", '⚠ Alterações só são aplicadas ao clicar em "Aplicar Services".');
-  c5.setAttribute("data-section", "services");
+  const c5 = card("Services", '⚠ Changes are only applied when you click "Apply Services".');
+  c5.dataset.section = "services";
   c5.appendChild(toggle("s_sys", "SysMain (Superfetch)", true, TIP.s_sys));
   c5.appendChild(toggle("s_diag", "DiagTrack (Telemetry)", true, TIP.s_diag));
   c5.appendChild(toggle("s_ws", "Windows Search", false, TIP.s_ws));
@@ -4503,11 +5424,12 @@ function build() {
   c5.appendChild(toggle("s_maps", "MapsBroker", true, TIP.s_maps));
   c5.appendChild(toggle("s_phonesvc", "Phone Service", true, TIP.s_phonesvc));
   c5.appendChild(toggle("s_retaildemo", "RetailDemo Service", true, TIP.s_retaildemo));
-  c5.appendChild(cardApplyBtn("Aplicar Services", "services", "🛡"));
+  c5.appendChild(cardRecommendBtn("services"));
+  c5.appendChild(cardApplyBtn("Apply Services", "services", "🛡"));
 
   /* ── 6. autoexec.cfg ─────────────────────────────────────────── */
-  const c6 = card("autoexec.cfg", '⚠ Alterações só são aplicadas ao clicar em "Guardar autoexec".');
-  c6.setAttribute("data-section", "autoexec");
+  const c6 = card("autoexec.cfg", '⚠ Changes are only applied when you click "Save autoexec".');
+  c6.dataset.section = "autoexec";
   c6.appendChild(toggle("ae_on", "Generate autoexec.cfg", true, TIP.ae_on, false));
   c6.appendChild(numInput("ae_fps", "fps_max", "400"));
   c6.appendChild(numInput("ae_rate", "rate", "786432"));
@@ -4522,17 +5444,23 @@ function build() {
   c6.appendChild(customLabel);
   c6.appendChild(textArea("ae_custom", 'bind "c" "toggle cl_righthand 0 1"'));
   {
+    const btnAeRec = document.createElement("button");
+    btnAeRec.className = "card-apply-btn card-recommend-btn";
+    btnAeRec.innerHTML = "⚡ Recommended Config";
+    btnAeRec.title = "Apply recommended autoexec values based on your hardware (fps_max, rate, threads, etc.)";
+    btnAeRec.addEventListener("click", applyAutoexecRecommendations);
+    c6.appendChild(btnAeRec);
     const btn = document.createElement("button");
     btn.className = "card-apply-btn card-apply-save";
-    btn.innerHTML = "💾 Guardar autoexec.cfg";
-    btn.title = "Gerar e guardar o ficheiro autoexec.cfg na pasta CS2";
+    btn.innerHTML = "💾 Save autoexec.cfg";
+    btn.title = "Generate and save the autoexec.cfg file to the CS2 folder";
     btn.addEventListener("click", () => runSectionAsAdmin("autoexec", "autoexec.cfg"));
     c6.appendChild(btn);
   }
 
   /* ── 7. Launch Options ───────────────────────────────────────── */
-  const c7 = card("Launch Options", '⚠ Clica "Copiar" e cola no Steam → CS2 → Properties → Launch Options.');
-  c7.setAttribute("data-section", "launch");
+  const c7 = card("Launch Options", '⚠ Click "Copy" and paste in Steam → CS2 → Properties → Launch Options.');
+  c7.dataset.section = "launch";
   c7.appendChild(toggle("lo_exec", "+exec autoexec.cfg", true, TIP.lo_exec, false));
   c7.appendChild(toggle("lo_nvid", "-novid", true, TIP.lo_nvid, false));
   c7.appendChild(toggle("lo_joy", "-nojoy", true, TIP.lo_joy, false));
@@ -4545,17 +5473,23 @@ function build() {
   c7.appendChild(argsLabel);
   c7.appendChild(textArea("lo_custom", ""));
   {
+    const btnLoRec = document.createElement("button");
+    btnLoRec.className = "card-apply-btn card-recommend-btn";
+    btnLoRec.innerHTML = "⚡ Recommended Config";
+    btnLoRec.title = "Apply recommended launch options (threads based on your CPU cores)";
+    btnLoRec.addEventListener("click", applyLaunchRecommendations);
+    c7.appendChild(btnLoRec);
     const btn = document.createElement("button");
     btn.className = "card-apply-btn card-apply-copy";
-    btn.innerHTML = "📋 Copiar Launch Options";
-    btn.title = "Copiar as launch options para o clipboard";
+    btn.innerHTML = "📋 Copy Launch Options";
+    btn.title = "Copy the launch options to clipboard";
     btn.addEventListener("click", copyLaunchOptions);
     c7.appendChild(btn);
   }
 
   /* ── 8. Extras / FACEIT ──────────────────────────────────────── */
-  const c8 = card("Extras & FACEIT", '⚠ Alterações só são aplicadas ao clicar em "Aplicar Extras".');
-  c8.setAttribute("data-section", "extras");
+  const c8 = card("Extras & FACEIT", '⚠ Changes are only applied when you click "Apply Extras".');
+  c8.dataset.section = "extras";
   c8.appendChild(infoRow("FACEIT Anti-Cheat status", TIP.x_faceit));
   c8.appendChild(toggle("x_steam", "Disable Steam Overlay", true, TIP.x_steam));
   c8.appendChild(toggle("x_disc", "Disable Discord Overlay", true, TIP.x_disc));
@@ -4569,7 +5503,8 @@ function build() {
   c8.appendChild(toggle("x_pcie", "PCIe Link State Off", true, TIP.x_pcie));
   c8.appendChild(toggle("x_ndis", "Interrupt Moderation Off", false, TIP.x_ndis));
   c8.appendChild(toggle("x_large", "Enable Large Pages", false, TIP.x_large));
-  c8.appendChild(cardApplyBtn("Aplicar Extras", "extras", "🛡"));
+  c8.appendChild(cardRecommendBtn("extras"));
+  c8.appendChild(cardApplyBtn("Apply Extras", "extras", "🛡"));
 
   /* ── PRO TIPS (not toggleable — pure informational guidance) ───── */
   /* We inject a tips section below the grid, before the actions bar */
@@ -4630,21 +5565,28 @@ function build() {
   impactBar.title = "Estimated FPS improvement based on selected features. Features already active on your system (blue LED) are excluded from this estimate.";
   impactBar.innerHTML = `<span class="impact-label">Est. FPS Gain</span><span class="impact-pct"><span id="impact-pct-val">+0.0%</span></span><span class="impact-sep">│</span><span class="impact-fps"><span id="impact-fps-val">+0 FPS</span></span>`;
 
+  /* ── One-Click Recommend All Button ──────────────────────────── */
+  const btnRecAll = document.createElement("button");
+  btnRecAll.className = "btn-recommend-all";
+  btnRecAll.innerHTML = "⚡ One-Click Config";
+  btnRecAll.title = "Apply ALL recommended settings based on your hardware (Windows + Network + NVIDIA + Services + Autoexec + Launch + Extras)";
+  btnRecAll.addEventListener("click", applyAllSysRecommendations);
+
   actions.appendChild(btnExport);
   actions.appendChild(btnImport2);
   actions.appendChild(btnRun2);
+  actions.appendChild(btnRecAll);
   actions.appendChild(impactBar);
 
+  /* ── SYS Schema Import Button ────────────────────────────────── */
   /* ── Signature (inside actions bar) ───────────────────── */
-  const signature = document.createElement("div");
-  signature.className = "app-signature";
-  signature.innerHTML = `<span class="sig-by">by</span> <span class="sig-name">Rqdiniz</span> <span class="sig-tag">[ bu- ]</span> <span class="sig-by">&middot;</span> <span class="sig-community">aim.camp</span>`;
+  const signature = buildSignature(true);
   actions.appendChild(signature);
 
   /* ── Tab: System Optimizer ─────────────────────────────────────── */
   const tabSys = document.createElement("div");
   tabSys.id = "tab-optimizer";
-  tabSys.className = "tab-panel active";
+  tabSys.style.cssText = "display:flex;flex-direction:column;flex:1;min-height:0;overflow:hidden;gap:3px;";
 
   const sysSub = buildSubTabs(["BIOS & Windows", "Network & GPU", "Services & Config", "Extras & Tips"]);
   tabSys.appendChild(sysSub.bar);
@@ -4681,73 +5623,329 @@ function build() {
   for (const p of sysSub.panels) tabSys.appendChild(p);
   tabSys.appendChild(actions);
 
+  /* ── Enable drag reorder within cards ────────────────────────── */
+  function enableCardDrag(cardEl: HTMLElement, onReorder?: (ids: string[]) => void) {
+    const rows = Array.from(cardEl.querySelectorAll<HTMLElement>(":scope > .toggle-row"));
+    if (rows.length < 2) return; // nothing to drag
+    let draggedRow: HTMLElement | null = null;
+
+    rows.forEach((row) => {
+      // Add drag grip handle
+      const grip = document.createElement("span");
+      grip.className = "row-drag-grip";
+      grip.textContent = "⠿";
+      row.insertBefore(grip, row.firstChild);
+      row.setAttribute("draggable", "true");
+
+      row.addEventListener("dragstart", (e) => {
+        if (_layoutEditMode) return; // don't interfere with layout edit mode
+        draggedRow = row;
+        row.classList.add("row-dragging");
+        e.dataTransfer!.effectAllowed = "move";
+        e.dataTransfer!.setData("text/plain", "");
+      });
+
+      row.addEventListener("dragend", () => {
+        row.classList.remove("row-dragging");
+        cardEl.querySelectorAll(".row-drag-over").forEach((r) => { r.classList.remove("row-drag-over"); });
+        if (draggedRow && onReorder) {
+          const currentRows = Array.from(cardEl.querySelectorAll<HTMLElement>(":scope > .toggle-row"));
+          const ids = currentRows
+            .map((r) => {
+              const cb = r.querySelector<HTMLInputElement>("input[type=checkbox]");
+              return cb?.id || r.dataset.cmdId || "";
+            })
+            .filter(Boolean);
+          onReorder(ids);
+        }
+        draggedRow = null;
+      });
+
+      row.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        if (draggedRow && draggedRow !== row && draggedRow.parentElement === row.parentElement) {
+          e.dataTransfer!.dropEffect = "move";
+          // Show insert indicator
+          const rect = row.getBoundingClientRect();
+          const midY = rect.top + rect.height / 2;
+          row.classList.toggle("row-drag-over-above", e.clientY < midY);
+          row.classList.toggle("row-drag-over-below", e.clientY >= midY);
+          row.classList.add("row-drag-over");
+        }
+      });
+
+      row.addEventListener("dragleave", () => {
+        row.classList.remove("row-drag-over", "row-drag-over-above", "row-drag-over-below");
+      });
+
+      row.addEventListener("drop", (e) => {
+        e.preventDefault();
+        row.classList.remove("row-drag-over", "row-drag-over-above", "row-drag-over-below");
+        if (draggedRow && draggedRow !== row && draggedRow.parentElement === row.parentElement) {
+          const rect = row.getBoundingClientRect();
+          if (e.clientY < rect.top + rect.height / 2) {
+            row.before(draggedRow);
+          } else if (row.nextSibling) {
+            row.nextSibling.before(draggedRow);
+          } else {
+            row.parentElement!.appendChild(draggedRow);
+          }
+        }
+      });
+    });
+  }
+
+  /* ── Enable drag reorder within SYS cards ────────────────────── */
+  [c2, c3, c4, c5, c6, c7, c8].forEach((sysCard) => {
+    restoreSysCardOrder(sysCard);
+    enableCardDrag(sysCard, (ids) => {
+      const sec = sysCard.dataset.section;
+      if (sec) saveSysCardOrder(sec, ids);
+    });
+  });
+
   /* ── Tab: CFG Manager ────────────────────────────────────────── */
   const tabCfg = document.createElement("div");
   tabCfg.id = "tab-cfg";
-  tabCfg.className = "tab-panel";
+  tabCfg.style.cssText = "display:flex;flex-direction:column;flex:1;min-height:0;overflow:hidden;gap:3px;";
 
-  const cfgSub = buildSubTabs(["Performance & Crosshair", "HUD, Radar & Audio", "Input, Network & Telemetry", "Voice, Buy & Misc"]);
-
-  // group CFG categories into sub-tab panels
-  const cfgSubMap: Record<string, number> = {
-    Performance: 0,
-    Crosshair: 0,
-    Viewmodel: 0,
-    HUD: 1,
-    Radar: 1,
-    Audio: 1,
-    "Mouse & Input": 2,
-    Network: 2,
-    "Voice & Comms": 3,
-    "Buy & Economy": 3,
-    "Spectator & Demo": 3,
-    "Misc & QoL": 3,
-  };
-  const cfgGrids = [0, 1, 2, 3].map(() => {
-    const g = document.createElement("main");
-    g.className = "cfg-grid";
-    return g;
-  });
-
-  for (const cat of CFG) {
-    const cc = card(cat.name);
-    for (const cmd of cat.commands) {
-      if (cmd.type === "toggle") {
-        cc.appendChild(toggle(cmd.id, cmd.label, cmd.on, cmd.tip, false));
-      } else {
-        const row = document.createElement("div");
-        row.className = "toggle-row";
-        if (cmd.tip) row.title = cmd.tip;
-        const lbl = document.createElement("label");
-        lbl.htmlFor = cmd.id;
-        lbl.textContent = cmd.label;
-        const vi = document.createElement("input");
-        vi.type = "text";
-        vi.id = `${cmd.id}_v`;
-        vi.value = cmd.val;
-        vi.style.cssText =
-          'width:56px;text-align:center;padding:2px 4px;font-size:11px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:3px;color:var(--neon-green);font-family:"Rajdhani",monospace;';
-        const cb = document.createElement("input");
-        cb.type = "checkbox";
-        cb.id = cmd.id;
-        cb.checked = cmd.on;
-        row.appendChild(lbl);
-        row.appendChild(vi);
-        row.appendChild(cb);
-        cc.appendChild(row);
-      }
+  /* Helper: build a CFG command row (toggle or value input) with star toggle */
+  function buildCfgRow(cmd: CfgCmd, container: HTMLElement, isPri: boolean) {
+    let row: HTMLDivElement;
+    if (cmd.type === "toggle") {
+      row = toggle(cmd.id, cmd.label, cmd.on, cmd.tip, false);
+    } else {
+      row = document.createElement("div");
+      row.className = "toggle-row";
+      if (cmd.tip) row.title = cmd.tip;
+      const lbl = document.createElement("label");
+      lbl.htmlFor = cmd.id;
+      lbl.textContent = cmd.label;
+      const vi = document.createElement("input");
+      vi.type = "text";
+      vi.id = `${cmd.id}_v`;
+      vi.value = cmd.val;
+      vi.style.cssText =
+        'width:56px;text-align:center;padding:2px 4px;font-size:11px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:3px;color:var(--neon-green);font-family:"Rajdhani",monospace;';
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.id = cmd.id;
+      cb.checked = cmd.on;
+      row.appendChild(lbl);
+      row.appendChild(vi);
+      row.appendChild(cb);
     }
-    const idx = cfgSubMap[cat.name] ?? 2;
-    cfgGrids[idx].appendChild(cc);
+    row.dataset.cmdId = cmd.id;
+
+    // X remove button — removes command from this tab's layout (edit mode only)
+    const xDel = document.createElement("button");
+    xDel.className = "row-x-btn";
+    xDel.innerHTML = "✕";
+    xDel.title = "Remove this feature from the layout";
+    xDel.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const parentCard = row.closest<HTMLElement>(".card");
+      row.classList.add("card-removing");
+      setTimeout(() => {
+        row.remove();
+        // Refresh the "add feature" dropdown for this card
+        if (parentCard) refreshAddFeatureMenu(parentCard);
+      }, 250);
+    });
+    row.appendChild(xDel);
+
+    // Star toggle button — ★ = Primary, ☆ = Secondary
+    const star = document.createElement("button");
+    star.className = "row-star-btn" + (isPri ? " starred" : "");
+    star.innerHTML = isPri ? "★" : "☆";
+    star.title = isPri ? "Move to Secondary" : "Move to Primary";
+    star.addEventListener("click", (e) => {
+      e.stopPropagation();
+      toggleCmdPrincipal(cmd.id, !isPri);
+      if (_layoutEditMode) {
+        // Incremental update: just remove the row from the current grid.
+        // The command now belongs to the other panel. It will appear
+        // there after the next full build (save / cancel / tab switch).
+        const parentCard = row.closest<HTMLElement>(".card");
+        row.remove();
+        // If the card's grid became empty, show a placeholder message
+        if (parentCard) {
+          const grid = parentCard.querySelector(".cfg-grid");
+          if (grid?.children.length === 0) {
+            const empty = document.createElement("p");
+            empty.style.cssText =
+              "text-align:center;color:rgba(255,255,255,0.3);font-size:12px;padding:12px;";
+            empty.textContent = "No commands — use ★ to add";
+            grid.appendChild(empty);
+          }
+        }
+      } else {
+        // Save current values before rebuild so they survive
+        const as = getActiveSchema();
+        if (as) saveSchemaValues(as.id, collectFullState());
+        rebuildCfgLayout();
+      }
+    });
+    row.appendChild(star);
+    container.appendChild(row);
   }
 
-  cfgSub.panels[0].appendChild(cfgGrids[0]);
-  cfgSub.panels[1].appendChild(cfgGrids[1]);
-  cfgSub.panels[2].appendChild(cfgGrids[2]);
+  /** Find CfgCmd object by ID */
+  function findCfgCmd(cmdId: string): CfgCmd | null {
+    for (const cat of CFG) {
+      const found = cat.commands.find((c) => c.id === cmdId);
+      if (found) return found;
+    }
+    return null;
+  }
 
-  tabCfg.appendChild(cfgSub.bar);
+  /** Get all command IDs for a given category name */
+  function getCatCommandIds(catName: string): string[] {
+    const cat = CFG.find((c) => c.name === catName);
+    return cat ? cat.commands.map((c) => c.id) : [];
+  }
 
-  /* ── Crosshair Preview — inline in sub-tab 0 ────────────────── */
+  /** Get command IDs currently visible in a card element */
+  function getCardVisibleIds(cardEl: HTMLElement): Set<string> {
+    const ids = new Set<string>();
+    cardEl.querySelectorAll<HTMLElement>("[data-cmd-id]").forEach((row) => {
+      ids.add(row.dataset.cmdId!);
+    });
+    return ids;
+  }
+
+  /** Refresh the "add feature" dropdown options for a card */
+  function refreshAddFeatureMenu(cardEl: HTMLElement) {
+    const catName = cardEl.dataset.catName;
+    if (!catName) return;
+    const menu = cardEl.querySelector<HTMLElement>(".add-feature-menu");
+    if (!menu) return;
+    const allIds = getCatCommandIds(catName);
+    const visibleIds = getCardVisibleIds(cardEl);
+    const missingIds = allIds.filter((id) => !visibleIds.has(id));
+    menu.innerHTML = "";
+    // Helper to insert a cmd row back into the card
+    const insertCmdRow = (cmd: CfgCmd) => {
+      const tabView = getCurrentCfgTabView();
+      const inPrincipal = tabView === "Principal";
+      const addWrap = cardEl.querySelector(".add-feature-wrap");
+      buildCfgRow(cmd, cardEl, inPrincipal);
+      const newRow = cardEl.lastElementChild as HTMLElement;
+      if (addWrap && newRow && newRow !== addWrap) {
+        addWrap.before(newRow);
+        newRow.classList.add("row-balloon");
+        newRow.setAttribute("draggable", "true");
+        newRow.querySelectorAll<HTMLInputElement>("input").forEach((inp) => { inp.disabled = true; });
+      }
+      refreshAddFeatureMenu(cardEl);
+    };
+
+    if (missingIds.length > 0) {
+      for (const id of missingIds) {
+        const cmd = findCfgCmd(id);
+        if (!cmd) continue;
+        const item = document.createElement("button");
+        item.className = "add-feature-item";
+        item.textContent = `➕ ${cmd.label}`;
+        item.title = cmd.tip || "";
+        item.addEventListener("click", (e) => {
+          e.stopPropagation();
+          insertCmdRow(cmd);
+        });
+        menu.appendChild(item);
+      }
+    } else {
+      const p = document.createElement("p");
+      p.className = "add-feature-empty";
+      p.textContent = "All catalog features are already in the layout";
+      menu.appendChild(p);
+    }
+
+    // Separator + Custom command option (always present)
+    const sep = document.createElement("div");
+    sep.className = "add-feature-sep";
+    menu.appendChild(sep);
+    const customBtn = document.createElement("button");
+    customBtn.className = "add-feature-item add-feature-custom";
+    customBtn.innerHTML = `✏️ Custom command...`;
+    customBtn.title = "Add a custom CS2 command with a name and value of your choice";
+    customBtn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      menu.style.display = "none";
+      const cmdName = await showInputModal("Command", "E.g.: cl_crosshairgap, sensitivity...");
+      if (!cmdName?.trim()) return;
+      const cmdVal = await showInputModal("Value", `Value for ${cmdName.trim()} (e.g.: 0, 1, 2.5)`);
+      if (cmdVal === null) return;
+      // Create a custom CfgCmd on the fly
+      const customId = "custom_" + cmdName.trim().replaceAll(/\W/g, "_") + "_" + Date.now();
+      const customCmd: CfgCmd = {
+        id: customId,
+        cmd: cmdName.trim(),
+        label: cmdName.trim(),
+        type: "value",
+        on: true,
+        val: cmdVal.trim(),
+        tip: "Custom command",
+      };
+      insertCmdRow(customCmd);
+      menu.style.display = "flex";
+    });
+    menu.appendChild(customBtn);
+  }
+
+  /** Build the "Add feature" button + dropdown for a category card */
+  function buildAddFeatureBtn(cardEl: HTMLElement, catName: string) {
+    cardEl.dataset.catName = catName;
+    const wrap = document.createElement("div");
+    wrap.className = "add-feature-wrap";
+    const btn = document.createElement("button");
+    btn.className = "add-feature-btn";
+    btn.innerHTML = "➕ Add Feature";
+    btn.title = `Add a removed feature back to "${catName}"`;
+    const menu = document.createElement("div");
+    menu.className = "add-feature-menu";
+    menu.style.display = "none";
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const isOpen = menu.style.display !== "none";
+      // Close all other open menus
+      document.querySelectorAll<HTMLElement>(".add-feature-menu").forEach((m) => { m.style.display = "none"; });
+      if (!isOpen) {
+        refreshAddFeatureMenu(cardEl);
+        menu.style.display = "flex";
+      }
+    });
+    wrap.appendChild(btn);
+    wrap.appendChild(menu);
+    cardEl.appendChild(wrap);
+  }
+
+  /** Guard for CFG sub-tab switching — blocks if layout edit mode is active */
+  function cfgEditGuard(): boolean {
+    if (_layoutEditMode) {
+      pulseLayoutSaveBtn();
+      return false;
+    }
+    return true;
+  }
+  const cfgSub = buildSubTabs(["⚡ Primary", "🔧 Secondary"], cfgEditGuard);
+
+  /* ── Principal panel — most-used / urgent commands ───────────── */
+  const priGrid = document.createElement("main");
+  priGrid.className = "cfg-grid";
+  const priSet = getPrincipalSet();
+
+  for (const cat of CFG) {
+    const priCmds = cat.commands.filter((c) => priSet.has(c.id));
+    if (priCmds.length === 0) continue;
+    const cc = card(cat.name);
+    for (const cmd of priCmds) buildCfgRow(cmd, cc, true);
+    buildAddFeatureBtn(cc, cat.name);
+    priGrid.appendChild(cc);
+  }
+  cfgSub.panels[0].appendChild(priGrid);
+
+  /* ── Crosshair Preview — inline in Principal tab ─────────────── */
   const xhCard = card("Crosshair Preview");
   xhCard.style.cssText = "margin:0 12px 8px;";
   const xhDiv = document.createElement("div");
@@ -4762,7 +5960,86 @@ function build() {
   xhCard.appendChild(xhDiv);
   cfgSub.panels[0].appendChild(xhCard);
 
+  /* ── Secondary panel — remaining commands by theme ────────────── */
+  const secLabels = ["Performance", "Crosshair", "HUD & Radar", "Audio", "Input & Network", "Other"];
+  const secSub = buildSubTabs(secLabels, cfgEditGuard);
+  secSub.bar.classList.add("inner-sub-tab-bar");
+  secSub.bar.querySelectorAll(".sub-tab-btn").forEach((btn) => {
+    btn.classList.add("inner-sub-tab-btn");
+  });
+
+  const secSubMap: Record<string, number> = {
+    Performance: 0,
+    Viewmodel: 0,
+    Crosshair: 1,
+    HUD: 2,
+    Radar: 2,
+    Audio: 3,
+    "Mouse & Input": 4,
+    Network: 4,
+    "Voice & Comms": 5,
+    "Buy & Economy": 5,
+    "Spectator & Demo": 5,
+    "Misc & QoL": 5,
+  };
+  const secGrids = secLabels.map(() => {
+    const g = document.createElement("main");
+    g.className = "cfg-grid";
+    return g;
+  });
+
+  for (const cat of CFG) {
+    const secCmds = cat.commands.filter((c) => !priSet.has(c.id));
+    if (secCmds.length === 0) continue;
+    const cc = card(cat.name);
+    for (const cmd of secCmds) buildCfgRow(cmd, cc, false);
+    buildAddFeatureBtn(cc, cat.name);
+    const idx = secSubMap[cat.name] ?? 5;
+    secGrids[idx].appendChild(cc);
+  }
+
+  cfgSub.panels[1].appendChild(secSub.bar);
+  for (let i = 0; i < secLabels.length; i++) {
+    secSub.panels[i].appendChild(secGrids[i]);
+    cfgSub.panels[1].appendChild(secSub.panels[i]);
+  }
+
+
+  tabCfg.appendChild(cfgSub.bar);
   for (const p of cfgSub.panels) tabCfg.appendChild(p);
+
+  /* ── Enable drag reorder within CFG cards ────────────────────── */
+  function saveCfgCardOrder(cardEl: HTMLElement) {
+    const schema = getActiveSchema();
+    if (!schema) return;
+    const tabView = getCurrentCfgTabView();
+    const rows = Array.from(cardEl.querySelectorAll<HTMLElement>(":scope > .toggle-row"));
+    const ids = rows.map((r) => r.dataset.cmdId || "").filter(Boolean);
+    // Update only the IDs that belong to this card within the tab layout
+    const layout = schema.cfgLayout[tabView];
+    if (layout) {
+      // Replace the matching subset in the layout's commands with the new order
+      const cardIds = new Set(ids);
+      const others = layout.commands.filter((id) => !cardIds.has(id));
+      // Find where the first card ID was in the layout, insert reordered ones there
+      const firstIdx = layout.commands.findIndex((id) => cardIds.has(id));
+      if (firstIdx >= 0) {
+        const before = layout.commands.slice(0, firstIdx).filter((id) => !cardIds.has(id));
+        const after = layout.commands.slice(firstIdx).filter((id) => !cardIds.has(id));
+        updateSchemaTabLayout(schema.id, tabView, [...before, ...ids, ...after]);
+      } else {
+        updateSchemaTabLayout(schema.id, tabView, [...others, ...ids]);
+      }
+    }
+  }
+  priGrid.querySelectorAll<HTMLElement>(".card").forEach((cc) => {
+    enableCardDrag(cc, () => saveCfgCardOrder(cc));
+  });
+  secGrids.forEach((grid) => {
+    grid.querySelectorAll<HTMLElement>(".card").forEach((cc) => {
+      enableCardDrag(cc, () => saveCfgCardOrder(cc));
+    });
+  });
 
   // listen for crosshair value changes
   const xhIds = ["cf_xhstyle", "cf_xhsize", "cf_xhgap", "cf_xhthick", "cf_xhcolor", "cf_xhdot", "cf_xhoutline", "cf_xht"];
@@ -4801,7 +6078,7 @@ function build() {
     loadMenu.classList.remove("open");
   });
   saveMenu.addEventListener("click", async (e) => {
-    const t = (e.target as HTMLElement).closest("[data-action]") as HTMLElement | null;
+    const t = (e.target as HTMLElement).closest<HTMLElement>("[data-action]");
     if (!t) return;
     saveMenu.classList.remove("open");
     const action = t.dataset.action;
@@ -4809,8 +6086,6 @@ function build() {
       await saveCfgFile();
     } else if (action === "save-drive") {
       const content = collectCfgContent();
-      const encoded = encodeURIComponent(content);
-      const name = encodeURIComponent("autoexec.cfg");
       // Open Google Drive upload via Google Docs create-then-save-as flow
       const url = `https://drive.google.com/drive/my-drive`;
       shellOpen(url);
@@ -4822,7 +6097,7 @@ function build() {
       const subject = encodeURIComponent("My CS2 autoexec.cfg — aim.camp Player Agent");
       const body = encodeURIComponent(content);
       const mailto = `mailto:?subject=${subject}&body=${body}`;
-      window.location.href = mailto;
+      globalThis.location.href = mailto;
       toast("Opening email client with CFG...");
     }
   });
@@ -4854,7 +6129,7 @@ function build() {
     saveMenu.classList.remove("open");
   });
   loadMenu.addEventListener("click", async (e) => {
-    const t = (e.target as HTMLElement).closest("[data-action]") as HTMLElement | null;
+    const t = (e.target as HTMLElement).closest<HTMLElement>("[data-action]");
     if (!t) return;
     loadMenu.classList.remove("open");
     const action = t.dataset.action;
@@ -4881,22 +6156,28 @@ function build() {
   btnResetCfg.textContent = "Reset";
   btnResetCfg.title = "Reset all commands to defaults";
 
-  const btnCfgAi = document.createElement("button");
-  btnCfgAi.className = "btn-ai";
-  btnCfgAi.innerHTML = "🤖 AI Suggest";
-  btnCfgAi.title = "AI config recommendations for your hardware";
+  const btnCfgRecommend = document.createElement("button");
+  btnCfgRecommend.className = "btn-recommend-all";
+  btnCfgRecommend.innerHTML = "⚡ Competitive CFG";
+  btnCfgRecommend.title = "Apply recommended competitive CS2 settings (Performance, Crosshair, Audio, Network, etc.) based on your hardware";
+  btnCfgRecommend.addEventListener("click", applyCfgRecommendations);
 
-  const cfgAiResp = document.createElement("div");
-  cfgAiResp.className = "ai-response";
-  cfgAiResp.id = "cfg-ai-response";
+  const btnCfgAdv = document.createElement("button");
+  btnCfgAdv.className = "btn-adv";
+  btnCfgAdv.innerHTML = "🔍 Suggest";
+  btnCfgAdv.title = "Personalized config recommendations based on your hardware — requires Advisor key configured";
 
-  btnCfgAi.addEventListener("click", async () => {
-    if (!hasAiKey()) {
-      showAiModal();
+  const cfgAdvResp = document.createElement("div");
+  cfgAdvResp.className = "adv-response";
+  cfgAdvResp.id = "cfg-adv-response";
+
+  btnCfgAdv.addEventListener("click", async () => {
+    if (!hasAdvKey()) {
+      showAdvModal();
       return;
     }
-    btnCfgAi.disabled = true;
-    cfgAiResp.innerHTML = '<div class="ai-loading">Generating config suggestions...</div>';
+    btnCfgAdv.disabled = true;
+    cfgAdvResp.innerHTML = '<div class="adv-loading">Generating config suggestions...</div>';
     const hwGrid = document.querySelector(".hw-grid");
     const hwData = hwGrid ? hwGrid.textContent || "" : "Hardware not scanned yet";
     // gather current CFG states
@@ -4910,28 +6191,259 @@ function build() {
     }
     const context = `Hardware:\n${hwData}\n\nActive config commands:\n${cfgStates.join("\n")}`;
     try {
-      const result = await aiChat(AI_PROMPTS.cfg, context);
-      cfgAiResp.innerHTML = mdToHtml(result);
+      const result = await advChat(ADV_PROMPTS.cfg, context);
+      cfgAdvResp.innerHTML = mdToHtml(result);
     } catch (e) {
-      cfgAiResp.innerHTML = `<span style="color:#ef4444">Error: ${e}</span>`;
+      cfgAdvResp.innerHTML = `<span style="color:#ef4444">Error: ${e}</span>`;
     }
-    btnCfgAi.disabled = false;
+    btnCfgAdv.disabled = false;
   });
 
   const cfgCounter = document.createElement("div");
   cfgCounter.className = "cfg-counter";
   cfgCounter.innerHTML = '<span>Commands:</span> <span id="cfg-count">0</span>';
 
-  const cfgSig = document.createElement("div");
-  cfgSig.className = "app-signature";
-  cfgSig.innerHTML = `<span class="sig-by">by</span> <span class="sig-name">Rqdiniz</span> <span class="sig-tag">[ bu- ]</span>`;
+  /* ── Schema buttons (CFG) ────────────────────────────────────── */
+  const btnCfgLayout = document.createElement("button");
+  btnCfgLayout.className = "btn-schema";
+  btnCfgLayout.innerHTML = "📐 Configure Layout";
+  btnCfgLayout.title = "Edit layout — customize which commands appear and their order. Changes are saved to the active schema, allowing full per-schema customization.";
+
+  const btnCfgLayoutSave = document.createElement("button");
+  btnCfgLayoutSave.className = "btn-schema btn-schema-save";
+  btnCfgLayoutSave.innerHTML = "💾 Save Layout";
+  btnCfgLayoutSave.style.display = "none";
+
+  const btnCfgLayoutCancel = document.createElement("button");
+  btnCfgLayoutCancel.className = "btn-schema btn-schema-cancel";
+  btnCfgLayoutCancel.innerHTML = "❌ Cancel";
+  btnCfgLayoutCancel.style.display = "none";
+
+  /* Enter layout edit mode */
+  btnCfgLayout.addEventListener("click", () => {
+    if (_layoutEditMode) return;
+    const tabView = getCurrentCfgTabView();
+    // Ensure we have an active schema, creating one if needed
+    let schema = getActiveSchema();
+    if (!schema) {
+      schema = createSchema("Default");
+      setActiveSchemaId(schema.id);
+    }
+    _layoutEditMode = true;
+    _layoutEditTabView = tabView;
+    const layout = schema.cfgLayout[tabView];
+    _layoutEditOriginal = layout ? [...layout.commands] : [];
+
+    // Find the currently active grid
+    const cfgPanel = document.getElementById("tab-cfg");
+    if (!cfgPanel) return;
+
+    // Find the active sub-tab panel's cfg-grid
+    const activePanel = cfgPanel.querySelector<HTMLElement>(".sub-tab-panel.active");
+    // Within Secondary, look for the inner active panel
+    let targetGrid: HTMLElement | null = null;
+    if (tabView === "Principal") {
+      targetGrid = activePanel?.querySelector<HTMLElement>(".cfg-grid") || null;
+    } else {
+      const innerActive = activePanel?.querySelector<HTMLElement>(".sub-tab-panel.active");
+      targetGrid = innerActive?.querySelector<HTMLElement>(".cfg-grid") || activePanel?.querySelector<HTMLElement>(".cfg-grid") || null;
+    }
+    if (!targetGrid) { _layoutEditMode = false; return; }
+    _layoutEditContainer = targetGrid;
+
+    // Disable all inputs in the grid
+    targetGrid.querySelectorAll<HTMLInputElement>("input").forEach((inp) => { inp.disabled = true; });
+
+    // Transform cards into floating balloons with drag handles and X buttons
+    targetGrid.classList.add("cfg-grid-edit-mode");
+    targetGrid.querySelectorAll<HTMLElement>(".card").forEach((cardEl) => {
+      cardEl.classList.add("card-balloon");
+      cardEl.setAttribute("draggable", "true");
+
+      // Add "X" remove button for entire card
+      const xBtn = document.createElement("button");
+      xBtn.className = "card-remove-btn";
+      xBtn.innerHTML = "✕";
+      xBtn.title = "Remove from this tab";
+      xBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        cardEl.classList.add("card-removing");
+        setTimeout(() => cardEl.remove(), 300);
+      });
+      cardEl.appendChild(xBtn);
+
+      // Make individual toggle-rows draggable (row-x-btn already exists from buildCfgRow)
+      cardEl.querySelectorAll<HTMLElement>(".toggle-row").forEach((row) => {
+        row.classList.add("row-balloon");
+        row.setAttribute("draggable", "true");
+      });
+    });
+
+    // Drag & drop for reordering cards
+    let dragSrc: HTMLElement | null = null;
+    targetGrid.addEventListener("dragstart", (e: DragEvent) => {
+      dragSrc = (e.target as HTMLElement).closest(".card-balloon, .row-balloon");
+      if (dragSrc) {
+        dragSrc.classList.add("dragging");
+        e.dataTransfer?.setData("text/plain", "");
+      }
+    });
+    targetGrid.addEventListener("dragover", (e: DragEvent) => {
+      e.preventDefault();
+      const target = (e.target as HTMLElement).closest<HTMLElement>(".card-balloon, .row-balloon");
+      if (target && target !== dragSrc && dragSrc) {
+        const rect = target.getBoundingClientRect();
+        const mid = rect.top + rect.height / 2;
+        if (e.clientY < mid) {
+          target.parentElement?.insertBefore(dragSrc, target);
+        } else {
+          target.parentElement?.insertBefore(dragSrc, target.nextSibling);
+        }
+      }
+    });
+    targetGrid.addEventListener("dragend", () => {
+      if (dragSrc) dragSrc.classList.remove("dragging");
+      dragSrc = null;
+    });
+
+    // Show/hide buttons
+    btnCfgLayout.style.display = "none";
+    btnCfgLayoutSave.style.display = "";
+    btnCfgLayoutCancel.style.display = "";
+    toast("Edit mode active — drag to reorder, ✕ to remove");
+  });
+
+  /* Save layout */
+  btnCfgLayoutSave.addEventListener("click", () => {
+    if (!_layoutEditMode || !_layoutEditContainer) return;
+    const schema = getActiveSchema();
+    if (!schema) { _layoutEditMode = false; return; }
+
+    // Collect current command IDs from the grid
+    const commandIds: string[] = [];
+    _layoutEditContainer.querySelectorAll<HTMLInputElement>("input[type=checkbox]").forEach((cb) => {
+      commandIds.push(cb.id);
+    });
+
+    updateSchemaTabLayout(schema.id, _layoutEditTabView, commandIds);
+    // Persist current values so they survive the rebuild
+    saveSchemaValues(schema.id, collectFullState());
+    exitLayoutEditMode();
+    rebuildCfgLayout();
+    toast("Layout saved ✔");
+  });
+
+  /* Cancel layout edit */
+  btnCfgLayoutCancel.addEventListener("click", () => {
+    // Persist current values so they survive the rebuild
+    const schema = getActiveSchema();
+    if (schema) saveSchemaValues(schema.id, collectFullState());
+    exitLayoutEditMode();
+    // Rebuild CFG content to restore original order
+    rebuildCfgLayout();
+    toast("Edit cancelled");
+  });
+
+  function exitLayoutEditMode() {
+    _layoutEditMode = false;
+    _layoutEditTabView = "";
+    _layoutEditOriginal = [];
+
+    if (_layoutEditContainer) {
+      _layoutEditContainer.classList.remove("cfg-grid-edit-mode");
+      _layoutEditContainer.querySelectorAll<HTMLElement>(".card").forEach((c) => {
+        c.classList.remove("card-balloon");
+        c.removeAttribute("draggable");
+        c.querySelector(".card-remove-btn")?.remove();
+      });
+      _layoutEditContainer.querySelectorAll<HTMLElement>(".toggle-row").forEach((r) => {
+        r.classList.remove("row-balloon");
+        r.removeAttribute("draggable");
+      });
+      // Close any open add-feature menus
+      _layoutEditContainer.querySelectorAll<HTMLElement>(".add-feature-menu").forEach((m) => {
+        m.style.display = "none";
+      });
+      _layoutEditContainer.querySelectorAll<HTMLInputElement>("input").forEach((inp) => {
+        inp.disabled = false;
+      });
+    }
+    _layoutEditContainer = null;
+    btnCfgLayout.style.display = "";
+    btnCfgLayoutSave.style.display = "none";
+    btnCfgLayoutCancel.style.display = "none";
+  }
+
+  /** Rebuild CFG layout according to active schema */
+  function rebuildCfgLayout() {
+    setTimeout(() => {
+      build();
+      setTimeout(() => {
+        switchTab("config");
+        // Switch to CFG sub-tab within Config
+        const configBar = document.querySelector<HTMLElement>("#tab-config > .sub-tab-bar");
+        if (configBar) {
+          const btns = configBar.querySelectorAll<HTMLButtonElement>(".sub-tab-btn");
+          if (btns[1]) btns[1].click();
+        }
+        updateCfgCounter();
+        drawCrosshair();
+        // Restore the active schema's values after rebuild
+        const schema = getActiveSchema();
+        if (schema?.values && Object.keys(schema.values).length > 0) {
+          restoreFullState(schema.values);
+        }
+      }, 100);
+    }, 50);
+  }
+
+  /** Build an author signature element with donation hover */
+  function buildSignature(includeCommunity = false): HTMLElement {
+    const sig = document.createElement("div");
+    sig.className = "app-signature";
+    const inner = `<span class="sig-by">by</span> <span class="sig-name">Rqdiniz</span> <span class="sig-tag">[ bu- ]</span>` +
+      (includeCommunity ? ` <span class="sig-by">&middot;</span> <span class="sig-community">aim.camp</span>` : ``) +
+      ` <span class="sig-support-hint" title="Support the project">☕</span>`;
+    sig.innerHTML = inner;
+    // Donation popup
+    const popup = document.createElement("div");
+    popup.className = "donate-popup";
+    popup.innerHTML = `
+      <div class="donate-title">☕ Support the project</div>
+      <p class="donate-desc">If this optimizer helped you, consider supporting development!</p>
+      <a href="https://paypal.me/rqdiniz" target="_blank" class="donate-link donate-paypal">
+        <span class="donate-icon">💳</span> PayPal
+      </a>
+    `;
+    document.body.appendChild(popup);
+    // Toggle popup on click — position relative to the signature element
+    sig.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const isShowing = !popup.classList.contains("show");
+      // Close all other donate popups first
+      document.querySelectorAll(".donate-popup.show").forEach((p) => { p.classList.remove("show"); });
+      if (isShowing) {
+        const r = sig.getBoundingClientRect();
+        popup.style.left = r.left + r.width / 2 + "px";
+        popup.style.bottom = window.innerHeight - r.top + 8 + "px";
+        popup.classList.add("show");
+      }
+    });
+    // Close when clicking outside
+    document.addEventListener("click", () => popup.classList.remove("show"));
+    popup.addEventListener("click", (e) => e.stopPropagation());
+    return sig;
+  }
+
+  const cfgSig = buildSignature();
 
   cfgActions.appendChild(saveWrap);
   cfgActions.appendChild(loadWrap);
   cfgActions.appendChild(btnResetCfg);
-  cfgActions.appendChild(btnCfgAi);
+  cfgActions.appendChild(btnCfgRecommend);
+  cfgActions.appendChild(btnCfgAdv);
   cfgActions.appendChild(cfgCounter);
-  cfgActions.appendChild(cfgAiResp);
+  cfgActions.appendChild(cfgAdvResp);
   cfgActions.appendChild(cfgSig);
   tabCfg.appendChild(cfgActions);
 
@@ -4948,15 +6460,15 @@ function build() {
   btnHwRefresh.textContent = "Scan Hardware";
   btnHwRefresh.title = "Detect hardware via WMI";
   btnHwRefresh.addEventListener("click", refreshHardwareInfo);
-  const btnHwAi = document.createElement("button");
-  btnHwAi.className = "btn-ai";
-  btnHwAi.innerHTML = "🤖 AI Analysis";
-  btnHwAi.title = "AI bottleneck analysis + upgrade tips";
+  const btnHwAdv = document.createElement("button");
+  btnHwAdv.className = "btn-adv";
+  btnHwAdv.innerHTML = "🔍 Analysis";
+  btnHwAdv.title = "Hardware bottleneck analysis + upgrade suggestions — requires Advisor key configured";
   const hwInfo = document.createElement("span");
   hwInfo.style.cssText = "font-size:10px;opacity:0.5;";
   hwInfo.textContent = "Reads CPU, GPU, RAM, disk, HAGS, ReBAR via PowerShell WMI";
   hwHeader.appendChild(btnHwRefresh);
-  hwHeader.appendChild(btnHwAi);
+  hwHeader.appendChild(btnHwAdv);
   const hwShareBar = buildShareBar(() => {
     const hwText = document.getElementById("hw-content")?.textContent || "No data";
     return { title: "aim.camp Player Agent — Hardware Specs", text: hwText.slice(0, 500), fields: [] };
@@ -4971,15 +6483,15 @@ function build() {
   hwContent.innerHTML = '<div class="net-status">Click "Scan Hardware" to detect your system</div>';
   tabHw.appendChild(hwContent);
 
-  const hwAiResp = document.createElement("div");
-  hwAiResp.className = "ai-response";
-  hwAiResp.id = "hw-ai-response";
-  hwAiResp.style.margin = "0 12px";
-  tabHw.appendChild(hwAiResp);
+  const hwAdvResp = document.createElement("div");
+  hwAdvResp.className = "adv-response";
+  hwAdvResp.id = "hw-adv-response";
+  hwAdvResp.style.margin = "0 12px";
+  tabHw.appendChild(hwAdvResp);
 
-  btnHwAi.addEventListener("click", async () => {
-    if (!hasAiKey()) {
-      showAiModal();
+  btnHwAdv.addEventListener("click", async () => {
+    if (!hasAdvKey()) {
+      showAdvModal();
       return;
     }
     const hwText = document.getElementById("hw-content")?.textContent || "";
@@ -4987,24 +6499,21 @@ function build() {
       toast("Scan hardware first", true);
       return;
     }
-    btnHwAi.disabled = true;
-    hwAiResp.innerHTML = '<div class="ai-loading">Analyzing hardware...</div>';
+    btnHwAdv.disabled = true;
+    hwAdvResp.innerHTML = '<div class="adv-loading">Analyzing hardware...</div>';
     try {
-      const result = await aiChat(AI_PROMPTS.hw, hwText);
-      hwAiResp.innerHTML = mdToHtml(result);
+      const result = await advChat(ADV_PROMPTS.hw, hwText);
+      hwAdvResp.innerHTML = mdToHtml(result);
     } catch (e) {
-      hwAiResp.innerHTML = `<span style="color:#ef4444">Error: ${e}</span>`;
+      hwAdvResp.innerHTML = `<span style="color:#ef4444">Error: ${e}</span>`;
     }
-    btnHwAi.disabled = false;
+    btnHwAdv.disabled = false;
   });
 
   const hwSig = document.createElement("section");
   hwSig.className = "cfg-actions";
   hwSig.style.marginTop = "auto";
-  const hwSigText = document.createElement("div");
-  hwSigText.className = "app-signature";
-  hwSigText.innerHTML = `<span class="sig-by">by</span> <span class="sig-name">Rqdiniz</span> <span class="sig-tag">[ bu- ]</span>`;
-  hwSig.appendChild(hwSigText);
+  hwSig.appendChild(buildSignature());
   tabHw.appendChild(hwSig);
 
   /* ── Tab: Drivers ────────────────────────────────────────────── */
@@ -5017,12 +6526,12 @@ function build() {
   drvHeader.style.cssText = "display:flex;gap:8px;padding:10px 12px;align-items:center;";
   const btnDrvRefresh = document.createElement("button");
   btnDrvRefresh.className = "btn-export";
-  btnDrvRefresh.textContent = "Analisar Drivers";
-  btnDrvRefresh.title = "Analisar drivers do sistema e periféricos via WMI";
+  btnDrvRefresh.textContent = "Analyze Drivers";
+  btnDrvRefresh.title = "Analyze system and peripheral drivers via WMI";
   btnDrvRefresh.addEventListener("click", refreshDriverInfo);
   const drvInfo = document.createElement("span");
   drvInfo.style.cssText = "font-size:10px;opacity:0.5;";
-  drvInfo.textContent = "Detecta drivers GPU, áudio, rede, rato, teclado e controladores. Verifica se são genéricos ou do fabricante.";
+  drvInfo.textContent = "Detects GPU, audio, network, mouse, keyboard and controller drivers. Checks if they are generic or from the manufacturer.";
   drvHeader.appendChild(btnDrvRefresh);
   drvHeader.appendChild(drvInfo);
   tabDrv.appendChild(drvHeader);
@@ -5030,16 +6539,13 @@ function build() {
   const drvContent = document.createElement("div");
   drvContent.id = "drv-content";
   drvContent.style.cssText = "padding:0;flex:1;overflow-y:auto;";
-  drvContent.innerHTML = '<div class="net-status">Clique "Analisar Drivers" para verificar os drivers do seu sistema</div>';
+  drvContent.innerHTML = '<div class="net-status">Click "Analyze Drivers" to check your system drivers</div>';
   tabDrv.appendChild(drvContent);
 
   const drvSig = document.createElement("section");
   drvSig.className = "cfg-actions";
   drvSig.style.marginTop = "auto";
-  const drvSigText = document.createElement("div");
-  drvSigText.className = "app-signature";
-  drvSigText.innerHTML = `<span class="sig-by">by</span> <span class="sig-name">Rqdiniz</span> <span class="sig-tag">[ bu- ]</span>`;
-  drvSig.appendChild(drvSigText);
+  drvSig.appendChild(buildSignature());
   tabDrv.appendChild(drvSig);
 
   /* ── Tab: Process Manager ────────────────────────────────────── */
@@ -5054,15 +6560,15 @@ function build() {
   btnProcRefresh.textContent = "Refresh Processes";
   btnProcRefresh.title = "List top 40 processes by RAM usage";
   btnProcRefresh.addEventListener("click", refreshProcesses);
-  const btnProcAi = document.createElement("button");
-  btnProcAi.className = "btn-ai";
-  btnProcAi.innerHTML = "🤖 AI Analyze";
-  btnProcAi.title = "AI identifies safe-to-kill processes";
+  const btnProcAdv = document.createElement("button");
+  btnProcAdv.className = "btn-adv";
+  btnProcAdv.innerHTML = "🔍 Analyze";
+  btnProcAdv.title = "Identifies resource-heavy and safe-to-kill processes — requires Advisor key configured";
   const procInfo = document.createElement("span");
   procInfo.style.cssText = "font-size:10px;opacity:0.5;";
   procInfo.textContent = "Shows top 40 processes (>10MB RAM). Yellow = known resource hog.";
   procHeader.appendChild(btnProcRefresh);
-  procHeader.appendChild(btnProcAi);
+  procHeader.appendChild(btnProcAdv);
   const procShareBar = buildShareBar(() => {
     const procText = document.getElementById("proc-list")?.textContent || "No data";
     return { title: "aim.camp Player Agent — Process List", text: procText.slice(0, 500), fields: [] };
@@ -5082,15 +6588,15 @@ function build() {
   procList.innerHTML = '<div class="net-status">Click "Refresh Processes" to scan</div>';
   tabProc.appendChild(procList);
 
-  const procAiResp = document.createElement("div");
-  procAiResp.className = "ai-response";
-  procAiResp.id = "proc-ai-response";
-  procAiResp.style.margin = "0 12px";
-  tabProc.appendChild(procAiResp);
+  const procAdvResp = document.createElement("div");
+  procAdvResp.className = "adv-response";
+  procAdvResp.id = "proc-adv-response";
+  procAdvResp.style.margin = "0 12px";
+  tabProc.appendChild(procAdvResp);
 
-  btnProcAi.addEventListener("click", async () => {
-    if (!hasAiKey()) {
-      showAiModal();
+  btnProcAdv.addEventListener("click", async () => {
+    if (!hasAdvKey()) {
+      showAdvModal();
       return;
     }
     const procText = document.getElementById("proc-list")?.textContent || "";
@@ -5098,24 +6604,21 @@ function build() {
       toast("Refresh processes first", true);
       return;
     }
-    btnProcAi.disabled = true;
-    procAiResp.innerHTML = '<div class="ai-loading">Analyzing processes...</div>';
+    btnProcAdv.disabled = true;
+    procAdvResp.innerHTML = '<div class="adv-loading">Analyzing processes...</div>';
     try {
-      const result = await aiChat(AI_PROMPTS.proc, procText);
-      procAiResp.innerHTML = mdToHtml(result);
+      const result = await advChat(ADV_PROMPTS.proc, procText);
+      procAdvResp.innerHTML = mdToHtml(result);
     } catch (e) {
-      procAiResp.innerHTML = `<span style="color:#ef4444">Error: ${e}</span>`;
+      procAdvResp.innerHTML = `<span style="color:#ef4444">Error: ${e}</span>`;
     }
-    btnProcAi.disabled = false;
+    btnProcAdv.disabled = false;
   });
 
   const procSig = document.createElement("section");
   procSig.className = "cfg-actions";
   procSig.style.marginTop = "auto";
-  const procSigText = document.createElement("div");
-  procSigText.className = "app-signature";
-  procSigText.innerHTML = `<span class="sig-by">by</span> <span class="sig-name">Rqdiniz</span> <span class="sig-tag">[ bu- ]</span>`;
-  procSig.appendChild(procSigText);
+  procSig.appendChild(buildSignature());
   tabProc.appendChild(procSig);
 
   /* ── Tab: Network Diagnostics ────────────────────────────────── */
@@ -5130,15 +6633,15 @@ function build() {
   btnPingAll.textContent = "Ping All Servers";
   btnPingAll.title = "Ping Valve + FACEIT + DNS servers";
   btnPingAll.addEventListener("click", runPingTests);
-  const btnNetAi = document.createElement("button");
-  btnNetAi.className = "btn-ai";
-  btnNetAi.innerHTML = "🤖 AI Diagnose";
-  btnNetAi.title = "AI network quality analysis";
+  const btnNetAdv = document.createElement("button");
+  btnNetAdv.className = "btn-adv";
+  btnNetAdv.innerHTML = "🔍 Diagnose";
+  btnNetAdv.title = "Network quality and latency diagnosis — requires Advisor key configured";
   const netInfo = document.createElement("span");
   netInfo.style.cssText = "font-size:10px;opacity:0.5;";
   netInfo.textContent = "Pings 10 servers (Valve, FACEIT, DNS). Takes ~40 seconds.";
   netHeader.appendChild(btnPingAll);
-  netHeader.appendChild(btnNetAi);
+  netHeader.appendChild(btnNetAdv);
   const netShareBar = buildShareBar(() => {
     const netText = document.getElementById("net-results")?.textContent || "No data";
     return { title: "aim.camp Player Agent — Network Ping Results", text: netText.slice(0, 500), fields: [] };
@@ -5154,15 +6657,15 @@ function build() {
   netResults.innerHTML = '<div class="net-status">Click "Ping All Servers" to test latency</div>';
   tabNet.appendChild(netResults);
 
-  const netAiResp = document.createElement("div");
-  netAiResp.className = "ai-response";
-  netAiResp.id = "net-ai-response";
-  netAiResp.style.margin = "0 12px";
-  tabNet.appendChild(netAiResp);
+  const netAdvResp = document.createElement("div");
+  netAdvResp.className = "adv-response";
+  netAdvResp.id = "net-adv-response";
+  netAdvResp.style.margin = "0 12px";
+  tabNet.appendChild(netAdvResp);
 
-  btnNetAi.addEventListener("click", async () => {
-    if (!hasAiKey()) {
-      showAiModal();
+  btnNetAdv.addEventListener("click", async () => {
+    if (!hasAdvKey()) {
+      showAdvModal();
       return;
     }
     const netText = document.getElementById("net-results")?.textContent || "";
@@ -5170,24 +6673,21 @@ function build() {
       toast("Run ping tests first", true);
       return;
     }
-    btnNetAi.disabled = true;
-    netAiResp.innerHTML = '<div class="ai-loading">Analyzing network...</div>';
+    btnNetAdv.disabled = true;
+    netAdvResp.innerHTML = '<div class="adv-loading">Analyzing network...</div>';
     try {
-      const result = await aiChat(AI_PROMPTS.net, netText);
-      netAiResp.innerHTML = mdToHtml(result);
+      const result = await advChat(ADV_PROMPTS.net, netText);
+      netAdvResp.innerHTML = mdToHtml(result);
     } catch (e) {
-      netAiResp.innerHTML = `<span style="color:#ef4444">Error: ${e}</span>`;
+      netAdvResp.innerHTML = `<span style="color:#ef4444">Error: ${e}</span>`;
     }
-    btnNetAi.disabled = false;
+    btnNetAdv.disabled = false;
   });
 
   const netSig = document.createElement("section");
   netSig.className = "cfg-actions";
   netSig.style.marginTop = "auto";
-  const netSigText = document.createElement("div");
-  netSigText.className = "app-signature";
-  netSigText.innerHTML = `<span class="sig-by">by</span> <span class="sig-name">Rqdiniz</span> <span class="sig-tag">[ bu- ]</span>`;
-  netSig.appendChild(netSigText);
+  netSig.appendChild(buildSignature());
   tabNet.appendChild(netSig);
 
   /* ── Tab: Demo Review ────────────────────────────────────────── */
@@ -5268,7 +6768,11 @@ function build() {
     const el = document.createElement("div");
     el.className = `demo-tip priority-${tip.priority}`;
     el.title = tip.detail;
-    const prioLabel = tip.priority === "critical" ? "MUST" : tip.priority === "high" ? "CHECK" : tip.priority === "medium" ? "WEEKLY" : "AWARE";
+    let prioLabel: string;
+    if (tip.priority === "critical") prioLabel = "MUST";
+    else if (tip.priority === "high") prioLabel = "CHECK";
+    else if (tip.priority === "medium") prioLabel = "WEEKLY";
+    else prioLabel = "AWARE";
     const prioClass = `prio-${tip.priority}`;
     el.innerHTML = `<span class="dt-icon">${tip.icon}</span><div class="dt-body"><span class="dt-title">${tip.title}</span> <span class="dt-desc">${tip.desc}</span></div><span class="dt-prio ${prioClass}">${prioLabel}</span>`;
     tipsContainer.appendChild(el);
@@ -5281,44 +6785,41 @@ function build() {
   const demoSig = document.createElement("section");
   demoSig.className = "cfg-actions";
   demoSig.style.marginTop = "auto";
-  const demoSigText = document.createElement("div");
-  demoSigText.className = "app-signature";
-  demoSigText.innerHTML = `<span class="sig-by">by</span> <span class="sig-name">Rqdiniz</span> <span class="sig-tag">[ bu- ]</span>`;
-  demoSig.appendChild(demoSigText);
+  demoSig.appendChild(buildSignature());
   tabDemo.appendChild(demoSig);
 
   // auto-load saved folder (fallback to test-demos for dev)
   const savedDemoFolder = localStorage.getItem("csmooth_demo_folder");
-  const defaultDemoFolder = "D:\\Projetos\\CSmooth\\test-demos";
+  const defaultDemoFolder = String.raw`D:\Projetos\CSmooth\test-demos`;
   const folderToLoad = savedDemoFolder || defaultDemoFolder;
   setTimeout(() => scanDemoFolder(folderToLoad), 100);
 
   /* ── Community Placeholder Tabs ────────────────────────────────── */
-  function buildPlaceholder(id: string, icon: string, title: string, subtitle: string, desc: string, features: string[], integrations: string[], eta: string): HTMLElement {
+  function buildPlaceholder(opts: { id: string; icon: string; title: string; subtitle: string; desc: string; features: string[]; integrations: string[]; eta: string }): HTMLElement {
     const tab = document.createElement("div");
-    tab.id = id;
+    tab.id = opts.id;
     tab.className = "tab-panel";
     tab.innerHTML = `
       <div class="placeholder-panel">
-        <div class="placeholder-badge">EM DESENVOLVIMENTO</div>
-        <div class="placeholder-icon">${icon}</div>
-        <div class="placeholder-title">${title}</div>
-        <div class="placeholder-subtitle">${subtitle}</div>
-        <div class="placeholder-desc">${desc}</div>
+        <div class="placeholder-badge">IN DEVELOPMENT</div>
+        <div class="placeholder-icon">${opts.icon}</div>
+        <div class="placeholder-title">${opts.title}</div>
+        <div class="placeholder-subtitle">${opts.subtitle}</div>
+        <div class="placeholder-desc">${opts.desc}</div>
         <div class="placeholder-section-label">Features</div>
         <div class="placeholder-features">
-          ${features.map((f) => `<span class="placeholder-chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>${f}</span>`).join("")}
+          ${opts.features.map((f) => `<span class="placeholder-chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>${f}</span>`).join("")}
         </div>
-        <div class="placeholder-section-label">Integrações</div>
+        <div class="placeholder-section-label">Integrations</div>
         <div class="placeholder-integrations">
-          ${integrations.map((i) => `<span class="placeholder-integration">${i}</span>`).join("")}
+          ${opts.integrations.map((i) => `<span class="placeholder-integration">${i}</span>`).join("")}
         </div>
-        <div class="placeholder-eta">${eta}</div>
+        <div class="placeholder-eta">${opts.eta}</div>
       </div>`;
     return tab;
   }
 
-  /* ── Tab: Feedback & Sugestões ───────────────────────────────── */
+  /* ── Tab: Feedback & Suggestions ──────────────────────────────── */
   const tabFdbk = document.createElement("div");
   tabFdbk.id = "tab-fdbk";
   tabFdbk.className = "tab-panel";
@@ -5329,8 +6830,8 @@ function build() {
 
   const btnFdbkNew = document.createElement("button");
   btnFdbkNew.className = "btn-export";
-  btnFdbkNew.textContent = "📝 Nova Sugestão";
-  btnFdbkNew.title = "Abrir formulário de feedback";
+  btnFdbkNew.textContent = "📝 New Suggestion";
+  btnFdbkNew.title = "Open feedback form";
   btnFdbkNew.addEventListener("click", async () => {
     const b64 = await captureAppScreenshot();
     showFeedbackModal(b64);
@@ -5338,25 +6839,25 @@ function build() {
 
   const btnFdbkRefresh = document.createElement("button");
   btnFdbkRefresh.className = "btn-import";
-  btnFdbkRefresh.textContent = "🔄 Atualizar";
-  btnFdbkRefresh.title = "Recarregar histórico";
+  btnFdbkRefresh.textContent = "🔄 Refresh";
+  btnFdbkRefresh.title = "Reload history";
   btnFdbkRefresh.addEventListener("click", refreshFeedbackHistory);
 
   const btnFdbkGhCfg = document.createElement("button");
   btnFdbkGhCfg.className = "btn-import";
   btnFdbkGhCfg.textContent = "🐙 GitHub";
-  btnFdbkGhCfg.title = "Configurar GitHub";
+  btnFdbkGhCfg.title = "Configure GitHub";
   btnFdbkGhCfg.addEventListener("click", showGitHubConfigModal);
 
   const btnFdbkDiscordCfg = document.createElement("button");
   btnFdbkDiscordCfg.className = "btn-import";
   btnFdbkDiscordCfg.textContent = "🎮 Discord";
-  btnFdbkDiscordCfg.title = "Configurar Discord Webhook";
+  btnFdbkDiscordCfg.title = "Configure Discord Webhook";
   btnFdbkDiscordCfg.addEventListener("click", () => showDiscordModal());
 
   const fdbkInfo = document.createElement("span");
   fdbkInfo.style.cssText = "font-size:10px;opacity:0.5;flex:1;";
-  fdbkInfo.textContent = "Clique direito em qualquer parte da app para enviar feedback rápido.";
+  fdbkInfo.textContent = "Right-click anywhere in the app to send quick feedback.";
 
   fdbkToolbar.appendChild(btnFdbkNew);
   fdbkToolbar.appendChild(btnFdbkRefresh);
@@ -5369,16 +6870,13 @@ function build() {
   fdbkHistory.id = "fdbk-history";
   fdbkHistory.style.cssText = "padding:8px 12px;flex:1;overflow-y:auto;";
   fdbkHistory.innerHTML =
-    '<div class="fdbk-empty"><div class="fdbk-empty-icon">📝</div><div class="fdbk-empty-text">Sem feedback registado</div><div class="fdbk-empty-hint">Clique direito em qualquer parte da app para enviar sugestões, ou usa o botão acima.</div></div>';
+    '<div class="fdbk-empty"><div class="fdbk-empty-icon">📝</div><div class="fdbk-empty-text">No feedback recorded</div><div class="fdbk-empty-hint">Right-click anywhere in the app to send suggestions, or use the button above.</div></div>';
   tabFdbk.appendChild(fdbkHistory);
 
   const fdbkSig = document.createElement("section");
   fdbkSig.className = "cfg-actions";
   fdbkSig.style.marginTop = "auto";
-  const fdbkSigText = document.createElement("div");
-  fdbkSigText.className = "app-signature";
-  fdbkSigText.innerHTML = `<span class="sig-by">by</span> <span class="sig-name">Rqdiniz</span> <span class="sig-tag">[ bu- ]</span>`;
-  fdbkSig.appendChild(fdbkSigText);
+  fdbkSig.appendChild(buildSignature());
   tabFdbk.appendChild(fdbkSig);
 
   /* ── Tab: Benchmark / Frame Analysis ─────────────────────────── */
@@ -5392,32 +6890,32 @@ function build() {
 
   const btnBenchImport = document.createElement("button");
   btnBenchImport.className = "btn-export";
-  btnBenchImport.textContent = "📂 Importar CSV/JSON";
-  btnBenchImport.title = "Importar ficheiro PresentMon CSV ou CapFrameX JSON";
+  btnBenchImport.textContent = "📂 Import CSV/JSON";
+  btnBenchImport.title = "Import PresentMon CSV or CapFrameX JSON file";
   btnBenchImport.addEventListener("click", importBenchmarkFile);
 
   const btnBenchCX = document.createElement("button");
   btnBenchCX.className = "btn-import";
   btnBenchCX.textContent = "📦 CapFrameX";
-  btnBenchCX.title = "Procurar capturas CapFrameX";
+  btnBenchCX.title = "Search for CapFrameX captures";
   btnBenchCX.addEventListener("click", scanCapFrameX);
 
   const btnBenchClear = document.createElement("button");
   btnBenchClear.className = "btn-import";
-  btnBenchClear.textContent = "🗑 Limpar";
-  btnBenchClear.title = "Limpar dados de benchmark";
+  btnBenchClear.textContent = "🗑 Clear";
+  btnBenchClear.title = "Clear benchmark data";
   btnBenchClear.addEventListener("click", () => {
     benchHistory.length = 0;
     _currentBenchResult = null;
     const el = document.getElementById("bench-content");
     if (el)
       el.innerHTML =
-        '<div class="bench-empty"><div class="bench-empty-icon">📊</div><div class="bench-empty-title">Benchmark & Frame Analysis</div><div class="bench-empty-desc">Importa um ficheiro PresentMon (.csv) ou CapFrameX (.json) para analisar frame times, FPS e stutters do teu sistema em CS2.</div><div class="bench-empty-hint">Alternativa leve ao CapFrameX — analisa os mesmos dados com métricas completas e gráficos interativos.</div><div class="bench-compat"><span class="bench-compat-item">✅ PresentMon CSV</span><span class="bench-compat-item">✅ CapFrameX JSON</span><span class="bench-compat-item">✅ OCAT CSV</span><span class="bench-compat-item">✅ FrameView CSV</span></div></div>';
+        '<div class="bench-empty"><div class="bench-empty-icon">📊</div><div class="bench-empty-title">Benchmark & Frame Analysis</div><div class="bench-empty-desc">Import a PresentMon (.csv) or CapFrameX (.json) file to analyze frame times, FPS and stutters of your system in CS2.</div><div class="bench-empty-hint">Lightweight alternative to CapFrameX — analyzes the same data with full metrics and interactive charts.</div><div class="bench-compat"><span class="bench-compat-item">✅ PresentMon CSV</span><span class="bench-compat-item">✅ CapFrameX JSON</span><span class="bench-compat-item">✅ OCAT CSV</span><span class="bench-compat-item">✅ FrameView CSV</span></div></div>';
   });
 
   const benchInfo = document.createElement("span");
   benchInfo.style.cssText = "font-size:10px;opacity:0.5;flex:1;";
-  benchInfo.textContent = "Compatível com PresentMon, CapFrameX, OCAT e FrameView. Análise de frame times, FPS, percentis e stutters.";
+  benchInfo.textContent = "Compatible with PresentMon, CapFrameX, OCAT and FrameView. Frame time, FPS, percentile and stutter analysis.";
 
   benchToolbar.appendChild(btnBenchImport);
   benchToolbar.appendChild(btnBenchCX);
@@ -5429,66 +6927,182 @@ function build() {
   benchContent.id = "bench-content";
   benchContent.style.cssText = "padding:0 12px;flex:1;overflow-y:auto;";
   benchContent.innerHTML =
-    '<div class="bench-empty"><div class="bench-empty-icon">📊</div><div class="bench-empty-title">Benchmark & Frame Analysis</div><div class="bench-empty-desc">Importa um ficheiro PresentMon (.csv) ou CapFrameX (.json) para analisar frame times, FPS e stutters do teu sistema em CS2.</div><div class="bench-empty-hint">Alternativa leve ao CapFrameX — analisa os mesmos dados com métricas completas e gráficos interativos.</div><div class="bench-compat"><span class="bench-compat-item">✅ PresentMon CSV</span><span class="bench-compat-item">✅ CapFrameX JSON</span><span class="bench-compat-item">✅ OCAT CSV</span><span class="bench-compat-item">✅ FrameView CSV</span></div></div>';
+    '<div class="bench-empty"><div class="bench-empty-icon">📊</div><div class="bench-empty-title">Benchmark & Frame Analysis</div><div class="bench-empty-desc">Import a PresentMon (.csv) or CapFrameX (.json) file to analyze frame times, FPS and stutters on your CS2 system.</div><div class="bench-empty-hint">Lightweight alternative to CapFrameX — analyzes the same data with full metrics and interactive charts.</div><div class="bench-compat"><span class="bench-compat-item">✅ PresentMon CSV</span><span class="bench-compat-item">✅ CapFrameX JSON</span><span class="bench-compat-item">✅ OCAT CSV</span><span class="bench-compat-item">✅ FrameView CSV</span></div></div>';
   tabBench.appendChild(benchContent);
 
   const benchSig = document.createElement("section");
   benchSig.className = "cfg-actions";
   benchSig.style.marginTop = "auto";
-  const benchSigText = document.createElement("div");
-  benchSigText.className = "app-signature";
-  benchSigText.innerHTML = `<span class="sig-by">by</span> <span class="sig-name">Rqdiniz</span> <span class="sig-tag">[ bu- ]</span>`;
-  benchSig.appendChild(benchSigText);
+  benchSig.appendChild(buildSignature());
   tabBench.appendChild(benchSig);
 
-  const tabRank = buildPlaceholder(
-    "tab-rank",
-    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>',
-    "RANKINGS & STATS",
-    "ELO \u00b7 Leaderboards \u00b7 Conquistas",
-    "Rankings globais e mensais, ELO tracking, stats por mapa e modo, conquistas desbloqueáveis e perfis de jogador com histórico de partidas. Login via Steam, Discord ou FACEIT.",
-    ["ELO Tracker", "Leaderboard Global", "Stats por Mapa", "Conquistas & Badges", "Match History", "Player Profiles"],
-    ["OAuth Steam", "OAuth Discord", "FACEIT API", "Node.js Backend"],
-    "Integra\u00E7\u00E3o OAuth + FACEIT Data API \u2014 em desenvolvimento",
-  );
+  const tabRank = buildPlaceholder({
+    id: "tab-rank",
+    icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>',
+    title: "RANKINGS & STATS",
+    subtitle: "ELO \u00b7 Leaderboards \u00b7 Achievements",
+    desc: "Global and monthly rankings, ELO tracking, stats per map and mode, unlockable achievements and player profiles with match history. Login via Steam, Discord or FACEIT.",
+    features: ["ELO Tracker", "Global Leaderboard", "Map Stats", "Achievements & Badges", "Match History", "Player Profiles"],
+    integrations: ["OAuth Steam", "OAuth Discord", "FACEIT API", "Node.js Backend"],
+    eta: "OAuth + FACEIT Data API integration \u2014 in development",
+  });
 
-  const tabServers = buildPlaceholder(
-    "tab-servers",
-    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>',
-    "MATCH & SERVERS",
-    "Criar Partida \u00b7 5v5 \u00b7 Retakes \u00b7 Live Status",
-    "Lança servidores CS2 diretamente via Discord Bot. Modos 5v5 competitivo e Retakes com auto team balancing, criação de canais de voz e info privada por jogador. Monitorização em tempo real.",
-    ["Criar Partida via Bot", "5v5 Competitivo", "Retakes Mode", "Auto Team Balancing", "Server Status Live", "Quick Connect"],
-    ["Discord Bot", "Docker + SteamCMD", "WebSocket", "Prometheus"],
-    "Infraestrutura Docker + SteamCMD + Discord Bot \u2014 em desenvolvimento",
-  );
+  const tabServers = buildPlaceholder({
+    id: "tab-servers",
+    icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>',
+    title: "MATCH & SERVERS",
+    subtitle: "Create Match \u00b7 5v5 \u00b7 Retakes \u00b7 Live Status",
+    desc: "Launch CS2 servers directly via Discord Bot. Competitive 5v5 and Retakes modes with auto team balancing, voice channel creation and private player info. Real-time monitoring.",
+    features: ["Create Match via Bot", "5v5 Competitive", "Retakes Mode", "Auto Team Balancing", "Server Status Live", "Quick Connect"],
+    integrations: ["Discord Bot", "Docker + SteamCMD", "WebSocket", "Prometheus"],
+    eta: "Docker + SteamCMD + Discord Bot infrastructure \u2014 in development",
+  });
 
-  const tabMarket = buildPlaceholder(
-    "tab-market",
-    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>',
-    "ITEM TRACKER",
-    "Inventário \u00b7 Preços \u00b7 Watchlist \u00b7 Alertas",
-    "Monitoriza o teu inventário Steam CS2, acompanha o histórico de preços de skins, cria watchlists com alertas de preço e analisa tendências do mercado. Informação em tempo real.",
-    ["Steam Inventory", "Price History", "Watchlist & Alertas", "Market Trends", "Trade Tracker", "Float & Wear"],
-    ["Steam Web API", "WebSocket Real-time", "Node.js Backend", "React Frontend"],
-    "Integra\u00E7\u00E3o Steam Web API + Price Tracking \u2014 em desenvolvimento",
-  );
+  const tabMarket = buildPlaceholder({
+    id: "tab-market",
+    icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>',
+    title: "ITEM TRACKER",
+    subtitle: "Inventory \u00b7 Prices \u00b7 Watchlist \u00b7 Alerts",
+    desc: "Monitor your Steam CS2 inventory, track skin price history, create watchlists with price alerts and analyze market trends. Real-time data.",
+    features: ["Steam Inventory", "Price History", "Watchlist & Alerts", "Market Trends", "Trade Tracker", "Float & Wear"],
+    integrations: ["Steam Web API", "WebSocket Real-time", "Node.js Backend", "React Frontend"],
+    eta: "Steam Web API + Price Tracking integration \u2014 in development",
+  });
 
-  const tabHub = buildPlaceholder(
-    "tab-hub",
-    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>',
-    "AIM.CAMP HUB",
-    "Wiki \u00b7 Eventos \u00b7 Discord \u00b7 Feedback",
-    "Portal central da comunidade aim.camp: wiki com guias e strats, calendário de eventos e torneios, bridge com Discord, sistema de feedback e sugestões. Conhecimento partilhado por todos.",
-    ["Wiki & Guias", "Evento Calendar", "Discord Bridge", "Feedback System", "Torneios", "Member Profiles"],
-    ["Discord OAuth", "React SPA", "WebSocket", "Grafana Dashboards"],
-    "Community platform aim.camp \u2014 em desenvolvimento",
-  );
+  const tabHub = buildPlaceholder({
+    id: "tab-hub",
+    icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>',
+    title: "AIM.CAMP HUB",
+    subtitle: "Wiki \u00b7 Events \u00b7 Discord \u00b7 Feedback",
+    desc: "Central community hub for aim.camp: wiki with guides and strats, event and tournament calendar, Discord bridge, feedback and suggestions system. Knowledge shared by everyone.",
+    features: ["Wiki & Guides", "Event Calendar", "Discord Bridge", "Feedback System", "Tournaments", "Member Profiles"],
+    integrations: ["Discord OAuth", "React SPA", "WebSocket", "Grafana Dashboards"],
+    eta: "Community platform aim.camp \u2014 in development",
+  });
+
+  /* ── Tab: Config (merges SYS + CFG) ─────────────────────────── */
+  const tabConfig = document.createElement("div");
+  tabConfig.id = "tab-config";
+  tabConfig.className = "tab-panel active";
+  const configSub = buildSubTabs(["🖥 SYS", "⚙️ CFG"], cfgEditGuard);
+  configSub.panels[0].appendChild(tabSys);
+  configSub.panels[1].appendChild(tabCfg);
+
+  /* ── Schema bar (above SYS/CFG sub-tabs) ─────────────────── */
+  const schemaBar = document.createElement("div");
+  schemaBar.className = "config-schema-bar";
+
+  const schemaLabel = document.createElement("span");
+  schemaLabel.className = "config-schema-label";
+  schemaLabel.textContent = "📋 Schema:";
+
+  /* Inline schema action buttons */
+  const btnSchemaSave = document.createElement("button");
+  btnSchemaSave.className = "schema-bar-btn";
+  btnSchemaSave.innerHTML = "💾 Save";
+  btnSchemaSave.title = "Save current settings to the selected schema";
+  btnSchemaSave.addEventListener("click", () => {
+    const schema = getActiveSchema();
+    if (!schema) { toast("No schema selected"); return; }
+    saveSchemaValues(schema.id, collectFullState());
+    toast(`Schema "${schema.name}" saved ✔`);
+  });
+
+  const btnSchemaLoad = document.createElement("button");
+  btnSchemaLoad.className = "schema-bar-btn";
+  btnSchemaLoad.innerHTML = "📂 Load";
+  btnSchemaLoad.title = "Load the selected schema — restores all values and layout";
+  btnSchemaLoad.addEventListener("click", () => {
+    const schema = getActiveSchema();
+    if (!schema) { toast("No schema selected"); return; }
+    rebuildCfgLayout();
+    toast(`Schema "${schema.name}" loaded ✔`);
+  });
+
+  const btnSchemaRename = document.createElement("button");
+  btnSchemaRename.className = "schema-bar-btn";
+  btnSchemaRename.innerHTML = "✏️ Rename";
+  btnSchemaRename.title = "Rename the selected schema";
+  btnSchemaRename.addEventListener("click", async () => {
+    const schema = getActiveSchema();
+    if (!schema) { toast("No schema selected"); return; }
+    const newName = await showInputModal("Rename Schema", schema.name);
+    if (!newName) return;
+    renameSchema(schema.id, newName);
+    refreshProfileDropdown();
+    toast(`Renamed to "${newName}" ✔`);
+  });
+
+  const btnSchemaDelete = document.createElement("button");
+  btnSchemaDelete.className = "schema-bar-btn schema-bar-btn-del";
+  btnSchemaDelete.innerHTML = "🗑️ Delete";
+  btnSchemaDelete.title = "Delete the selected schema";
+  btnSchemaDelete.addEventListener("click", async () => {
+    const schema = getActiveSchema();
+    if (!schema) { toast("No schema selected"); return; }
+    const ok = await showConfirmModal("Delete Schema", `Are you sure you want to delete <strong>${schema.name}</strong>?`);
+    if (!ok) return;
+    deleteSchema(schema.id);
+    const remaining = getSchemas();
+    if (remaining.length > 0) {
+      setActiveSchemaId(remaining[0].id);
+    } else {
+      const def = createDefaultSchema();
+      setActiveSchemaId(def.id);
+    }
+    refreshProfileDropdown();
+    rebuildCfgLayout();
+    toast(`Schema "${schema.name}" deleted`);
+  });
+
+  const btnSchemaNew = document.createElement("button");
+  btnSchemaNew.className = "schema-bar-btn schema-bar-btn-new";
+  btnSchemaNew.innerHTML = "+ New";
+  btnSchemaNew.title = "Create a new schema from current settings";
+  btnSchemaNew.addEventListener("click", async () => {
+    const trimmed = await showInputModal("New Schema", "E.g.: Competitive, Practice, AWP...");
+    if (!trimmed) return;
+    const existing = getSchemas().find((s) => s.name === trimmed);
+    if (existing) {
+      saveSchemaValues(existing.id, collectFullState());
+      setActiveSchemaId(existing.id);
+      toast(`Schema "${trimmed}" updated ✔`);
+    } else {
+      const currentActive = getActiveSchema();
+      const s = createSchema(trimmed);
+      if (currentActive) {
+        const allSchemas = getSchemas();
+        const newS = allSchemas.find((x) => x.id === s.id);
+        if (newS) {
+          newS.cfgLayout = structuredClone(currentActive.cfgLayout);
+          saveSchemas(allSchemas);
+        }
+      }
+      saveSchemaValues(s.id, collectFullState());
+      setActiveSchemaId(s.id);
+      toast(`Schema "${trimmed}" created ✔`);
+    }
+    refreshProfileDropdown();
+  });
+
+  schemaBar.appendChild(schemaLabel);
+  schemaBar.appendChild(profileSel);
+  schemaBar.appendChild(btnSchemaSave);
+  schemaBar.appendChild(btnSchemaLoad);
+  schemaBar.appendChild(btnSchemaRename);
+  schemaBar.appendChild(btnSchemaDelete);
+  schemaBar.appendChild(btnSchemaNew);
+  schemaBar.appendChild(btnCfgLayout);
+  schemaBar.appendChild(btnCfgLayoutSave);
+  schemaBar.appendChild(btnCfgLayoutCancel);
+
+  tabConfig.appendChild(schemaBar);
+  tabConfig.appendChild(configSub.bar);
+  for (const p of configSub.panels) tabConfig.appendChild(p);
 
   /* ── Assemble ────────────────────────────────────────────────── */
   container.appendChild(header);
-  container.appendChild(tabSys);
-  container.appendChild(tabCfg);
+  container.appendChild(tabConfig);
   container.appendChild(tabHw);
   container.appendChild(tabDrv);
   container.appendChild(tabProc);
@@ -5527,11 +7141,19 @@ build();
 const savedTheme = localStorage.getItem("csmooth_theme");
 if (savedTheme !== null) applyTheme(Number.parseInt(savedTheme, 10));
 
+// Restore last active schema values on startup
+(() => {
+  const activeSchema = getActiveSchema();
+  if (activeSchema?.values && Object.keys(activeSchema.values).length > 0) {
+    restoreFullState(activeSchema.values);
+  }
+})();
+
 refreshSystemState();
 
 // ── Auto-update check on startup ────────────────────────────────
+// Small delay to let the UI render first
 (async () => {
-  // Small delay to let the UI render first
   await new Promise((r) => setTimeout(r, 3000));
   try {
     const info = await invoke<{
@@ -5547,14 +7169,14 @@ refreshSystemState();
       error?: string;
     }>("check_for_update");
 
-    if (!info.update_available) return;
-
-    // Store last dismissed version to avoid nagging
-    const dismissed = localStorage.getItem("aimcamp_dismissed_version");
-    if (dismissed === info.latest_version) return;
-
-    showUpdateModal(info);
-  } catch (_) {
+    if (info.update_available) {
+      // Store last dismissed version to avoid nagging
+      const dismissed = localStorage.getItem("aimcamp_dismissed_version");
+      if (dismissed !== info.latest_version) {
+        showUpdateModal(info);
+      }
+    }
+  } catch {
     /* silent fail — no network is ok */
   }
 })();
@@ -5563,14 +7185,14 @@ function showUpdateModal(info: { current_version: string; latest_version: string
   const existing = document.querySelector(".update-overlay");
   if (existing) existing.remove();
 
-  const notes = (info.release_notes || "Sem notas de lançamento.").replace(/\n/g, "<br>").replace(/#{1,3}\s/g, "");
+  const notes = (info.release_notes || "No release notes.").replaceAll("\n", "<br>").replaceAll(/#{1,3}\s/g, "");
 
   const overlay = document.createElement("div");
   overlay.className = "update-overlay fdbk-overlay";
   overlay.innerHTML = `
     <div class="fdbk-modal update-modal" style="max-width:480px;">
       <div class="fdbk-modal-header">
-        <h3>🔄 Atualização Disponível</h3>
+        <h3>🔄 Update Available</h3>
         <button class="fdbk-close" id="update-close">&times;</button>
       </div>
       <div class="fdbk-modal-body" style="padding:16px;">
@@ -5582,20 +7204,20 @@ function showUpdateModal(info: { current_version: string; latest_version: string
         ${info.release_name ? `<div class="update-name">${info.release_name}</div>` : ""}
         <div class="update-notes">${notes}</div>
         <div class="update-preserve-msg">
-          ℹ️ Os teus dados (feedback, screenshots, configs, temas) são preservados automaticamente — ficam guardados em <code>%LOCALAPPDATA%</code>.
+          ℹ️ Your data (feedback, screenshots, configs, themes) is automatically preserved — stored in <code>%LOCALAPPDATA%</code>.
         </div>
         <div class="update-actions">
           <button class="update-btn update-btn-download" id="update-download">
-            ⬇️ Descarregar e Instalar
+            ⬇️ Download and Install
           </button>
           <a class="update-btn update-btn-github" href="${info.html_url}" target="_blank">
-            🐙 Ver no GitHub
+            🐙 View on GitHub
           </a>
           <button class="update-btn update-btn-skip" id="update-skip">
-            Ignorar esta versão
+            Skip this version
           </button>
           <button class="update-btn update-btn-later" id="update-later">
-            Mais tarde
+            Later
           </button>
         </div>
       </div>
@@ -5609,28 +7231,28 @@ function showUpdateModal(info: { current_version: string; latest_version: string
   document.getElementById("update-skip")!.addEventListener("click", () => {
     localStorage.setItem("aimcamp_dismissed_version", info.latest_version);
     overlay.remove();
-    toast("Versão ignorada. Serás notificado na próxima.");
+    toast("Version skipped. You'll be notified of the next one.");
   });
 
   document.getElementById("update-download")!.addEventListener("click", async () => {
     const btn = document.getElementById("update-download") as HTMLButtonElement;
     btn.disabled = true;
-    btn.textContent = "⏳ A descarregar...";
+    btn.textContent = "⏳ Downloading...";
     try {
       const url = info.msi_url || info.nsis_url;
       if (!url) {
-        toast("Nenhum instalador encontrado. Visita o GitHub.", true);
+        toast("No installer found. Visit GitHub.", true);
         return;
       }
       const path = await invoke<string>("download_update", { url });
-      btn.textContent = "🚀 A iniciar instalador...";
+      btn.textContent = "🚀 Starting installer...";
       await invoke("run_installer", { path });
-      toast("Instalador iniciado. A app vai fechar.");
+      toast("Installer started. The app will close.");
       setTimeout(() => window.close(), 2000);
     } catch (e) {
       toast(`Erro: ${e}`, true);
       btn.disabled = false;
-      btn.textContent = "⬇️ Descarregar e Instalar";
+      btn.textContent = "⬇️ Download and Install";
     }
   });
 

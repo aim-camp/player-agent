@@ -1305,6 +1305,108 @@ async fn pick_ps1_file() -> Result<String, String> {
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Schema ZIP: import a .zip containing schema.pla / sys.ps1 / game.cfg
+// ────────────────────────────────────────────────────────────────────
+#[derive(serde::Serialize)]
+struct SchemaZipContents {
+    pla: Option<String>,
+    ps1: Option<String>,
+    cfg: Option<String>,
+}
+
+#[tauri::command]
+async fn import_schema_zip() -> Result<SchemaZipContents, String> {
+    let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
+
+    FileDialogBuilder::new()
+        .add_filter("Schema Package", &["zip"])
+        .set_title("Import Schema Package (.zip)")
+        .pick_file(move |file_path| {
+            if let Some(path) = file_path {
+                let _ = tx.send(Some(path.to_string_lossy().to_string()));
+            } else {
+                let _ = tx.send(None);
+            }
+        });
+
+    let path = match rx.recv() {
+        Ok(Some(p)) => p,
+        Ok(None) => return Err("No file selected.".into()),
+        Err(_) => return Err("Dialog cancelled.".into()),
+    };
+
+    let file = File::open(&path).map_err(|e| format!("Cannot open ZIP: {}", e))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Invalid ZIP: {}", e))?;
+
+    let mut pla: Option<String> = None;
+    let mut ps1: Option<String> = None;
+    let mut cfg: Option<String> = None;
+
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| format!("ZIP entry error: {}", e))?;
+        let name = entry.name().to_lowercase();
+        let mut content = String::new();
+        entry.read_to_string(&mut content).map_err(|e| format!("Read error: {}", e))?;
+
+        if name.ends_with(".pla") {
+            pla = Some(content);
+        } else if name.ends_with(".ps1") {
+            ps1 = Some(content);
+        } else if name.ends_with(".cfg") {
+            cfg = Some(content);
+        }
+    }
+
+    Ok(SchemaZipContents { pla, ps1, cfg })
+}
+
+#[tauri::command]
+async fn export_schema_zip(pla: String, ps1: Option<String>, cfg: Option<String>, schema_name: String) -> Result<(), String> {
+    let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
+
+    let default_name = format!("{}.zip", schema_name.replace(' ', "_"));
+
+    FileDialogBuilder::new()
+        .add_filter("Schema Package", &["zip"])
+        .set_title("Export Schema Package")
+        .set_file_name(&default_name)
+        .save_file(move |file_path| {
+            if let Some(path) = file_path {
+                let _ = tx.send(Some(path.to_string_lossy().to_string()));
+            } else {
+                let _ = tx.send(None);
+            }
+        });
+
+    let path = match rx.recv() {
+        Ok(Some(p)) => p,
+        Ok(None) => return Err("Export cancelled.".into()),
+        Err(_) => return Err("Dialog error.".into()),
+    };
+
+    let file = File::create(&path).map_err(|e| format!("Cannot create ZIP: {}", e))?;
+    let mut zip_writer = zip::ZipWriter::new(file);
+    let options = zip::write::FileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    zip_writer.start_file("schema.pla", options).map_err(|e| format!("ZIP write error: {}", e))?;
+    zip_writer.write_all(pla.as_bytes()).map_err(|e| format!("ZIP write error: {}", e))?;
+
+    if let Some(ps1_content) = ps1 {
+        zip_writer.start_file("sys_config.ps1", options).map_err(|e| format!("ZIP write error: {}", e))?;
+        zip_writer.write_all(ps1_content.as_bytes()).map_err(|e| format!("ZIP write error: {}", e))?;
+    }
+
+    if let Some(cfg_content) = cfg {
+        zip_writer.start_file("autoexec.cfg", options).map_err(|e| format!("ZIP write error: {}", e))?;
+        zip_writer.write_all(cfg_content.as_bytes()).map_err(|e| format!("ZIP write error: {}", e))?;
+    }
+
+    zip_writer.finish().map_err(|e| format!("ZIP finalize error: {}", e))?;
+    Ok(())
+}
+
+// ────────────────────────────────────────────────────────────────────
 // Check real system state for every feature → returns JSON
 // ────────────────────────────────────────────────────────────────────
 #[tauri::command]
@@ -1418,11 +1520,11 @@ $_report | ConvertTo-Json -Depth 3 | Set-Content -Path '{}' -Encoding UTF8
 }
 
 // ────────────────────────────────────────────────────────────────────
-// AI Chat — calls OpenAI-compatible API
+// Advisor Chat — calls compatible chat API
 // ────────────────────────────────────────────────────────────────────
 
 #[tauri::command]
-async fn ai_chat(
+async fn advisor_chat(
     api_key: String,
     endpoint: String,
     model: String,
@@ -2573,7 +2675,7 @@ fn main() {
             parse_demo_header,
             open_demo_in_cs2,
             pick_demo_folder,
-            ai_chat,
+            advisor_chat,
             send_to_discord,
             capture_screenshot,
             save_feedback,
@@ -2588,6 +2690,8 @@ fn main() {
             check_for_update,
             download_update,
             run_installer,
+            import_schema_zip,
+            export_schema_zip,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
