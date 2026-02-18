@@ -1139,18 +1139,40 @@ async fn generate_script(config: OptimizationConfig, section: Option<String>) ->
 // ────────────────────────────────────────────────────────────────────
 #[tauri::command]
 async fn save_script(script_content: String) -> Result<(), String> {
+    let (tx, rx) = std::sync::mpsc::channel::<Option<Result<(), String>>>();
+
     FileDialogBuilder::new()
         .set_file_name("aimcamp_PlayerAgent_Optimize.ps1")
         .add_filter("PowerShell Script", &["ps1"])
         .save_file(move |file_path| {
             if let Some(path) = file_path {
-                if let Ok(mut file) = File::create(&path) {
-                    let _ = file.write_all(&[0xEF, 0xBB, 0xBF]); // UTF-8 BOM
-                    let _ = file.write_all(script_content.as_bytes());
+                match File::create(&path) {
+                    Ok(mut file) => {
+                        if let Err(e) = file.write_all(&[0xEF, 0xBB, 0xBF]) {
+                            let _ = tx.send(Some(Err(format!("Failed to write BOM: {}", e))));
+                            return;
+                        }
+                        if let Err(e) = file.write_all(script_content.as_bytes()) {
+                            let _ = tx.send(Some(Err(format!("Failed to write script: {}", e))));
+                            return;
+                        }
+                        let _ = tx.send(Some(Ok(())));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Some(Err(format!("Failed to create file: {}", e))));
+                    }
                 }
+            } else {
+                let _ = tx.send(None); // User cancelled
             }
         });
-    Ok(())
+
+    match rx.recv() {
+        Ok(Some(Ok(()))) => Ok(()),
+        Ok(Some(Err(e))) => Err(e),
+        Ok(None) => Err("Export cancelled".to_string()),
+        Err(_) => Err("Dialog communication error".to_string()),
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1158,17 +1180,36 @@ async fn save_script(script_content: String) -> Result<(), String> {
 // ────────────────────────────────────────────────────────────────────
 #[tauri::command]
 async fn save_cfg(cfg_content: String) -> Result<(), String> {
+    let (tx, rx) = std::sync::mpsc::channel::<Option<Result<(), String>>>();
+
     FileDialogBuilder::new()
         .set_file_name("autoexec.cfg")
         .add_filter("CS2 Config", &["cfg"])
         .save_file(move |file_path| {
             if let Some(path) = file_path {
-                if let Ok(mut file) = File::create(&path) {
-                    let _ = file.write_all(cfg_content.as_bytes());
+                match File::create(&path) {
+                    Ok(mut file) => {
+                        if let Err(e) = file.write_all(cfg_content.as_bytes()) {
+                            let _ = tx.send(Some(Err(format!("Failed to write CFG: {}", e))));
+                            return;
+                        }
+                        let _ = tx.send(Some(Ok(())));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Some(Err(format!("Failed to create file: {}", e))));
+                    }
                 }
+            } else {
+                let _ = tx.send(None); // User cancelled
             }
         });
-    Ok(())
+
+    match rx.recv() {
+        Ok(Some(Ok(()))) => Ok(()),
+        Ok(Some(Err(e))) => Err(e),
+        Ok(None) => Err("Export cancelled".to_string()),
+        Err(_) => Err("Dialog communication error".to_string()),
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────

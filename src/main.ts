@@ -1978,6 +1978,40 @@ async function refreshSystemState() {
   }
 }
 
+/** Sync checkboxes with actual system state (for first-time users) */
+async function syncTogglesWithSystemState() {
+  try {
+    const state = await invoke<Record<string, boolean | null>>("check_system_state");
+    for (const [id, value] of Object.entries(state)) {
+      // Only set checkbox if value is known (true or false, not null)
+      if (value !== null) {
+        const checkbox = document.getElementById(id) as HTMLInputElement | null;
+        if (checkbox?.type === "checkbox") {
+          checkbox.checked = value;
+        }
+      }
+      // Also update LEDs
+      const led = document.getElementById(`led_${id}`);
+      if (!led) continue;
+      led.classList.remove("active", "unknown");
+      if (value === true) {
+        led.classList.add("active");
+        led.title = "✔ Applied on this system (excluded from estimate)";
+      } else if (value === false) {
+        led.title = "✖ Not yet applied";
+      } else {
+        led.classList.add("unknown");
+        led.title = "— Cannot determine";
+      }
+    }
+    /* Recalculate impact now that toggles are updated */
+    updateImpact();
+    updateCfgCounter();
+  } catch (e) {
+    console.error("System state sync failed:", e);
+  }
+}
+
 /* ================================================================
    Tooltips
    ================================================================ */
@@ -7141,15 +7175,19 @@ build();
 const savedTheme = localStorage.getItem("csmooth_theme");
 if (savedTheme !== null) applyTheme(Number.parseInt(savedTheme, 10));
 
-// Restore last active schema values on startup
-(() => {
+// Restore last active schema values on startup OR sync with system state on first run
+(async () => {
   const activeSchema = getActiveSchema();
   if (activeSchema?.values && Object.keys(activeSchema.values).length > 0) {
+    // User has a profile/schema — restore saved values
     restoreFullState(activeSchema.values);
+    // Update LEDs to show current system state
+    refreshSystemState();
+  } else {
+    // First run or no active schema — sync toggles with actual system state
+    await syncTogglesWithSystemState();
   }
 })();
-
-refreshSystemState();
 
 // ── Auto-update check on startup ────────────────────────────────
 // Small delay to let the UI render first

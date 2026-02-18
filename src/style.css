@@ -2493,6 +2493,11 @@ textarea:focus {
   font-size: 12px;
   font-family: inherit;
 }
+.fdbk-select option {
+  background: #0a0e14;
+  color: #fff;
+  padding: 6px;
+}
 .fdbk-select:focus,
 .fdbk-input:focus,
 .fdbk-textarea:focus {
