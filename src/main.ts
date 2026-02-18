@@ -5589,7 +5589,7 @@ function build() {
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
               <div>
                 <label style="font-size:11px;font-weight:600;color:var(--text-main);display:block;margin-bottom:2px;">Current Version</label>
-                <span style="font-family:Orbitron,monospace;font-size:9px;opacity:0.65;">v1.3.5 (2026-02-18)</span>
+                <span style="font-family:Orbitron,monospace;font-size:9px;opacity:0.65;">v1.3.6 (2026-02-18)</span>
               </div>
               <button class="btn-export" style="font-size:10px;padding:4px 12px;">Check for Updates</button>
             </div>
@@ -5611,7 +5611,7 @@ function build() {
               <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:9px;margin-bottom:12px;">
                 <div style="background:rgba(255,255,255,0.02);padding:6px;border-radius:4px;border:1px solid rgba(255,255,255,0.05);">
                   <div style="opacity:0.5;margin-bottom:2px;">Version</div>
-                  <div style="font-family:Orbitron,monospace;color:var(--neon-green);">v1.3.5</div>
+                  <div style="font-family:Orbitron,monospace;color:var(--neon-green);">v1.3.6</div>
                 </div>
                 <div style="background:rgba(255,255,255,0.02);padding:6px;border-radius:4px;border:1px solid rgba(255,255,255,0.05);">
                   <div style="opacity:0.5;margin-bottom:2px;">Release</div>
