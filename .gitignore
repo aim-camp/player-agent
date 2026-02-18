@@ -24,3 +24,5 @@ test-demos/
 # AI assistant files
 CLAUDE.md
 .claude/
+
+build-*.log
