@@ -2617,14 +2617,23 @@ async fn check_for_update() -> Result<serde_json::Value, String> {
     let has_update = version_newer(remote_version, current_version);
 
     // Find installer download URLs
+    // Detect if running as portable build (exe filename contains "portable")
+    let is_portable = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()))
+        .map(|n| n.contains("portable"))
+        .unwrap_or(false);
+
     let mut msi_url = String::new();
     let mut nsis_url = String::new();
+    let mut portable_url = String::new();
     if let Some(assets) = release["assets"].as_array() {
         for asset in assets {
             let name = asset["name"].as_str().unwrap_or("");
             let url = asset["browser_download_url"].as_str().unwrap_or("");
             if name.ends_with(".msi") { msi_url = url.to_string(); }
             if name.ends_with(".exe") && name.contains("setup") { nsis_url = url.to_string(); }
+            if name.ends_with(".exe") && name.contains("portable") { portable_url = url.to_string(); }
         }
     }
 
@@ -2638,6 +2647,8 @@ async fn check_for_update() -> Result<serde_json::Value, String> {
         "html_url": release["html_url"].as_str().unwrap_or(""),
         "msi_url": msi_url,
         "nsis_url": nsis_url,
+        "portable_url": portable_url,
+        "is_portable": is_portable,
         "published_at": release["published_at"].as_str().unwrap_or("")
     }))
 }
@@ -2688,6 +2699,16 @@ async fn run_installer(path: String) -> Result<(), String> {
         .args(&["/C", "start", "", &path])
         .spawn()
         .map_err(|e| format!("Launch installer error: {}", e))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn open_in_explorer(path: String) -> Result<(), String> {
+    // Open Explorer with the file selected (highlight the downloaded portable exe)
+    Command::new("explorer")
+        .args(&[format!("/select,{}", path)])
+        .spawn()
+        .map_err(|e| format!("Explorer error: {}", e))?;
     Ok(())
 }
 
@@ -2744,6 +2765,7 @@ fn main() {
             check_for_update,
             download_update,
             run_installer,
+            open_in_explorer,
             import_schema_zip,
             export_schema_zip,
             llm_install_ollama,

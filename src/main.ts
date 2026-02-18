@@ -5048,6 +5048,25 @@ function showConfirmModal(title: string, message: string): Promise<boolean> {
 function build() {
   const app = document.getElementById("app");
   if (!app) return;
+
+  // ── Responsive scale: fill any resolution proportionally ─────
+  // Design base: 1920×1080. Scale #app to fill the current screen.
+  (function applyResponsiveScale() {
+    const scale = Math.min(window.innerWidth / 1920, window.innerHeight / 1080);
+    if (Math.abs(scale - 1) > 0.02) {
+      app.style.width = "1920px";
+      app.style.height = "1080px";
+      app.style.flex = "none";
+      app.style.transformOrigin = "0 0";
+      app.style.transform = `scale(${scale.toFixed(5)})`;
+      // Center on non-16:9 aspect ratios
+      const ox = Math.max(0, (window.innerWidth - 1920 * scale) / 2);
+      const oy = Math.max(0, (window.innerHeight - 1080 * scale) / 2);
+      if (ox > 1) app.style.marginLeft = ox + "px";
+      if (oy > 1) app.style.marginTop = oy + "px";
+    }
+  })();
+
   app.innerHTML = "";
 
   // Load saved theme
@@ -5589,7 +5608,7 @@ function build() {
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
               <div>
                 <label style="font-size:11px;font-weight:600;color:var(--text-main);display:block;margin-bottom:2px;">Current Version</label>
-                <span style="font-family:Orbitron,monospace;font-size:9px;opacity:0.65;">v1.3.6 (2026-02-18)</span>
+                <span style="font-family:Orbitron,monospace;font-size:9px;opacity:0.65;">v1.3.7 (2026-02-18)</span>
               </div>
               <button class="btn-export" style="font-size:10px;padding:4px 12px;">Check for Updates</button>
             </div>
@@ -5611,7 +5630,7 @@ function build() {
               <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:9px;margin-bottom:12px;">
                 <div style="background:rgba(255,255,255,0.02);padding:6px;border-radius:4px;border:1px solid rgba(255,255,255,0.05);">
                   <div style="opacity:0.5;margin-bottom:2px;">Version</div>
-                  <div style="font-family:Orbitron,monospace;color:var(--neon-green);">v1.3.6</div>
+                  <div style="font-family:Orbitron,monospace;color:var(--neon-green);">v1.3.7</div>
                 </div>
                 <div style="background:rgba(255,255,255,0.02);padding:6px;border-radius:4px;border:1px solid rgba(255,255,255,0.05);">
                   <div style="opacity:0.5;margin-bottom:2px;">Release</div>
@@ -7373,16 +7392,16 @@ function build() {
 
   /* ── SUB-TAB 1: Optimizations ── */
   const netPanel1 = netSub.panels[1];
-  netPanel1.style.cssText = "padding:8px 12px 16px;display:flex;flex-direction:column;gap:12px;overflow-y:auto;";
+  netPanel1.style.cssText = "padding:10px 16px 20px;display:flex;flex-direction:column;gap:10px;overflow-y:auto;overflow-x:hidden;min-width:0;";
 
   function netOptCard(title: string, icon: string, desc: string): { wrap: HTMLElement; body: HTMLElement } {
     const wrap = document.createElement("div");
-    wrap.style.cssText = "border:1px solid rgba(255,255,255,0.07);border-radius:8px;overflow:hidden;";
+    wrap.style.cssText = "border:1px solid rgba(255,255,255,0.07);border-radius:8px;overflow:hidden;min-width:0;width:100%;box-sizing:border-box;";
     const hdr = document.createElement("div");
-    hdr.style.cssText = "display:flex;align-items:center;gap:8px;padding:10px 12px;background:rgba(255,255,255,0.03);border-bottom:1px solid rgba(255,255,255,0.06);";
-    hdr.innerHTML = `<span style="font-size:16px">${icon}</span><div><div style="font-weight:600;font-size:12px">${title}</div><div style="font-size:10px;opacity:0.5;margin-top:1px">${desc}</div></div>`;
+    hdr.style.cssText = "display:flex;align-items:center;gap:10px;padding:10px 14px;background:rgba(255,255,255,0.03);border-bottom:1px solid rgba(255,255,255,0.06);";
+    hdr.innerHTML = `<span style="font-size:18px;flex-shrink:0">${icon}</span><div style="flex:1;min-width:0;"><div style="font-weight:600;font-size:12.5px;letter-spacing:0.02em">${title}</div><div style="font-size:10px;opacity:0.5;margin-top:2px;line-height:1.35;white-space:normal">${desc}</div></div>`;
     const body = document.createElement("div");
-    body.style.cssText = "padding:10px 12px;display:flex;flex-direction:column;gap:8px;";
+    body.style.cssText = "padding:10px 14px;display:flex;flex-direction:column;gap:8px;";
     wrap.appendChild(hdr);
     wrap.appendChild(body);
     return { wrap, body };
@@ -7397,12 +7416,12 @@ function build() {
 
   function netActionRow(label: string, btnLabel: string, btnClass: string, onClick: () => Promise<void>, statusId?: string): HTMLElement {
     const row = document.createElement("div");
-    row.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:8px;";
+    row.style.cssText = "display:flex;align-items:center;gap:12px;min-height:32px;";
     const lbl = document.createElement("span");
-    lbl.style.cssText = "font-size:11px;opacity:0.8;flex:1;";
+    lbl.style.cssText = "font-size:11px;opacity:0.75;flex:1;min-width:0;line-height:1.4;";
     lbl.textContent = label;
     const btnW = document.createElement("div");
-    btnW.style.cssText = "display:flex;align-items:center;gap:6px;";
+    btnW.style.cssText = "display:flex;align-items:center;gap:6px;flex-shrink:0;margin-left:auto;";
     const btn = document.createElement("button");
     btn.className = btnClass;
     btn.textContent = btnLabel;
@@ -7435,7 +7454,7 @@ function build() {
     { label: "Quad9 (Secure)", p: "9.9.9.9", s: "149.112.112.112" },
   ];
   const dnsRow = document.createElement("div");
-  dnsRow.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;align-items:center;";
+  dnsRow.style.cssText = "display:flex;gap:8px;align-items:center;";
   const dnsSelect = document.createElement("select");
   dnsSelect.className = "pro-select";
   dnsSelect.style.cssText = "flex:1;min-width:140px;font-size:11px;padding:4px 8px;height:28px;";
@@ -7454,10 +7473,13 @@ function build() {
   btnRestoreDns.textContent = "Restore";
   btnRestoreDns.style.cssText += "padding:4px 10px;font-size:11px;";
   const dnsStatus = netStatusSpan("dns-opt-status");
+  const dnsBtnGroup = document.createElement("div");
+  dnsBtnGroup.style.cssText = "display:flex;align-items:center;gap:6px;flex-shrink:0;";
+  dnsBtnGroup.appendChild(btnApplyDns);
+  dnsBtnGroup.appendChild(btnRestoreDns);
+  dnsBtnGroup.appendChild(dnsStatus);
   dnsRow.appendChild(dnsSelect);
-  dnsRow.appendChild(btnApplyDns);
-  dnsRow.appendChild(btnRestoreDns);
-  dnsRow.appendChild(dnsStatus);
+  dnsRow.appendChild(dnsBtnGroup);
   dnsBody.appendChild(dnsRow);
   dnsBody.appendChild((() => {
     const info = document.createElement("div");
@@ -7488,35 +7510,6 @@ function build() {
     btnRestoreDns.disabled = false;
   });
   netPanel1.appendChild(dnsWrap);
-
-  // ── TCP Optimizer ─────────────────────────────────────────────
-  const { wrap: tcpWrap, body: tcpBody } = netOptCard(
-    "TCP Game Optimizer",
-    "📡",
-    "Disable Nagle algorithm, tune TCP stack for low-latency gaming"
-  );
-  tcpBody.appendChild(netActionRow(
-    "Apply TCP gaming tweaks (disable Nagle, enable ECN, tune buffers)",
-    "Apply", "btn-export",
-    async () => {
-      const msg = await invoke<string>("apply_tcp_tweaks");
-      const s = document.getElementById("tcp-opt-status");
-      if (s) s.textContent = `✅ ${msg}`;
-      toast("TCP tweaks applied");
-    },
-    "tcp-opt-status"
-  ));
-  tcpBody.appendChild(netActionRow(
-    "Restore default TCP settings",
-    "Restore", "btn-adv",
-    async () => {
-      const msg = await invoke<string>("restore_tcp_tweaks");
-      const s = document.getElementById("tcp-opt-status");
-      if (s) s.textContent = `✅ ${msg}`;
-      toast("TCP defaults restored");
-    }
-  ));
-  netPanel1.appendChild(tcpWrap);
 
   // ── QoS Gaming Mode ───────────────────────────────────────────
   const { wrap: qosWrap, body: qosBody } = netOptCard(
@@ -7554,7 +7547,7 @@ function build() {
     "Find and apply the optimal MTU — prevents packet fragmentation which causes lag spikes"
   );
   const mtuRow = document.createElement("div");
-  mtuRow.style.cssText = "display:flex;gap:6px;align-items:center;flex-wrap:wrap;";
+  mtuRow.style.cssText = "display:flex;gap:8px;align-items:center;";
   const mtuPresets = [
     { label: "1500 (Default)", val: 1500 },
     { label: "1492 (PPPoE)", val: 1492 },
@@ -7576,9 +7569,12 @@ function build() {
   btnApplyMtu.textContent = "Apply";
   btnApplyMtu.style.cssText += "padding:4px 10px;font-size:11px;";
   const mtuStatus = netStatusSpan("mtu-opt-status");
+  const mtuBtnGroup = document.createElement("div");
+  mtuBtnGroup.style.cssText = "display:flex;align-items:center;gap:6px;flex-shrink:0;";
+  mtuBtnGroup.appendChild(btnApplyMtu);
+  mtuBtnGroup.appendChild(mtuStatus);
   mtuRow.appendChild(mtuSelect);
-  mtuRow.appendChild(btnApplyMtu);
-  mtuRow.appendChild(mtuStatus);
+  mtuRow.appendChild(mtuBtnGroup);
   mtuBody.appendChild(mtuRow);
   btnApplyMtu.addEventListener("click", async () => {
     btnApplyMtu.disabled = true;
@@ -8340,6 +8336,8 @@ async function greetVoiceAgent() {
       html_url: string;
       msi_url: string;
       nsis_url: string;
+      portable_url: string;
+      is_portable: boolean;
       published_at: string;
       error?: string;
     }>("check_for_update");
@@ -8356,11 +8354,13 @@ async function greetVoiceAgent() {
   }
 })();
 
-function showUpdateModal(info: { current_version: string; latest_version: string; release_name: string; release_notes: string; html_url: string; msi_url: string; nsis_url: string }) {
+function showUpdateModal(info: { current_version: string; latest_version: string; release_name: string; release_notes: string; html_url: string; msi_url: string; nsis_url: string; portable_url: string; is_portable: boolean }) {
   const existing = document.querySelector(".update-overlay");
   if (existing) existing.remove();
 
   const notes = (info.release_notes || "No release notes.").replaceAll("\n", "<br>").replaceAll(/#{1,3}\s/g, "");
+  const isPortable = info.is_portable;
+  const downloadBtnLabel = isPortable ? "⬇️ Download Versão Portátil" : "⬇️ Download and Install";
 
   const overlay = document.createElement("div");
   overlay.className = "update-overlay fdbk-overlay";
@@ -8379,11 +8379,14 @@ function showUpdateModal(info: { current_version: string; latest_version: string
         ${info.release_name ? `<div class="update-name">${info.release_name}</div>` : ""}
         <div class="update-notes">${notes}</div>
         <div class="update-preserve-msg">
-          ℹ️ Your data (feedback, screenshots, configs, themes) is automatically preserved — stored in <code>%LOCALAPPDATA%</code>.
+          ${isPortable
+            ? "ℹ️ A nova versão portátil será guardada na pasta <code>Downloads</code>. Os teus dados (configs, schemas, temas) ficam preservados em <code>%LOCALAPPDATA%</code>."
+            : "ℹ️ Your data (feedback, screenshots, configs, themes) is automatically preserved — stored in <code>%LOCALAPPDATA%</code>."
+          }
         </div>
         <div class="update-actions">
           <button class="update-btn update-btn-download" id="update-download">
-            ⬇️ Download and Install
+            ${downloadBtnLabel}
           </button>
           <a class="update-btn update-btn-github" href="${info.html_url}" target="_blank">
             🐙 View on GitHub
@@ -8412,22 +8415,39 @@ function showUpdateModal(info: { current_version: string; latest_version: string
   document.getElementById("update-download")!.addEventListener("click", async () => {
     const btn = document.getElementById("update-download") as HTMLButtonElement;
     btn.disabled = true;
-    btn.textContent = "⏳ Downloading...";
+    btn.textContent = "⏳ A transferir...";
     try {
-      const url = info.msi_url || info.nsis_url;
-      if (!url) {
-        toast("No installer found. Visit GitHub.", true);
-        return;
+      if (isPortable) {
+        const url = info.portable_url;
+        if (!url) {
+          toast("Portable não encontrado na release. Usa o GitHub.", true);
+          btn.disabled = false;
+          btn.textContent = downloadBtnLabel;
+          return;
+        }
+        const path = await invoke<string>("download_update", { url });
+        btn.textContent = "📂 A abrir...";
+        await invoke("open_in_explorer", { path });
+        toast(`✅ Portátil guardado — clica duas vezes para lançar a nova versão.`);
+        overlay.remove();
+      } else {
+        const url = info.msi_url || info.nsis_url;
+        if (!url) {
+          toast("No installer found. Visit GitHub.", true);
+          btn.disabled = false;
+          btn.textContent = downloadBtnLabel;
+          return;
+        }
+        const path = await invoke<string>("download_update", { url });
+        btn.textContent = "🚀 Starting installer...";
+        await invoke("run_installer", { path });
+        toast("Installer started. The app will close.");
+        setTimeout(() => window.close(), 2000);
       }
-      const path = await invoke<string>("download_update", { url });
-      btn.textContent = "🚀 Starting installer...";
-      await invoke("run_installer", { path });
-      toast("Installer started. The app will close.");
-      setTimeout(() => window.close(), 2000);
     } catch (e) {
       toast(`Erro: ${e}`, true);
       btn.disabled = false;
-      btn.textContent = "⬇️ Download and Install";
+      btn.textContent = downloadBtnLabel;
     }
   });
 
