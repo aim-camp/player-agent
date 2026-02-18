@@ -2718,6 +2718,9 @@ fn main() {
             restore_tcp_tweaks,
             apply_qos_cs2,
             remove_qos_cs2,
+            get_cpu_topology,
+            set_cs2_cpu_affinity,
+            restore_cs2_affinity,
             set_mtu,
             prioritize_ethernet,
             disable_wifi,
@@ -3174,6 +3177,167 @@ Get-NetQosPolicy | Where-Object { $_.Name -like 'AimCamp_*' } | Remove-NetQosPol
         .map_err(|e| e.to_string())?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+#[tauri::command]
+async fn get_cpu_topology() -> Result<String, String> {
+    let script = r#"
+$proc = Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue
+if (-not $proc) { Write-Output 'CPU desconhecido'; exit }
+$cores  = $proc.NumberOfCores
+$threads = $proc.NumberOfLogicalProcessors
+$ht = $threads -gt $cores
+$htText = if ($ht) { "HT/SMT activo" } else { "sem HT/SMT" }
+$step = if ($ht) { [int]($threads / $cores) } else { 1 }
+$mask = [long]0
+for ($i = 0; $i -lt $threads; $i += $step) { $mask = $mask -bor ([long]1 -shl $i) }
+"$cores cores fisicos, $threads threads ($htText) — mascara 0x$('{0:X}' -f $mask)"
+"#;
+    let out = Command::new("powershell")
+        .args(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+#[tauri::command]
+async fn set_cs2_cpu_affinity() -> Result<String, String> {
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$results = [System.Collections.Generic.List[string]]::new()
+
+# Detect CPU topology
+$proc    = Get-CimInstance Win32_Processor
+$cores   = $proc.NumberOfCores
+$threads = $proc.NumberOfLogicalProcessors
+$ht      = $threads -gt $cores
+$step    = if ($ht) { [int]($threads / $cores) } else { 1 }
+
+# Build affinity mask: one logical CPU per physical core (positions 0, step, 2*step, ...)
+$mask = [long]0
+for ($i = 0; $i -lt $threads; $i += $step) {
+    $mask = $mask -bor ([long]1 -shl $i)
+}
+$maskHex = '0x{0:X}' -f $mask
+
+# Apply immediately if CS2 is already running
+$cs2 = Get-Process -Name 'cs2' -ErrorAction SilentlyContinue
+if ($cs2) {
+    $cs2.ProcessorAffinity = [System.IntPtr][long]$mask
+    $results.Add("CS2 em execucao: afinidade aplicada ($maskHex)")
+} else {
+    $results.Add('CS2 nao esta a correr — sera aplicado no proximo lancamento')
+}
+
+# Persist mask in registry
+$regPath = 'HKCU:\Software\AimCamp\PlayerAgent'
+if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
+Set-ItemProperty -Path $regPath -Name 'CS2AffinityMask'    -Value ([int]$mask) -Type DWord -Force
+Set-ItemProperty -Path $regPath -Name 'CS2AffinityEnabled' -Value 1            -Type DWord -Force
+
+# Write background watcher script
+$scriptDir  = Join-Path $env:APPDATA 'AimCamp'
+$scriptPath = Join-Path $scriptDir 'cs2_affinity_watch.ps1'
+if (-not (Test-Path $scriptDir)) { New-Item -ItemType Directory -Path $scriptDir -Force | Out-Null }
+
+$watchCode = @"
+while (`$true) {
+    try {
+        `$watcher = New-Object System.Management.ManagementEventWatcher
+        `$watcher.Query = "SELECT * FROM __InstanceCreationEvent WITHIN 2 WHERE TargetInstance ISA 'Win32_Process' AND TargetInstance.Name = 'cs2.exe'"
+        `$null = `$watcher.WaitForNextEvent()
+        Start-Sleep -Milliseconds 800
+        `$p = Get-Process -Name 'cs2' -ErrorAction SilentlyContinue
+        if (`$p) { `$p.ProcessorAffinity = [System.IntPtr][long]$mask }
+        `$watcher.Dispose()
+    } catch { Start-Sleep -Seconds 5 }
+}
+"@
+$watchCode | Out-File -FilePath $scriptPath -Encoding UTF8 -Force
+
+# Register as a scheduled task (runs at logon, hidden)
+$taskName = 'AimCamp_CS2Affinity'
+$action   = New-ScheduledTaskAction -Execute 'powershell.exe' `
+    -Argument "-WindowStyle Hidden -NonInteractive -ExecutionPolicy Bypass -File `"$scriptPath`""
+$trigger  = New-ScheduledTaskTrigger -AtLogOn
+$settings = New-ScheduledTaskSettingsSet -Hidden `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) `
+    -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1)
+$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Limited
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+    -Settings $settings -Principal $principal -Force | Out-Null
+
+# Start watcher now (don't wait for next login)
+Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+
+$results.Add("Tarefa agendada criada: $cores cores fisicos, mascara $maskHex")
+$results -join "`n"
+"#;
+    let out = Command::new("powershell")
+        .args(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if stdout.is_empty() { Ok("Afinidade CPU aplicada".to_string()) } else { Ok(stdout) }
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+#[tauri::command]
+async fn restore_cs2_affinity() -> Result<String, String> {
+    let script = r#"
+$results = [System.Collections.Generic.List[string]]::new()
+
+# Stop and remove scheduled task
+$taskName = 'AimCamp_CS2Affinity'
+if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+    Stop-ScheduledTask      -TaskName $taskName -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    $results.Add('Tarefa agendada removida')
+}
+
+# Remove watcher script
+$scriptPath = Join-Path $env:APPDATA 'AimCamp\cs2_affinity_watch.ps1'
+if (Test-Path $scriptPath) {
+    Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
+    $results.Add('Script de watcher removido')
+}
+
+# Restore full affinity to running CS2
+$proc    = Get-CimInstance Win32_Processor
+$threads = $proc.NumberOfLogicalProcessors
+$fullMask = ([long]1 -shl $threads) - 1
+$cs2 = Get-Process -Name 'cs2' -ErrorAction SilentlyContinue
+if ($cs2) {
+    $cs2.ProcessorAffinity = [System.IntPtr][long]$fullMask
+    $results.Add("CS2: todos os $threads threads restaurados")
+}
+
+# Clear registry flag
+$regPath = 'HKCU:\Software\AimCamp\PlayerAgent'
+if (Test-Path $regPath) {
+    Set-ItemProperty -Path $regPath -Name 'CS2AffinityEnabled' -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+}
+
+if ($results.Count -eq 0) { $results.Add('Nada a restaurar') }
+$results -join "`n"
+"#;
+    let out = Command::new("powershell")
+        .args(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if stdout.is_empty() { Ok("Afinidade CPU restaurada".to_string()) } else { Ok(stdout) }
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }

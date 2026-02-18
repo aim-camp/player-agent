@@ -2121,6 +2121,7 @@ const TIP: Record<string, string> = {
   x_pcie: "✔ AUTO (PowerShell): Disables PCIe Active State Power Management. +1.0% (+3 FPS). Prevents GPU bus downclocking.",
   x_ndis: "✔ AUTO (Registry): Disables network adapter Interrupt Moderation. +0.5% (+1 FPS). Lower packet processing latency.",
   x_large: "✔ AUTO (Registry): Enables Large Pages privilege for CS2. +1.0% (+3 FPS). Reduces TLB misses on large memory allocations.",
+  x_cs2_affinity: "⚡ BOTÃO: Limita o CS2 apenas aos cores físicos (desactiva Hyper-Threading/SMT). Reduz overhead do scheduler de threads. +1–2% FPS, menos stutters em CPUs multi-core. Cria tarefa agendada para aplicar automaticamente ao lançar o CS2.",
 };
 
 /* ================================================================
@@ -6085,6 +6086,57 @@ function build() {
   c8.appendChild(toggle("x_gpup", "GPU Priority for games", true, TIP.x_gpup));
   c8.appendChild(toggle("x_prio", "PrioritySeparation tuned", true, TIP.x_prio));
   c8.appendChild(toggle("x_cs2p", "CS2: High Process Priority", true, TIP.x_cs2p));
+
+  // CS2 CPU Affinity — physical cores only (HT/SMT disabled per-process)
+  {
+    const affinityRow = document.createElement("div");
+    affinityRow.className = "toggle-row";
+    affinityRow.style.cssText = "gap:6px;flex-wrap:wrap;align-items:center;";
+    affinityRow.innerHTML = `
+      <label title="${TIP.x_cs2_affinity}" style="flex:1;min-width:200px;cursor:help;">⚡ CS2: Physical Cores Apenas <span style="font-size:9px;opacity:0.4;font-weight:400;">(sem HT/SMT)</span></label>
+      <span id="cs2-affinity-info" style="font-size:9px;opacity:0.45;font-family:monospace;min-width:140px;">a detectar CPU...</span>
+      <button id="btn-cs2-affinity-apply" class="btn-export" style="font-size:10px;padding:3px 10px;">Aplicar</button>
+      <button id="btn-cs2-affinity-restore" class="btn-adv" style="font-size:10px;padding:3px 10px;">Restaurar</button>
+      <span id="cs2-affinity-status" style="font-size:10px;opacity:0.6;min-width:80px;"></span>
+    `;
+    c8.appendChild(affinityRow);
+
+    // Populate CPU topology info
+    invoke<string>("get_cpu_topology").then(info => {
+      const el = affinityRow.querySelector<HTMLElement>("#cs2-affinity-info");
+      if (el) el.textContent = info;
+    }).catch(() => {});
+
+    // Apply: physical cores only
+    affinityRow.querySelector<HTMLButtonElement>("#btn-cs2-affinity-apply")?.addEventListener("click", async () => {
+      const btn = affinityRow.querySelector<HTMLButtonElement>("#btn-cs2-affinity-apply")!;
+      const status = affinityRow.querySelector<HTMLElement>("#cs2-affinity-status");
+      btn.disabled = true; btn.textContent = "⏳...";
+      try {
+        const msg = await invoke<string>("set_cs2_cpu_affinity");
+        if (status) { status.textContent = "✅ Aplicado"; status.style.color = "var(--neon-green)"; }
+        toast(msg);
+      } catch (e) {
+        if (status) { status.textContent = "❌ Erro"; status.style.color = "#ef4444"; }
+        toast(`Afinidade CPU: ${e}`, true);
+      } finally { btn.disabled = false; btn.textContent = "Aplicar"; }
+    });
+
+    // Restore: all logical cores
+    affinityRow.querySelector<HTMLButtonElement>("#btn-cs2-affinity-restore")?.addEventListener("click", async () => {
+      const btn = affinityRow.querySelector<HTMLButtonElement>("#btn-cs2-affinity-restore")!;
+      const status = affinityRow.querySelector<HTMLElement>("#cs2-affinity-status");
+      btn.disabled = true; btn.textContent = "⏳...";
+      try {
+        const msg = await invoke<string>("restore_cs2_affinity");
+        if (status) { status.textContent = "↩ Restaurado"; status.style.color = "rgba(255,255,255,0.5)"; }
+        toast(msg);
+      } catch (e) {
+        if (status) { status.textContent = "❌ Erro"; status.style.color = "#ef4444"; }
+        toast(`Restaurar afinidade: ${e}`, true);
+      } finally { btn.disabled = false; btn.textContent = "Restaurar"; }
+    });
+  }
   c8.appendChild(toggle("x_telem", "Disable Telemetry Tasks", true, TIP.x_telem));
   c8.appendChild(toggle("x_timer", "Timer Resolution 0.5ms", false, TIP.x_timer));
   c8.appendChild(toggle("x_msimode", "MSI Mode for GPU", false, TIP.x_msimode));
