@@ -5608,7 +5608,7 @@ function build() {
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
               <div>
                 <label style="font-size:11px;font-weight:600;color:var(--text-main);display:block;margin-bottom:2px;">Current Version</label>
-                <span style="font-family:Orbitron,monospace;font-size:9px;opacity:0.65;">v1.3.7 (2026-02-18)</span>
+                <span style="font-family:Orbitron,monospace;font-size:9px;opacity:0.65;">v1.3.8 (2026-02-18)</span>
               </div>
               <button class="btn-export" style="font-size:10px;padding:4px 12px;">Check for Updates</button>
             </div>
@@ -5630,7 +5630,7 @@ function build() {
               <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:9px;margin-bottom:12px;">
                 <div style="background:rgba(255,255,255,0.02);padding:6px;border-radius:4px;border:1px solid rgba(255,255,255,0.05);">
                   <div style="opacity:0.5;margin-bottom:2px;">Version</div>
-                  <div style="font-family:Orbitron,monospace;color:var(--neon-green);">v1.3.7</div>
+                  <div style="font-family:Orbitron,monospace;color:var(--neon-green);">v1.3.8</div>
                 </div>
                 <div style="background:rgba(255,255,255,0.02);padding:6px;border-radius:4px;border:1px solid rgba(255,255,255,0.05);">
                   <div style="opacity:0.5;margin-bottom:2px;">Release</div>
@@ -7320,18 +7320,30 @@ function build() {
   tabNet.id = "tab-net";
   tabNet.className = "tab-panel";
 
-  const netSub = buildSubTabs(["🌐 Servers", "⚡ Optimizations"]);
-  tabNet.appendChild(netSub.bar);
+  // Single scrollable panel — no sub-tabs
+  const netPanel1 = document.createElement("div");
+  netPanel1.style.cssText = "padding:10px 16px 20px;display:flex;flex-direction:column;gap:10px;overflow-y:auto;overflow-x:hidden;min-width:0;flex:1;";
+  tabNet.appendChild(netPanel1);
 
-  /* ── SUB-TAB 0: Servers ── */
-  const netPanel0 = netSub.panels[0];
+  /* ── Server Latency section ── */
+  const netServerCard = document.createElement("div");
+  netServerCard.style.cssText = "border:1px solid rgba(255,255,255,0.07);border-radius:8px;overflow:hidden;min-width:0;width:100%;box-sizing:border-box;";
+  const netServerHdr = document.createElement("div");
+  netServerHdr.style.cssText = "display:flex;align-items:center;gap:10px;padding:10px 14px;background:rgba(255,255,255,0.03);border-bottom:1px solid rgba(255,255,255,0.06);";
+  netServerHdr.innerHTML = `<span style="font-size:18px;flex-shrink:0">🌐</span><div style="flex:1;min-width:0;"><div style="font-weight:600;font-size:12.5px;letter-spacing:0.02em">Server Latency</div><div style="font-size:10px;opacity:0.5;margin-top:2px;line-height:1.35">TCP latency to Valve, FACEIT and DNS servers (~5–10s)</div></div>`;
+  const netServerBody = document.createElement("div");
+  netServerBody.style.cssText = "padding:10px 14px;display:flex;flex-direction:column;gap:8px;";
+  netServerCard.appendChild(netServerHdr);
+  netServerCard.appendChild(netServerBody);
+  netPanel1.appendChild(netServerCard);
 
-  const netHeader = document.createElement("section");
-  netHeader.style.cssText = "display:flex;gap:8px;padding:10px 12px;align-items:center;flex-wrap:wrap;";
+  const netHeader = document.createElement("div");
+  netHeader.style.cssText = "display:flex;gap:8px;align-items:center;flex-wrap:wrap;";
   const btnPingAll = document.createElement("button");
   btnPingAll.className = "btn-export";
   btnPingAll.textContent = "▶ Run Test";
   btnPingAll.title = "TCP latency test to Valve, FACEIT, DNS servers";
+  btnPingAll.style.cssText += "padding:4px 14px;font-size:11px;";
   btnPingAll.addEventListener("click", async () => {
     btnPingAll.disabled = true;
     btnPingAll.textContent = "⏳ Testing...";
@@ -7343,31 +7355,26 @@ function build() {
   btnNetAdv.className = "btn-adv";
   btnNetAdv.innerHTML = "🔍 Diagnose";
   btnNetAdv.title = "Network quality and latency diagnosis — requires Advisor key";
-  const netInfo = document.createElement("span");
-  netInfo.style.cssText = "font-size:10px;opacity:0.5;";
-  netInfo.textContent = "TCP latency to 8 servers (Valve, FACEIT, DNS). ~5–10s.";
-  netHeader.appendChild(btnPingAll);
-  netHeader.appendChild(btnNetAdv);
+  btnNetAdv.style.cssText += "padding:4px 14px;font-size:11px;";
   const netShareBar = buildShareBar(() => {
     const netText = document.getElementById("net-results")?.textContent || "No data";
     return { title: "aim.camp Player Agent — Network Ping Results", text: netText.slice(0, 500), fields: [] };
   });
+  netHeader.appendChild(btnPingAll);
+  netHeader.appendChild(btnNetAdv);
   netHeader.appendChild(netShareBar);
-  netHeader.appendChild(netInfo);
-  netPanel0.appendChild(netHeader);
+  netServerBody.appendChild(netHeader);
 
   const netResults = document.createElement("div");
   netResults.id = "net-results";
   netResults.className = "net-grid";
-  netResults.style.cssText = "padding:0 12px 12px;";
   netResults.innerHTML = '<div class="net-status">Click "▶ Run Test" to test TCP latency to game servers</div>';
-  netPanel0.appendChild(netResults);
+  netServerBody.appendChild(netResults);
 
   const netAdvResp = document.createElement("div");
   netAdvResp.className = "adv-response";
   netAdvResp.id = "net-adv-response";
-  netAdvResp.style.margin = "0 12px";
-  netPanel0.appendChild(netAdvResp);
+  netServerBody.appendChild(netAdvResp);
 
   btnNetAdv.addEventListener("click", async () => {
     if (!hasAdvKey()) {
@@ -7389,10 +7396,6 @@ function build() {
     }
     btnNetAdv.disabled = false;
   });
-
-  /* ── SUB-TAB 1: Optimizations ── */
-  const netPanel1 = netSub.panels[1];
-  netPanel1.style.cssText = "padding:10px 16px 20px;display:flex;flex-direction:column;gap:10px;overflow-y:auto;overflow-x:hidden;min-width:0;";
 
   function netOptCard(title: string, icon: string, desc: string): { wrap: HTMLElement; body: HTMLElement } {
     const wrap = document.createElement("div");
@@ -7440,6 +7443,12 @@ function build() {
     row.appendChild(btnW);
     return row;
   }
+
+  // ── Section: Optimizations ────────────────────────────────────
+  const netOptLabel = document.createElement("div");
+  netOptLabel.style.cssText = "display:flex;align-items:center;gap:8px;padding:4px 0 2px;";
+  netOptLabel.innerHTML = `<span style="font-size:9px;font-family:'Orbitron',monospace;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;opacity:0.4;">⚡ Optimizations</span><div style="flex:1;height:1px;background:rgba(255,255,255,0.06);"></div>`;
+  netPanel1.appendChild(netOptLabel);
 
   // ── DNS Optimizer ──────────────────────────────────────────────
   const { wrap: dnsWrap, body: dnsBody } = netOptCard(
@@ -7637,13 +7646,11 @@ function build() {
   restoreRow.appendChild(btnRestoreAll);
   netPanel1.appendChild(restoreRow);
 
-  for (const p of netSub.panels) tabNet.appendChild(p);
-
   const netSig = document.createElement("section");
   netSig.className = "cfg-actions";
-  netSig.style.marginTop = "auto";
+  netSig.style.cssText = "margin-top:auto;padding:4px 16px 0;flex-shrink:0;";
   netSig.appendChild(buildSignature());
-  tabNet.appendChild(netSig);
+  netPanel1.appendChild(netSig);
 
   /* ── Tab: Demo Review ────────────────────────────────────────── */
   const tabDemo = document.createElement("div");
