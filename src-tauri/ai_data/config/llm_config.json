@@ -1,0 +1,101 @@
+{
+  "providers": [
+    {
+      "id": "llama-3.2-3b",
+      "name": "Llama 3.2 3B",
+      "provider_type": "Local",
+      "enabled": false,
+      "model_name": "meta-llama/Llama-3.2-3B-Instruct",
+      "model_size_gb": 2.0,
+      "model_path": "D:\\Projetos\\player-agent\\src-tauri\\ai_data\\models\\llama-3.2-3b-q4.gguf",
+      "status": "NotDownloaded",
+      "config": {
+        "quantization": "q4",
+        "context_length": 8192,
+        "gpu_layers": 28,
+        "api_key": null,
+        "endpoint": null,
+        "max_tokens": 2048
+      },
+      "requirements": {
+        "min_ram_gb": 4,
+        "min_vram_gb": 2,
+        "gpu_required": false,
+        "disk_space_gb": 2.5
+      }
+    },
+    {
+      "id": "personaplex-7b",
+      "name": "PersonaPlex 7B (NVIDIA)",
+      "provider_type": "Local",
+      "enabled": false,
+      "model_name": "nvidia/personaplex-7b-v1",
+      "model_size_gb": 4.2,
+      "model_path": "D:\\Projetos\\player-agent\\src-tauri\\ai_data\\models\\personaplex-7b-q4.gguf",
+      "status": "NotDownloaded",
+      "config": {
+        "quantization": "q4",
+        "context_length": 4096,
+        "gpu_layers": 35,
+        "api_key": null,
+        "endpoint": null,
+        "max_tokens": 2048
+      },
+      "requirements": {
+        "min_ram_gb": 8,
+        "min_vram_gb": 4,
+        "gpu_required": false,
+        "disk_space_gb": 4.5
+      }
+    },
+    {
+      "id": "groq-llama",
+      "name": "Groq (Cloud API)",
+      "provider_type": "Cloud",
+      "enabled": false,
+      "model_name": "llama-3.1-70b-versatile",
+      "model_size_gb": 0.0,
+      "model_path": null,
+      "status": "Downloaded",
+      "config": {
+        "quantization": null,
+        "context_length": 8192,
+        "gpu_layers": null,
+        "api_key": null,
+        "endpoint": "https://api.groq.com/openai/v1/chat/completions",
+        "max_tokens": 8000
+      },
+      "requirements": {
+        "min_ram_gb": 0,
+        "min_vram_gb": null,
+        "gpu_required": false,
+        "disk_space_gb": 0.0
+      }
+    },
+    {
+      "id": "openai-compatible",
+      "name": "OpenAI Compatible API",
+      "provider_type": "Cloud",
+      "enabled": false,
+      "model_name": "gpt-4",
+      "model_size_gb": 0.0,
+      "model_path": null,
+      "status": "Downloaded",
+      "config": {
+        "quantization": null,
+        "context_length": 8192,
+        "gpu_layers": null,
+        "api_key": null,
+        "endpoint": "https://api.openai.com/v1/chat/completions",
+        "max_tokens": 4096
+      },
+      "requirements": {
+        "min_ram_gb": 0,
+        "min_vram_gb": null,
+        "gpu_required": false,
+        "disk_space_gb": 0.0
+      }
+    }
+  ],
+  "active_provider_id": null
+}

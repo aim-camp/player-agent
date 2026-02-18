@@ -1,0 +1,58 @@
+[
+  {
+    "id": "disable_hpet",
+    "name": "Disable HPET",
+    "category": "Windows",
+    "description": "HPET é um timer antigo que força o CPU a verificá-lo constantemente. Desactivar reduz input lag.",
+    "technical_details": "High Precision Event Timer (HPET) adiciona ~2-3ms de latência. CPUs modernos têm TSC (Time Stamp Counter) que é mais eficiente.",
+    "impact": {
+      "fps_gain": null,
+      "latency_reduction": "-2.5ms average",
+      "memory_impact": null,
+      "requires_restart": true
+    },
+    "requirements": [
+      "CPU com suporte TSC (todos os modernos)"
+    ],
+    "warnings": [
+      "Requer restart"
+    ]
+  },
+  {
+    "id": "hardware_gpu_scheduling",
+    "name": "Hardware-accelerated GPU Scheduling",
+    "category": "Windows",
+    "description": "Permite GPU gerir a sua própria memória directamente, reduzindo overhead do CPU.",
+    "technical_details": "Windows 10 2004+ feature. GPU controla VRAM scheduling em vez do CPU fazer via kernel do Windows.",
+    "impact": {
+      "fps_gain": "+5-15 fps",
+      "latency_reduction": "-1ms",
+      "memory_impact": null,
+      "requires_restart": false
+    },
+    "requirements": [
+      "Windows 10 2004+",
+      "GPU WDDM 2.7+"
+    ],
+    "warnings": []
+  },
+  {
+    "id": "disable_core_parking",
+    "name": "Disable Core Parking",
+    "category": "Windows",
+    "description": "Mantém todos os cores do CPU activos em vez de adormecer os não usados.",
+    "technical_details": "Core parking coloca cores CPU em C-states profundos. Acordá-los adiciona latência. Para gaming, melhor manter todos activos.",
+    "impact": {
+      "fps_gain": "+8-12 fps em CPUs 8+ cores",
+      "latency_reduction": "-2-5ms",
+      "memory_impact": null,
+      "requires_restart": false
+    },
+    "requirements": [
+      "CPU multi-core (4+ cores)"
+    ],
+    "warnings": [
+      "Aumenta consumo energia/temperatura"
+    ]
+  }
+]

@@ -11,8 +11,9 @@
     "isolatedModules": true,
     "esModuleInterop": true,
     "noEmit": true,
-    "unusedLocals": true,
+    "noUnusedLocals": false,
     "noImplicitReturns": true,
+    "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true
   },
   "include": ["src"]

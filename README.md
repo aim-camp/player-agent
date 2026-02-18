@@ -21,7 +21,7 @@ Built with **Tauri v1** (Rust backend + TypeScript frontend).
 - **HUB** — Wiki, events, Discord bridge, feedback, tournaments
 
 ### Additional
-- AI-powered optimization suggestions (Groq integration)
+- Cloud-powered optimization advisor
 - Discord webhook sharing
 - 11 color themes with LED state indicators
 - Profile save/load system

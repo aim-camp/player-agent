@@ -2,7 +2,34 @@ use tauri::api::dialog::FileDialogBuilder;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::process::Command;
-// base64 Engine trait used via associated function calls
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+mod ai;
+use ai::{AIAssistant, KnowledgeBase, LearningSystem, VoiceHandler, LLMManager};
+
+// ────────────────────────────────────────────────────────────────────
+// Global AI state
+// ────────────────────────────────────────────────────────────────────
+struct AIState {
+    assistant: Option<AIAssistant>,
+    knowledge_base: Option<KnowledgeBase>,
+    learning_system: Option<LearningSystem>,
+    voice_handler: Option<VoiceHandler>,
+    llm_manager: Option<LLMManager>,
+}
+
+impl AIState {
+    fn new() -> Self {
+        Self {
+            assistant: None,
+            knowledge_base: None,
+            learning_system: None,
+            voice_handler: None,
+            llm_manager: None,
+        }
+    }
+}
 
 // ────────────────────────────────────────────────────────────────────
 // Data model – every field maps 1:1 to a UI toggle/input AND to real
@@ -407,10 +434,8 @@ Read-Host -Prompt '  Press Enter to exit'
 // Script generator
 // ────────────────────────────────────────────────────────────────────
 #[tauri::command]
-async fn generate_script(config: OptimizationConfig, section: Option<String>) -> Result<String, String> {
+async fn generate_script(config: OptimizationConfig) -> Result<String, String> {
     let mut s = String::with_capacity(32_000);
-    let run_all = section.is_none();
-    let sf = section.as_deref();
 
     let pc = if config.theme_primary.is_empty() { "#84cc16".to_string() } else { config.theme_primary.clone() };
     let sc = if config.theme_secondary.is_empty() { "#22d3ee".to_string() } else { config.theme_secondary.clone() };
@@ -429,7 +454,6 @@ async fn generate_script(config: OptimizationConfig, section: Option<String>) ->
     s.push_str("}\n\n");
 
     // 1. BIOS
-    if run_all || sf == Some("bios") {
     ps1_section(&mut s, 1, "BIOS -- Hardware Checks", "HW");
 
     s.push_str("    # Check virtualization state\n");
@@ -466,10 +490,8 @@ async fn generate_script(config: OptimizationConfig, section: Option<String>) ->
     if config.bios.enable_above_4g {
         ps1_info(&mut s, "Enable Above 4G Decoding in BIOS");
     }
-    } // end bios
 
     // 2. Windows
-    if run_all || sf == Some("windows") {
     ps1_section(&mut s, 2, "Windows -- Performance Tweaks", "OS");
 
     if config.windows.ultimate_power_plan {
@@ -694,10 +716,8 @@ async fn generate_script(config: OptimizationConfig, section: Option<String>) ->
             "Set-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management' -Name 'LargeSystemCache' -Value 0 -Type DWord -Force",
         ]);
     }
-    } // end windows
 
     // ── 3. Network ──────────────────────────────────────────────────
-    if run_all || sf == Some("network") {
     ps1_section(&mut s, 3, "Network -- Latency & TCP", "NET");
 
     if config.network.disable_nagle {
@@ -776,10 +796,8 @@ async fn generate_script(config: OptimizationConfig, section: Option<String>) ->
             "netsh int tcp set supplemental Internet congestionprovider=ctcp 2>$null",
         ]);
     }
-    } // end network
 
     // ── 4. NVIDIA ───────────────────────────────────────────────────
-    if run_all || sf == Some("nvidia") {
     ps1_section(&mut s, 4, "NVIDIA -- Registry-Level GPU Tweaks", "GPU");
 
     s.push_str("    # ── Find NVIDIA GPU registry path ──\n");
@@ -894,10 +912,8 @@ async fn generate_script(config: OptimizationConfig, section: Option<String>) ->
             "}",
         ]);
     }
-    } // end nvidia
 
     // ── 5. Services ─────────────────────────────────────────────────
-    if run_all || sf == Some("services") {
     ps1_section(&mut s, 5, "Services -- Disable Unnecessary", "SVC");
 
     let services: Vec<(&str, &str, bool)> = vec![
@@ -939,10 +955,8 @@ async fn generate_script(config: OptimizationConfig, section: Option<String>) ->
             "Get-Service -Name 'WpnUserService*' -ErrorAction SilentlyContinue | Set-Service -StartupType Disabled -ErrorAction SilentlyContinue",
         ]);
     }
-    } // end services
 
     // ── 6. autoexec.cfg ────────────────────────────────────────────
-    if run_all || sf == Some("autoexec") {
     if config.autoexec.enabled {
         ps1_section(&mut s, 6, "CS2 -- autoexec.cfg Generation", "CFG");
 
@@ -991,10 +1005,8 @@ async fn generate_script(config: OptimizationConfig, section: Option<String>) ->
         s.push_str("    $autoexecLines | Set-Content -Path $autoexecPath -Encoding UTF8\n");
         s.push_str("    Write-Host \"    ✔ autoexec.cfg written to: $autoexecPath\" -ForegroundColor Green\n");
     }
-    } // end autoexec
 
     // ── 7. Launch options ─────────────────────────────────────────
-    if run_all || sf == Some("launch") {
     ps1_section(&mut s, 7, "CS2 -- Launch Options", "RUN");
     {
         let mut opts: Vec<String> = Vec::new();
@@ -1015,10 +1027,8 @@ async fn generate_script(config: OptimizationConfig, section: Option<String>) ->
         s.push_str(&format!("    Set-Clipboard -Value '{}'\n", opts_str));
         s.push_str("    Write-Host '    (Copied to clipboard!)' -ForegroundColor Cyan\n");
     }
-    } // end launch
 
     // ── 8. Extras / FACEIT ─────────────────────────────────────────
-    if run_all || sf == Some("extras") {
     ps1_section(&mut s, 8, "Extras & FACEIT", "EXT");
 
     if config.extras.disable_steam_overlay {
@@ -1126,7 +1136,6 @@ async fn generate_script(config: OptimizationConfig, section: Option<String>) ->
             "Write-Host '    💡 Always run FACEIT AC as Administrator.' -ForegroundColor Yellow",
         ]);
     }
-    } // end extras
 
     // ── Galaxy Footer ───────────────────────────────────────────────
     ps1_footer(&mut s);
@@ -1139,40 +1148,18 @@ async fn generate_script(config: OptimizationConfig, section: Option<String>) ->
 // ────────────────────────────────────────────────────────────────────
 #[tauri::command]
 async fn save_script(script_content: String) -> Result<(), String> {
-    let (tx, rx) = std::sync::mpsc::channel::<Option<Result<(), String>>>();
-
     FileDialogBuilder::new()
         .set_file_name("aimcamp_PlayerAgent_Optimize.ps1")
         .add_filter("PowerShell Script", &["ps1"])
         .save_file(move |file_path| {
             if let Some(path) = file_path {
-                match File::create(&path) {
-                    Ok(mut file) => {
-                        if let Err(e) = file.write_all(&[0xEF, 0xBB, 0xBF]) {
-                            let _ = tx.send(Some(Err(format!("Failed to write BOM: {}", e))));
-                            return;
-                        }
-                        if let Err(e) = file.write_all(script_content.as_bytes()) {
-                            let _ = tx.send(Some(Err(format!("Failed to write script: {}", e))));
-                            return;
-                        }
-                        let _ = tx.send(Some(Ok(())));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Some(Err(format!("Failed to create file: {}", e))));
-                    }
+                if let Ok(mut file) = File::create(&path) {
+                    let _ = file.write_all(&[0xEF, 0xBB, 0xBF]); // UTF-8 BOM
+                    let _ = file.write_all(script_content.as_bytes());
                 }
-            } else {
-                let _ = tx.send(None); // User cancelled
             }
         });
-
-    match rx.recv() {
-        Ok(Some(Ok(()))) => Ok(()),
-        Ok(Some(Err(e))) => Err(e),
-        Ok(None) => Err("Export cancelled".to_string()),
-        Err(_) => Err("Dialog communication error".to_string()),
-    }
+    Ok(())
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1180,36 +1167,17 @@ async fn save_script(script_content: String) -> Result<(), String> {
 // ────────────────────────────────────────────────────────────────────
 #[tauri::command]
 async fn save_cfg(cfg_content: String) -> Result<(), String> {
-    let (tx, rx) = std::sync::mpsc::channel::<Option<Result<(), String>>>();
-
     FileDialogBuilder::new()
         .set_file_name("autoexec.cfg")
         .add_filter("CS2 Config", &["cfg"])
         .save_file(move |file_path| {
             if let Some(path) = file_path {
-                match File::create(&path) {
-                    Ok(mut file) => {
-                        if let Err(e) = file.write_all(cfg_content.as_bytes()) {
-                            let _ = tx.send(Some(Err(format!("Failed to write CFG: {}", e))));
-                            return;
-                        }
-                        let _ = tx.send(Some(Ok(())));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Some(Err(format!("Failed to create file: {}", e))));
-                    }
+                if let Ok(mut file) = File::create(&path) {
+                    let _ = file.write_all(cfg_content.as_bytes());
                 }
-            } else {
-                let _ = tx.send(None); // User cancelled
             }
         });
-
-    match rx.recv() {
-        Ok(Some(Ok(()))) => Ok(()),
-        Ok(Some(Err(e))) => Err(e),
-        Ok(None) => Err("Export cancelled".to_string()),
-        Err(_) => Err("Dialog communication error".to_string()),
-    }
+    Ok(())
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1346,108 +1314,6 @@ async fn pick_ps1_file() -> Result<String, String> {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Schema ZIP: import a .zip containing schema.pla / sys.ps1 / game.cfg
-// ────────────────────────────────────────────────────────────────────
-#[derive(serde::Serialize)]
-struct SchemaZipContents {
-    pla: Option<String>,
-    ps1: Option<String>,
-    cfg: Option<String>,
-}
-
-#[tauri::command]
-async fn import_schema_zip() -> Result<SchemaZipContents, String> {
-    let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
-
-    FileDialogBuilder::new()
-        .add_filter("Schema Package", &["zip"])
-        .set_title("Import Schema Package (.zip)")
-        .pick_file(move |file_path| {
-            if let Some(path) = file_path {
-                let _ = tx.send(Some(path.to_string_lossy().to_string()));
-            } else {
-                let _ = tx.send(None);
-            }
-        });
-
-    let path = match rx.recv() {
-        Ok(Some(p)) => p,
-        Ok(None) => return Err("No file selected.".into()),
-        Err(_) => return Err("Dialog cancelled.".into()),
-    };
-
-    let file = File::open(&path).map_err(|e| format!("Cannot open ZIP: {}", e))?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Invalid ZIP: {}", e))?;
-
-    let mut pla: Option<String> = None;
-    let mut ps1: Option<String> = None;
-    let mut cfg: Option<String> = None;
-
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| format!("ZIP entry error: {}", e))?;
-        let name = entry.name().to_lowercase();
-        let mut content = String::new();
-        entry.read_to_string(&mut content).map_err(|e| format!("Read error: {}", e))?;
-
-        if name.ends_with(".pla") {
-            pla = Some(content);
-        } else if name.ends_with(".ps1") {
-            ps1 = Some(content);
-        } else if name.ends_with(".cfg") {
-            cfg = Some(content);
-        }
-    }
-
-    Ok(SchemaZipContents { pla, ps1, cfg })
-}
-
-#[tauri::command]
-async fn export_schema_zip(pla: String, ps1: Option<String>, cfg: Option<String>, schema_name: String) -> Result<(), String> {
-    let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
-
-    let default_name = format!("{}.zip", schema_name.replace(' ', "_"));
-
-    FileDialogBuilder::new()
-        .add_filter("Schema Package", &["zip"])
-        .set_title("Export Schema Package")
-        .set_file_name(&default_name)
-        .save_file(move |file_path| {
-            if let Some(path) = file_path {
-                let _ = tx.send(Some(path.to_string_lossy().to_string()));
-            } else {
-                let _ = tx.send(None);
-            }
-        });
-
-    let path = match rx.recv() {
-        Ok(Some(p)) => p,
-        Ok(None) => return Err("Export cancelled.".into()),
-        Err(_) => return Err("Dialog error.".into()),
-    };
-
-    let file = File::create(&path).map_err(|e| format!("Cannot create ZIP: {}", e))?;
-    let mut zip_writer = zip::ZipWriter::new(file);
-    let options = zip::write::FileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
-
-    zip_writer.start_file("schema.pla", options).map_err(|e| format!("ZIP write error: {}", e))?;
-    zip_writer.write_all(pla.as_bytes()).map_err(|e| format!("ZIP write error: {}", e))?;
-
-    if let Some(ps1_content) = ps1 {
-        zip_writer.start_file("sys_config.ps1", options).map_err(|e| format!("ZIP write error: {}", e))?;
-        zip_writer.write_all(ps1_content.as_bytes()).map_err(|e| format!("ZIP write error: {}", e))?;
-    }
-
-    if let Some(cfg_content) = cfg {
-        zip_writer.start_file("autoexec.cfg", options).map_err(|e| format!("ZIP write error: {}", e))?;
-        zip_writer.write_all(cfg_content.as_bytes()).map_err(|e| format!("ZIP write error: {}", e))?;
-    }
-
-    zip_writer.finish().map_err(|e| format!("ZIP finalize error: {}", e))?;
-    Ok(())
-}
-
-// ────────────────────────────────────────────────────────────────────
 // Check real system state for every feature → returns JSON
 // ────────────────────────────────────────────────────────────────────
 #[tauri::command]
@@ -1480,55 +1346,8 @@ async fn check_system_state() -> Result<serde_json::Value, String> {
 // Generate + run script content directly as admin (no file dialog)
 // ────────────────────────────────────────────────────────────────────
 #[tauri::command]
-async fn run_config_as_admin(config: OptimizationConfig, section: Option<String>) -> Result<String, String> {
-    let script = generate_script(config, section).await?;
-
-    // Wrap script with timing/statistics that writes a report JSON
-    let report_path = std::env::temp_dir().join("aimcamp_script_report.json");
-    let report_path_str = report_path.to_string_lossy().to_string().replace('\\', "\\\\");
-
-    let wrapped = format!(
-        r#"$_aimcamp_start = Get-Date
-$_aimcamp_errors = @()
-$_aimcamp_sections = @()
-$_aimcamp_cmds = 0
-
-# Override Write-Host to count sections/commands
-$_origEAP = $ErrorActionPreference
-
-# Trap errors
-trap {{
-    $_aimcamp_errors += $_.Exception.Message
-    continue
-}}
-
-{}
-
-$_aimcamp_end = Get-Date
-$_aimcamp_duration = ($_aimcamp_end - $_aimcamp_start).TotalSeconds
-
-# Count sections and commands from script content
-$_scriptLines = @'
-{}
-'@
-$_aimcamp_sections = ([regex]::Matches($_scriptLines, 'SECTION \d+') | ForEach-Object {{ $_.Value }})
-$_aimcamp_cmds = ([regex]::Matches($_scriptLines, '\[ OK \]')).Count
-
-$_report = @{{
-    status        = if ($_aimcamp_errors.Count -eq 0) {{ 'success' }} else {{ 'partial' }}
-    duration_secs = [math]::Round($_aimcamp_duration, 1)
-    sections_run  = $_aimcamp_sections.Count
-    commands_run  = $_aimcamp_cmds
-    errors        = @($_aimcamp_errors)
-    start_time    = $_aimcamp_start.ToString('o')
-    end_time      = $_aimcamp_end.ToString('o')
-}}
-$_report | ConvertTo-Json -Depth 3 | Set-Content -Path '{}' -Encoding UTF8
-"#,
-        script,
-        script.replace('\'', "''"),
-        report_path_str
-    );
+async fn run_config_as_admin(config: OptimizationConfig) -> Result<String, String> {
+    let script = generate_script(config).await?;
 
     let temp_dir = std::env::temp_dir();
     let script_path = temp_dir.join("aimcamp_run.ps1");
@@ -1539,7 +1358,7 @@ $_report | ConvertTo-Json -Depth 3 | Set-Content -Path '{}' -Encoding UTF8
         .map_err(|e| format!("Failed to write temp script: {}", e))?;
     file.write_all(&bom)
         .map_err(|e| format!("BOM write error: {}", e))?;
-    file.write_all(wrapped.as_bytes())
+    file.write_all(script.as_bytes())
         .map_err(|e| format!("Script write error: {}", e))?;
 
     let path_str = script_path.to_string_lossy().to_string();
@@ -1561,11 +1380,377 @@ $_report | ConvertTo-Json -Depth 3 | Set-Content -Path '{}' -Encoding UTF8
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Advisor Chat — calls compatible chat API
+// Local AI Assistant Commands
 // ────────────────────────────────────────────────────────────────────
 
 #[tauri::command]
-async fn advisor_chat(
+async fn init_ai_assistant(state: tauri::State<'_, Arc<Mutex<AIState>>>) -> Result<String, String> {
+    let mut ai_state = state.lock().await;
+    
+    // Initialize knowledge base
+    let data_path = std::env::current_dir()
+        .map_err(|e| e.to_string())?
+        .join("ai_data");
+    
+    let kb = KnowledgeBase::new(data_path.join("knowledge"))
+        .map_err(|e| format!("Failed to init knowledge base: {}", e))?;
+    
+    // Initialize learning system
+    let learning = LearningSystem::new(data_path.join("learning"))
+        .map_err(|e| format!("Failed to init learning system: {}", e))?;
+    
+    // Initialize assistant with default config
+    let config = ai::assistant::AIConfig::default();
+    let assistant = AIAssistant::new(config.clone());
+    
+    // Try to initialize model (this will fail gracefully if model not downloaded yet)
+    let init_result = assistant.initialize().await;
+    
+    // Initialize voice handler
+    let voice = VoiceHandler::new(ai::voice::VoiceConfig::default());
+    
+    // Initialize LLM Manager
+    let llm_mgr = LLMManager::new(data_path.join("config"), data_path.join("models"))
+        .map_err(|e| format!("Failed to init LLM manager: {}", e))?;
+    
+    ai_state.assistant = Some(assistant);
+    ai_state.knowledge_base = Some(kb);
+    ai_state.learning_system = Some(learning);
+    ai_state.voice_handler = Some(voice);
+    ai_state.llm_manager = Some(llm_mgr);
+    
+    match init_result {
+        Ok(_) => Ok("AI Assistant initialized successfully".to_string()),
+        Err(e) => Ok(format!("AI Assistant initialized (model not loaded: {})", e)),
+    }
+}
+
+#[tauri::command]
+async fn ai_local_chat(
+    message: String,
+    state: tauri::State<'_, Arc<Mutex<AIState>>>,
+) -> Result<String, String> {
+    let ai_state = state.lock().await;
+    
+    if let Some(assistant) = &ai_state.assistant {
+        assistant.process_text(message).await
+    } else {
+        Err("AI Assistant not initialized. Call init_ai_assistant first.".to_string())
+    }
+}
+
+#[tauri::command]
+async fn ai_explain_feature(
+    feature_id: String,
+    state: tauri::State<'_, Arc<Mutex<AIState>>>,
+) -> Result<serde_json::Value, String> {
+    let ai_state = state.lock().await;
+    
+    if let Some(kb) = &ai_state.knowledge_base {
+        match kb.get_feature(&feature_id) {
+            Some(feature) => Ok(serde_json::to_value(feature).unwrap()),
+            None => Err(format!("Feature '{}' not found in knowledge base", feature_id)),
+        }
+    } else {
+        Err("Knowledge base not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+async fn ai_get_suggestions(
+    state: tauri::State<'_, Arc<Mutex<AIState>>>,
+) -> Result<Vec<String>, String> {
+    let ai_state = state.lock().await;
+    
+    if let Some(learning) = &ai_state.learning_system {
+        Ok(learning.get_personalized_suggestions())
+    } else {
+        Err("Learning system not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+async fn ai_record_optimization(
+    feature_id: String,
+    state: tauri::State<'_, Arc<Mutex<AIState>>>,
+) -> Result<(), String> {
+    let mut ai_state = state.lock().await;
+    
+    if let Some(learning) = &mut ai_state.learning_system {
+        learning.record_optimization(feature_id);
+        Ok(())
+    } else {
+        Err("Learning system not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+async fn ai_record_satisfaction(
+    feature_id: String,
+    rating: u8,
+    state: tauri::State<'_, Arc<Mutex<AIState>>>,
+) -> Result<(), String> {
+    let mut ai_state = state.lock().await;
+    
+    if let Some(learning) = &mut ai_state.learning_system {
+        learning.record_satisfaction(&feature_id, rating);
+        Ok(())
+    } else {
+        Err("Learning system not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+async fn ai_process_voice(
+    audio_data: Vec<f32>,
+    state: tauri::State<'_, Arc<Mutex<AIState>>>,
+) -> Result<String, String> {
+    let ai_state = state.lock().await;
+    
+    if let Some(voice) = &ai_state.voice_handler {
+        // Transcribe audio to text
+        let text = voice.process_audio(audio_data).await?;
+        
+        // Parse command
+        let command = voice.parse_command(&text);
+        
+        // Return command as JSON
+        Ok(serde_json::to_string(&command).unwrap())
+    } else {
+        Err("Voice handler not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+async fn ai_get_conversation_history(
+    state: tauri::State<'_, Arc<Mutex<AIState>>>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let ai_state = state.lock().await;
+    
+    if let Some(assistant) = &ai_state.assistant {
+        let history = assistant.get_history();
+        Ok(history.iter().map(|m| serde_json::to_value(m).unwrap()).collect())
+    } else {
+        Err("AI Assistant not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+async fn ai_clear_history(
+    state: tauri::State<'_, Arc<Mutex<AIState>>>,
+) -> Result<(), String> {
+    let ai_state = state.lock().await;
+    
+    if let Some(assistant) = &ai_state.assistant {
+        assistant.clear_history().await;
+        Ok(())
+    } else {
+        Err("AI Assistant not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+async fn ai_update_config(
+    config: serde_json::Value,
+    state: tauri::State<'_, Arc<Mutex<AIState>>>,
+) -> Result<(), String> {
+    let ai_state = state.lock().await;
+    
+    if let Some(assistant) = &ai_state.assistant {
+        let ai_config: ai::assistant::AIConfig = serde_json::from_value(config)
+            .map_err(|e| format!("Invalid config: {}", e))?;
+        assistant.update_config(ai_config).await;
+        Ok(())
+    } else {
+        Err("AI Assistant not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+async fn ai_get_config(
+    state: tauri::State<'_, Arc<Mutex<AIState>>>,
+) -> Result<serde_json::Value, String> {
+    let ai_state = state.lock().await;
+    
+    if let Some(assistant) = &ai_state.assistant {
+        let config = assistant.get_config().await;
+        Ok(serde_json::to_value(config).unwrap())
+    } else {
+        Err("AI Assistant not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+async fn ai_search_features(
+    query: String,
+    state: tauri::State<'_, Arc<Mutex<AIState>>>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let ai_state = state.lock().await;
+    
+    if let Some(kb) = &ai_state.knowledge_base {
+        let features = kb.search_features(&query);
+        Ok(features.iter().map(|f| serde_json::to_value(f).unwrap()).collect())
+    } else {
+        Err("Knowledge base not initialized".to_string())
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// LLM Manager Commands - Multi-provider management
+// ────────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn llm_get_all_providers(
+    state: tauri::State<'_, Arc<Mutex<AIState>>>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let ai_state = state.lock().await;
+    
+    if let Some(llm_mgr) = &ai_state.llm_manager {
+        let providers = llm_mgr.get_all_providers();
+        Ok(providers.iter().map(|p| serde_json::to_value(p).unwrap()).collect())
+    } else {
+        Err("LLM Manager not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+async fn llm_get_active_provider(
+    state: tauri::State<'_, Arc<Mutex<AIState>>>,
+) -> Result<Option<serde_json::Value>, String> {
+    let ai_state = state.lock().await;
+    
+    if let Some(llm_mgr) = &ai_state.llm_manager {
+        Ok(llm_mgr.get_active_provider().map(|p| serde_json::to_value(p).unwrap()))
+    } else {
+        Err("LLM Manager not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+async fn llm_set_active_provider(
+    provider_id: String,
+    state: tauri::State<'_, Arc<Mutex<AIState>>>,
+) -> Result<(), String> {
+    let mut ai_state = state.lock().await;
+    
+    if let Some(llm_mgr) = &mut ai_state.llm_manager {
+        llm_mgr.set_active_provider(&provider_id)
+    } else {
+        Err("LLM Manager not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+async fn llm_enable_provider(
+    provider_id: String,
+    enabled: bool,
+    state: tauri::State<'_, Arc<Mutex<AIState>>>,
+) -> Result<(), String> {
+    let mut ai_state = state.lock().await;
+    
+    if let Some(llm_mgr) = &mut ai_state.llm_manager {
+        llm_mgr.enable_provider(&provider_id, enabled)
+    } else {
+        Err("LLM Manager not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+async fn llm_update_config(
+    provider_id: String,
+    config: serde_json::Value,
+    state: tauri::State<'_, Arc<Mutex<AIState>>>,
+) -> Result<(), String> {
+    let mut ai_state = state.lock().await;
+    
+    if let Some(llm_mgr) = &mut ai_state.llm_manager {
+        let provider_config: ai::llm_manager::ProviderConfig = serde_json::from_value(config)
+            .map_err(|e| format!("Invalid config: {}", e))?;
+        llm_mgr.update_provider_config(&provider_id, provider_config)
+    } else {
+        Err("LLM Manager not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+async fn llm_check_requirements(
+    provider_id: String,
+    state: tauri::State<'_, Arc<Mutex<AIState>>>,
+) -> Result<Vec<String>, String> {
+    let ai_state = state.lock().await;
+    
+    if let Some(llm_mgr) = &ai_state.llm_manager {
+        // Get current system info (placeholder - should detect actual hardware)
+        let system_info = ai::llm_manager::SystemInfo {
+            ram_gb: 16, // TODO: Get from system
+            vram_gb: Some(8), // TODO: Get from GPU detection
+            free_disk_gb: 50.0, // TODO: Get actual free space
+            has_gpu: true, // TODO: Detect GPU
+        };
+        
+        Ok(llm_mgr.check_requirements(&provider_id, &system_info))
+    } else {
+        Err("LLM Manager not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+async fn llm_download_model(
+    provider_id: String,
+    state: tauri::State<'_, Arc<Mutex<AIState>>>,
+) -> Result<String, String> {
+    let mut ai_state = state.lock().await;
+    
+    if let Some(llm_mgr) = &mut ai_state.llm_manager {
+        // TODO: Implement actual download logic with progress tracking
+        // For now, just update status
+        llm_mgr.update_model_status(&provider_id, ai::llm_manager::ModelStatus::Downloading(0.0))?;
+        
+        // Simulate download (in production, use reqwest with progress callback)
+        llm_mgr.update_model_status(&provider_id, ai::llm_manager::ModelStatus::Downloaded)?;
+        
+        Ok(format!("Model download initiated for {}", provider_id))
+    } else {
+        Err("LLM Manager not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+async fn llm_add_custom_provider(
+    provider: serde_json::Value,
+    state: tauri::State<'_, Arc<Mutex<AIState>>>,
+) -> Result<(), String> {
+    let mut ai_state = state.lock().await;
+    
+    if let Some(llm_mgr) = &mut ai_state.llm_manager {
+        let llm_provider: ai::llm_manager::LLMProvider = serde_json::from_value(provider)
+            .map_err(|e| format!("Invalid provider: {}", e))?;
+        llm_mgr.add_custom_provider(llm_provider)
+    } else {
+        Err("LLM Manager not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+async fn llm_remove_provider(
+    provider_id: String,
+    state: tauri::State<'_, Arc<Mutex<AIState>>>,
+) -> Result<(), String> {
+    let mut ai_state = state.lock().await;
+    
+    if let Some(llm_mgr) = &mut ai_state.llm_manager {
+        llm_mgr.remove_provider(&provider_id)
+    } else {
+        Err("LLM Manager not initialized".to_string())
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// AI Chat — calls OpenAI-compatible API
+// ────────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn ai_chat(
     api_key: String,
     endpoint: String,
     model: String,
@@ -1580,7 +1765,7 @@ async fn advisor_chat(
         "model": model,
         "messages": messages,
         "temperature": 0.7,
-        "max_completion_tokens": 3000,
+        "max_tokens": 3000,
     });
 
     let resp = client
@@ -1596,15 +1781,7 @@ async fn advisor_chat(
     let text = resp.text().await.map_err(|e| format!("Read failed: {}", e))?;
 
     if !status.is_success() {
-        let code = status.as_u16();
-        let hint = match code {
-            401 => " — API key is invalid or expired. Please generate a new key.",
-            403 => " — Access denied. Check your API key permissions.",
-            404 => " — Endpoint not found. Check the API URL.",
-            429 => " — Rate limit exceeded. Wait a moment and try again.",
-            _ => "",
-        };
-        return Err(format!("API error {}{}{}", status, hint, if hint.is_empty() { format!(": {}", &text[..text.len().min(500)]) } else { String::new() }));
+        return Err(format!("API error {}: {}", status, &text[..text.len().min(500)]));
     }
 
     let json: serde_json::Value = serde_json::from_str(&text)
@@ -1661,1039 +1838,11 @@ async fn send_to_discord(
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Driver information — system + peripheral drivers
-// Categories: GPU, Audio, Network, Mouse, Keyboard, Monitor, USB Game Controllers
-// For each: device name, driver name, driver version, manufacturer,
-//           whether it's a generic driver, and whether it's up to date.
-// ────────────────────────────────────────────────────────────────────
-#[tauri::command]
-async fn get_driver_info() -> Result<serde_json::Value, String> {
-    let script = r#"
-$ErrorActionPreference = 'SilentlyContinue'
-
-function Get-DriverCategory {
-    param($class, $name, $compat)
-    $n = ($name + ' ' + $compat).ToLower()
-    if ($class -eq 'Display')           { return 'GPU' }
-    if ($class -match 'AudioEndpoint|MEDIA|Sound') { return 'Audio' }
-    if ($class -eq 'Net')               { return 'Network' }
-    if ($class -eq 'Mouse' -or $class -eq 'HIDClass' -and $n -match 'mouse|pointer') { return 'Mouse' }
-    if ($class -eq 'Keyboard' -or ($class -eq 'HIDClass' -and $n -match 'keyboard')) { return 'Keyboard' }
-    if ($class -eq 'Monitor')           { return 'Monitor' }
-    if ($class -eq 'HIDClass' -and $n -match 'game|controller|joystick|gamepad|xbox') { return 'Controller' }
-    if ($class -eq 'USB' -and $n -match 'headset|audio|dac|amp') { return 'Audio' }
-    if ($class -eq 'HIDClass' -and $n -match 'headset|audio') { return 'Audio' }
-    return $null
-}
-
-# Collect PnP devices with driver info
-$devices = Get-CimInstance Win32_PnPSignedDriver |
-    Where-Object { $_.DeviceName -and $_.DeviceClass } |
-    Select-Object DeviceName, DeviceClass, DriverVersion, DriverDate, Manufacturer,
-                  DriverProviderName, HardWareID, CompatID, IsSigned, InfName
-
-$results = @()
-
-foreach ($d in $devices) {
-    $compatStr = if ($d.HardWareID) { ($d.HardWareID -join ' ') } else { '' }
-    $cat = Get-DriverCategory -class $d.DeviceClass -name $d.DeviceName -compat $compatStr
-    if (-not $cat) { continue }
-
-    # Determine if generic driver
-    $provider = if ($d.DriverProviderName) { $d.DriverProviderName.Trim() } else { '' }
-    $mfr = if ($d.Manufacturer) { $d.Manufacturer.Trim() } else { '' }
-    $genericProviders = @('Microsoft', 'Microsoft Corporation', 'Windows', '(Standard system devices)',
-                          '(Generic)', 'Generic', 'Microsoft Windows', 'Dispositivos de sistema', 'USB')
-    $isGeneric = $false
-    foreach ($gp in $genericProviders) {
-        if ($provider -eq $gp -or $mfr -eq $gp) { $isGeneric = $true; break }
-    }
-    # Display adapters with 'Microsoft Basic' are generic
-    if ($d.DeviceName -match 'Microsoft Basic|Standard VGA|Generic.*Display') { $isGeneric = $true }
-
-    # Driver date and age
-    $driverDateStr = ''
-    $daysOld = -1
-    if ($d.DriverDate) {
-        try {
-            $dt = [DateTime]$d.DriverDate
-            $driverDateStr = $dt.ToString('yyyy-MM-dd')
-            $daysOld = ((Get-Date) - $dt).Days
-        } catch { }
-    }
-
-    # Heuristic: driver older than 365 days = possibly outdated
-    $status = 'unknown'
-    if ($daysOld -ge 0) {
-        if ($daysOld -le 180)    { $status = 'current' }
-        elseif ($daysOld -le 365) { $status = 'aging' }
-        else                      { $status = 'outdated' }
-    }
-
-    $results += @{
-        category      = $cat
-        device_name   = $d.DeviceName.Trim()
-        driver_name   = if ($d.InfName) { $d.InfName.Trim() } else { 'N/A' }
-        driver_version = if ($d.DriverVersion) { $d.DriverVersion.Trim() } else { 'N/A' }
-        driver_provider = $provider
-        manufacturer  = $mfr
-        driver_date   = $driverDateStr
-        days_old      = $daysOld
-        is_signed     = [bool]$d.IsSigned
-        is_generic    = $isGeneric
-        status        = $status
-    }
-}
-
-# Deduplicate by device name (keep newest driver version)
-$unique = @{}
-foreach ($r in $results) {
-    $key = $r.category + '|' + $r.device_name
-    if (-not $unique.ContainsKey($key) -or $r.days_old -lt $unique[$key].days_old) {
-        $unique[$key] = $r
-    }
-}
-
-# Sort: GPU first, then by category
-$sorted = @($unique.Values) | Sort-Object @{Expression={
-    switch ($_.category) {
-        'GPU'        { 0 }
-        'Monitor'    { 1 }
-        'Audio'      { 2 }
-        'Network'    { 3 }
-        'Mouse'      { 4 }
-        'Keyboard'   { 5 }
-        'Controller' { 6 }
-        default      { 9 }
-    }
-}}, device_name
-
-@($sorted) | ConvertTo-Json -Depth 3
-"#;
-    let output = Command::new("powershell")
-        .args(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
-        .output()
-        .map_err(|e| format!("Driver info failed: {}", e))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(stdout.trim())
-        .map_err(|e| format!("Driver JSON parse: {} — {}", e, &stdout[..stdout.len().min(300)]))
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Check for available driver updates via Windows Update API
-// ────────────────────────────────────────────────────────────────────
-#[tauri::command]
-async fn check_driver_updates() -> Result<serde_json::Value, String> {
-    let script = r#"
-$ErrorActionPreference = 'SilentlyContinue'
-
-# Use Windows Update COM API to find available driver updates
-try {
-    $session = New-Object -ComObject Microsoft.Update.Session
-    $searcher = $session.CreateUpdateSearcher()
-    $searcher.ServiceID = '7971f918-a847-4430-9279-4a52d1efe18d'  # Microsoft Update
-    $searcher.SearchScope = 1
-    $searcher.ServerSelection = 3  # Third-party (includes manufacturer drivers)
-
-    $result = $searcher.Search("IsInstalled=0 AND Type='Driver'")
-    $updates = @()
-
-    foreach ($u in $result.Updates) {
-        $hwIds = @()
-        if ($u.DriverHardwareID) { $hwIds += $u.DriverHardwareID }
-
-        # Match device name from driver update
-        $devName = ''
-        if ($u.DriverModel) { $devName = $u.DriverModel }
-
-        $updates += @{
-            title         = $u.Title
-            description   = if ($u.Description) { $u.Description.Substring(0, [Math]::Min(200, $u.Description.Length)) } else { '' }
-            driver_model  = $devName
-            driver_ver    = if ($u.DriverVerDate) { $u.DriverVerDate.ToString('yyyy-MM-dd') } else { '' }
-            driver_class  = if ($u.DriverClass) { $u.DriverClass } else { '' }
-            driver_mfr    = if ($u.DriverManufacturer) { $u.DriverManufacturer } else { '' }
-            hw_ids        = $hwIds
-            update_id     = $u.Identity.UpdateID
-            size_mb       = [math]::Round($u.MaxDownloadSize / 1MB, 1)
-            download_url  = if ($u.MoreInfoUrls -and $u.MoreInfoUrls.Count -gt 0) { $u.MoreInfoUrls[0] } else { '' }
-            is_mandatory  = [bool]$u.IsMandatory
-        }
-    }
-
-    @{ available = @($updates); error = $null } | ConvertTo-Json -Depth 4
-} catch {
-    @{ available = @(); error = $_.Exception.Message } | ConvertTo-Json -Depth 4
-}
-"#;
-    let output = Command::new("powershell")
-        .args(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
-        .output()
-        .map_err(|e| format!("Driver update check failed: {}", e))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(stdout.trim())
-        .map_err(|e| format!("Driver update JSON parse: {} — {}", e, &stdout[..stdout.len().min(300)]))
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Install a specific driver update via Windows Update API (as admin)
-// ────────────────────────────────────────────────────────────────────
-#[tauri::command]
-async fn install_driver_update(update_id: String) -> Result<serde_json::Value, String> {
-    let report_path = std::env::temp_dir().join("aimcamp_driver_install_report.json");
-    let report_path_str = report_path.to_string_lossy().to_string();
-
-    let script = format!(r#"
-$ErrorActionPreference = 'Stop'
-$report = @{{ update_id = '{}'; status = 'starting'; steps = @(); error = $null; start_time = (Get-Date).ToString('o') }}
-
-try {{
-    $session = New-Object -ComObject Microsoft.Update.Session
-    $searcher = $session.CreateUpdateSearcher()
-    $searcher.ServiceID = '7971f918-a847-4430-9279-4a52d1efe18d'
-    $searcher.SearchScope = 1
-    $searcher.ServerSelection = 3
-
-    $result = $searcher.Search("IsInstalled=0 AND Type='Driver'")
-    $target = $null
-    foreach ($u in $result.Updates) {{
-        if ($u.Identity.UpdateID -eq '{}') {{ $target = $u; break }}
-    }}
-
-    if (-not $target) {{
-        $report.status = 'not_found'
-        $report.error = 'Update not found. It may have already been installed.'
-        $report | ConvertTo-Json -Depth 3 | Set-Content -Path '{}' -Encoding UTF8
-        exit 1
-    }}
-
-    $report.steps += 'Update found: ' + $target.Title
-
-    # Accept EULA
-    if (-not $target.EulaAccepted) {{ $target.AcceptEula() }}
-    $report.steps += 'EULA accepted'
-
-    # Download
-    $report.status = 'downloading'
-    $report | ConvertTo-Json -Depth 3 | Set-Content -Path '{}' -Encoding UTF8
-    $dl = New-Object -ComObject Microsoft.Update.UpdateColl
-    $dl.Add($target) | Out-Null
-    $downloader = $session.CreateUpdateDownloader()
-    $downloader.Updates = $dl
-    $dlResult = $downloader.Download()
-    $report.steps += 'Downloaded (result: ' + $dlResult.ResultCode + ')'
-
-    # Install
-    $report.status = 'installing'
-    $report | ConvertTo-Json -Depth 3 | Set-Content -Path '{}' -Encoding UTF8
-    $inst = New-Object -ComObject Microsoft.Update.UpdateColl
-    $inst.Add($target) | Out-Null
-    $installer = $session.CreateUpdateInstaller()
-    $installer.Updates = $inst
-    $instResult = $installer.Install()
-    $resultCode = $instResult.GetUpdateResult(0).ResultCode
-    # 2 = Succeeded, 3 = SucceededWithErrors
-    if ($resultCode -eq 2 -or $resultCode -eq 3) {{
-        $report.status = 'success'
-        $report.steps += 'Installation completed successfully'
-        $report.needs_reboot = $instResult.RebootRequired
-    }} else {{
-        $report.status = 'failed'
-        $report.error = 'Install result code: ' + $resultCode
-    }}
-}} catch {{
-    $report.status = 'failed'
-    $report.error = $_.Exception.Message
-}}
-
-$report.end_time = (Get-Date).ToString('o')
-$report | ConvertTo-Json -Depth 3 | Set-Content -Path '{}' -Encoding UTF8
-"#, update_id, update_id, report_path_str, report_path_str, report_path_str, report_path_str);
-
-    let temp_dir = std::env::temp_dir();
-    let script_path = temp_dir.join("aimcamp_driver_install.ps1");
-
-    let bom: [u8; 3] = [0xEF, 0xBB, 0xBF];
-    let mut file = File::create(&script_path)
-        .map_err(|e| format!("Failed to write driver install script: {}", e))?;
-    file.write_all(&bom).map_err(|e| format!("BOM write error: {}", e))?;
-    file.write_all(script.as_bytes()).map_err(|e| format!("Script write error: {}", e))?;
-
-    let path_str = script_path.to_string_lossy().to_string();
-    Command::new("powershell")
-        .args(&[
-            "-NoProfile",
-            "-Command",
-            &format!(
-                "Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File \"{}\"' -Wait",
-                path_str.replace('\'', "''")
-            ),
-        ])
-        .output()
-        .map_err(|e| format!("Failed to launch driver install: {}", e))?;
-
-    // Read the report
-    if report_path.exists() {
-        let content = std::fs::read_to_string(&report_path)
-            .map_err(|e| format!("Failed to read report: {}", e))?;
-        let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
-        let _ = std::fs::remove_file(&report_path);
-        serde_json::from_str(content.trim())
-            .map_err(|e| format!("Report parse error: {}", e))
-    } else {
-        Ok(serde_json::json!({ "status": "unknown", "error": "No report file generated. The UAC prompt may have been declined." }))
-    }
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Get script execution report
-// ────────────────────────────────────────────────────────────────────
-#[tauri::command]
-async fn get_script_report() -> Result<serde_json::Value, String> {
-    let report_path = std::env::temp_dir().join("aimcamp_script_report.json");
-    if !report_path.exists() {
-        return Ok(serde_json::json!({ "status": "no_report" }));
-    }
-    let content = std::fs::read_to_string(&report_path)
-        .map_err(|e| format!("Failed to read report: {}", e))?;
-    let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
-    serde_json::from_str(content.trim())
-        .map_err(|e| format!("Report parse error: {}", e))
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Feedback system — capture screenshot, save/load history, send
-// ────────────────────────────────────────────────────────────────────
-
-fn feedback_file_path() -> Result<std::path::PathBuf, String> {
-    let mut dir = dirs_next::data_local_dir()
-        .ok_or_else(|| "Cannot find local data dir".to_string())?;
-    dir.push("aimcamp-player-agent");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("Dir create failed: {}", e))?;
-    dir.push("feedback.json");
-    Ok(dir)
-}
-
-fn screenshots_dir() -> Result<std::path::PathBuf, String> {
-    let mut dir = dirs_next::data_local_dir()
-        .ok_or_else(|| "Cannot find local data dir".to_string())?;
-    dir.push("aimcamp-player-agent");
-    dir.push("screenshots");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("Dir create failed: {}", e))?;
-    Ok(dir)
-}
-
-#[tauri::command]
-async fn capture_screenshot() -> Result<String, String> {
-    let script = r#"
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-
-$sig = @'
-using System;
-using System.Runtime.InteropServices;
-public class WinApi {
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
-}
-'@
-Add-Type -TypeDefinition $sig -ErrorAction SilentlyContinue
-
-$hwnd = [WinApi]::GetForegroundWindow()
-$rect = New-Object WinApi+RECT
-[WinApi]::GetWindowRect($hwnd, [ref]$rect) | Out-Null
-$w = $rect.Right - $rect.Left
-$h = $rect.Bottom - $rect.Top
-if ($w -lt 100 -or $h -lt 100) { $w = 1920; $h = 1080; $rect.Left = 0; $rect.Top = 0 }
-$bmp = New-Object Drawing.Bitmap($w, $h)
-$g = [Drawing.Graphics]::FromImage($bmp)
-$g.CopyFromScreen($rect.Left, $rect.Top, 0, 0, (New-Object Drawing.Size($w, $h)))
-$g.Dispose()
-$ms = New-Object IO.MemoryStream
-$bmp.Save($ms, [Drawing.Imaging.ImageFormat]::Png)
-$bmp.Dispose()
-$b64 = [Convert]::ToBase64String($ms.ToArray())
-$ms.Dispose()
-$b64
-"#;
-    let output = Command::new("powershell")
-        .args(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
-        .output()
-        .map_err(|e| format!("Screenshot failed: {}", e))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if stdout.is_empty() {
-        Err("Screenshot capture returned empty".into())
-    } else {
-        Ok(stdout)
-    }
-}
-
-#[tauri::command]
-async fn save_feedback(
-    id: String,
-    tab: String,
-    description: String,
-    screenshot_b64: String,
-    sent: String,
-) -> Result<String, String> {
-    // Save screenshot file
-    let ss_dir = screenshots_dir()?;
-    let ss_path = ss_dir.join(format!("{}.png", id));
-    if !screenshot_b64.is_empty() {
-        let bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            &screenshot_b64,
-        ).map_err(|e| format!("Base64 decode: {}", e))?;
-        std::fs::write(&ss_path, &bytes).map_err(|e| format!("Screenshot write: {}", e))?;
-    }
-
-    // Load existing feedback
-    let fb_path = feedback_file_path()?;
-    let mut entries: Vec<serde_json::Value> = if fb_path.exists() {
-        let data = std::fs::read_to_string(&fb_path).unwrap_or_else(|_| "[]".into());
-        serde_json::from_str(&data).unwrap_or_else(|_| vec![])
-    } else {
-        vec![]
-    };
-
-    let entry = serde_json::json!({
-        "id": id,
-        "tab": tab,
-        "description": description,
-        "screenshot_path": ss_path.to_string_lossy(),
-        "sent": sent,
-        "timestamp": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-    });
-    entries.push(entry);
-
-    std::fs::write(&fb_path, serde_json::to_string_pretty(&entries).unwrap_or_default())
-        .map_err(|e| format!("Feedback save: {}", e))?;
-
-    Ok(ss_path.to_string_lossy().to_string())
-}
-
-#[tauri::command]
-async fn load_feedback_history() -> Result<serde_json::Value, String> {
-    let fb_path = feedback_file_path()?;
-    if !fb_path.exists() {
-        return Ok(serde_json::json!([]));
-    }
-    let data = std::fs::read_to_string(&fb_path).map_err(|e| format!("Read: {}", e))?;
-    serde_json::from_str(&data).map_err(|e| format!("Parse: {}", e))
-}
-
-#[tauri::command]
-async fn delete_feedback(id: String) -> Result<(), String> {
-    let fb_path = feedback_file_path()?;
-    if !fb_path.exists() { return Ok(()); }
-    let data = std::fs::read_to_string(&fb_path).map_err(|e| format!("Read: {}", e))?;
-    let mut entries: Vec<serde_json::Value> = serde_json::from_str(&data).unwrap_or_default();
-    entries.retain(|e| e["id"].as_str() != Some(&id));
-    std::fs::write(&fb_path, serde_json::to_string_pretty(&entries).unwrap_or_default())
-        .map_err(|e| format!("Write: {}", e))?;
-
-    // Also remove screenshot
-    let ss_dir = screenshots_dir()?;
-    let ss_path = ss_dir.join(format!("{}.png", id));
-    let _ = std::fs::remove_file(ss_path);
-    Ok(())
-}
-
-#[tauri::command]
-async fn send_feedback_github(
-    token: String,
-    repo: String,
-    title: String,
-    body: String,
-    screenshot_b64: String,
-    labels: Vec<String>,
-) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
-
-    // Build body with screenshot as inline image if available
-    let full_body = if screenshot_b64.is_empty() {
-        body.clone()
-    } else {
-        format!("{}\n\n---\n### Screenshot\n![screenshot](data:image/png;base64,{})", body, &screenshot_b64[..screenshot_b64.len().min(100_000)])
-    };
-
-    let issue = serde_json::json!({
-        "title": title,
-        "body": full_body,
-        "labels": labels,
-    });
-
-    let url = format!("https://api.github.com/repos/{}/issues", repo);
-    let resp = client
-        .post(&url)
-        .header("Accept", "application/vnd.github+json")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("User-Agent", "aimcamp-player-agent/1.0")
-        .json(&issue)
-        .send()
-        .await
-        .map_err(|e| format!("GitHub request failed: {}", e))?;
-
-    let status = resp.status();
-    if status.is_success() {
-        let json: serde_json::Value = resp.json().await.unwrap_or_default();
-        let url = json["html_url"].as_str().unwrap_or("created");
-        Ok(format!("Issue created: {}", url))
-    } else {
-        let text = resp.text().await.unwrap_or_default();
-        Err(format!("GitHub error ({}): {}", status, &text[..text.len().min(300)]))
-    }
-}
-
-#[tauri::command]
-async fn send_feedback_discord_with_image(
-    webhook_url: String,
-    description: String,
-    tab: String,
-    screenshot_b64: String,
-) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
-
-    let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-
-    let embed = serde_json::json!({
-        "embeds": [{
-            "title": "💡 Player Agent — Sugestão",
-            "description": description,
-            "color": 0x00ffaa,
-            "fields": [
-                { "name": "Separador", "value": tab, "inline": true },
-                { "name": "Timestamp", "value": timestamp, "inline": true },
-            ],
-            "image": if !screenshot_b64.is_empty() { serde_json::json!({"url": "attachment://screenshot.png"}) } else { serde_json::json!(null) },
-            "footer": { "text": "aim.camp Player Agent — Feedback System" },
-        }]
-    });
-
-    if screenshot_b64.is_empty() {
-        // Text-only
-        let resp = client
-            .post(&webhook_url)
-            .header("Content-Type", "application/json")
-            .json(&embed)
-            .send()
-            .await
-            .map_err(|e| format!("Discord request failed: {}", e))?;
-
-        if resp.status().is_success() || resp.status().as_u16() == 204 {
-            Ok("Sugestão enviada para Discord".into())
-        } else {
-            let text = resp.text().await.unwrap_or_default();
-            Err(format!("Discord error: {}", &text[..text.len().min(300)]))
-        }
-    } else {
-        // With image attachment via multipart
-        let img_bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            &screenshot_b64,
-        ).map_err(|e| format!("Base64 decode: {}", e))?;
-
-        let payload_json = serde_json::to_string(&embed)
-            .map_err(|e| format!("JSON: {}", e))?;
-
-        let form = reqwest::multipart::Form::new()
-            .text("payload_json", payload_json)
-            .part("files[0]", reqwest::multipart::Part::bytes(img_bytes)
-                .file_name("screenshot.png")
-                .mime_str("image/png")
-                .map_err(|e| format!("MIME: {}", e))?);
-
-        let resp = client
-            .post(&webhook_url)
-            .multipart(form)
-            .send()
-            .await
-            .map_err(|e| format!("Discord multipart failed: {}", e))?;
-
-        if resp.status().is_success() || resp.status().as_u16() == 204 {
-            Ok("Sugestão + screenshot enviados para Discord".into())
-        } else {
-            let text = resp.text().await.unwrap_or_default();
-            Err(format!("Discord error: {}", &text[..text.len().min(300)]))
-        }
-    }
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Benchmark / Frame‑time Analysis — parse PresentMon CSV & CapFrameX JSON
-// ────────────────────────────────────────────────────────────────────
-
-#[derive(serde::Serialize)]
-struct BenchmarkResult {
-    file_name: String,
-    process_name: String,
-    duration_secs: f64,
-    frame_count: usize,
-    avg_fps: f64,
-    min_fps: f64,
-    max_fps: f64,
-    p01_fps: f64,
-    p1_fps: f64,
-    p5_fps: f64,
-    median_fps: f64,
-    p95_fps: f64,
-    p99_fps: f64,
-    avg_frametime: f64,
-    p95_frametime: f64,
-    p99_frametime: f64,
-    p999_frametime: f64,
-    stutter_count: usize,
-    stutter_pct: f64,
-    dropped_frames: usize,
-    frametimes: Vec<f64>,
-    timestamps: Vec<f64>,
-    fps_values: Vec<f64>,
-}
-
-fn percentile(sorted: &[f64], p: f64) -> f64 {
-    if sorted.is_empty() { return 0.0; }
-    let idx = (p / 100.0 * (sorted.len() as f64 - 1.0)).max(0.0);
-    let lo = idx.floor() as usize;
-    let hi = (lo + 1).min(sorted.len() - 1);
-    let frac = idx - lo as f64;
-    sorted[lo] * (1.0 - frac) + sorted[hi] * frac
-}
-
-fn calc_metrics(frametimes: &[f64], timestamps: &[f64], dropped: usize, process: &str, file_name: &str) -> BenchmarkResult {
-    let n = frametimes.len();
-    if n == 0 {
-        return BenchmarkResult {
-            file_name: file_name.to_string(), process_name: process.to_string(),
-            duration_secs: 0.0, frame_count: 0, avg_fps: 0.0, min_fps: 0.0, max_fps: 0.0,
-            p01_fps: 0.0, p1_fps: 0.0, p5_fps: 0.0, median_fps: 0.0, p95_fps: 0.0, p99_fps: 0.0,
-            avg_frametime: 0.0, p95_frametime: 0.0, p99_frametime: 0.0, p999_frametime: 0.0,
-            stutter_count: 0, stutter_pct: 0.0, dropped_frames: dropped,
-            frametimes: vec![], timestamps: vec![], fps_values: vec![],
-        };
-    }
-
-    let fps_vals: Vec<f64> = frametimes.iter().map(|&ms| if ms > 0.0 { 1000.0 / ms } else { 0.0 }).collect();
-    let duration = timestamps.last().unwrap_or(&0.0) - timestamps.first().unwrap_or(&0.0);
-    let avg_ft: f64 = frametimes.iter().sum::<f64>() / n as f64;
-    let avg_fps = if avg_ft > 0.0 { 1000.0 / avg_ft } else { 0.0 };
-
-    let mut sorted_fps = fps_vals.clone();
-    sorted_fps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-    let mut sorted_ft = frametimes.to_vec();
-    sorted_ft.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Stutter: frames with frametime > 2.5× average
-    let stutter_threshold = avg_ft * 2.5;
-    let stutter_count = frametimes.iter().filter(|&&ft| ft > stutter_threshold).count();
-
-    // Downsample for frontend if > 5000 points
-    let (ds_ft, ds_ts, ds_fps) = if n > 5000 {
-        let step = n as f64 / 5000.0;
-        let mut dft = Vec::with_capacity(5000);
-        let mut dts = Vec::with_capacity(5000);
-        let mut dfps = Vec::with_capacity(5000);
-        let mut i = 0.0;
-        while (i as usize) < n {
-            let idx = i as usize;
-            dft.push(frametimes[idx]);
-            dts.push(timestamps[idx]);
-            dfps.push(fps_vals[idx]);
-            i += step;
-        }
-        (dft, dts, dfps)
-    } else {
-        (frametimes.to_vec(), timestamps.to_vec(), fps_vals.clone())
-    };
-
-    BenchmarkResult {
-        file_name: file_name.to_string(),
-        process_name: process.to_string(),
-        duration_secs: duration,
-        frame_count: n,
-        avg_fps,
-        min_fps: sorted_fps.first().copied().unwrap_or(0.0),
-        max_fps: sorted_fps.last().copied().unwrap_or(0.0),
-        p01_fps: percentile(&sorted_fps, 0.1),
-        p1_fps: percentile(&sorted_fps, 1.0),
-        p5_fps: percentile(&sorted_fps, 5.0),
-        median_fps: percentile(&sorted_fps, 50.0),
-        p95_fps: percentile(&sorted_fps, 95.0),
-        p99_fps: percentile(&sorted_fps, 99.0),
-        avg_frametime: avg_ft,
-        p95_frametime: percentile(&sorted_ft, 95.0),
-        p99_frametime: percentile(&sorted_ft, 99.0),
-        p999_frametime: percentile(&sorted_ft, 99.9),
-        stutter_count,
-        stutter_pct: stutter_count as f64 / n as f64 * 100.0,
-        dropped_frames: dropped,
-        frametimes: ds_ft,
-        timestamps: ds_ts,
-        fps_values: ds_fps,
-    }
-}
-
-#[tauri::command]
-async fn pick_benchmark_file() -> Result<String, String> {
-    use tauri::api::dialog::blocking::FileDialogBuilder;
-    FileDialogBuilder::new()
-        .add_filter("Benchmark Files", &["csv", "json"])
-        .add_filter("PresentMon CSV", &["csv"])
-        .add_filter("CapFrameX JSON", &["json"])
-        .set_title("Selecionar ficheiro de benchmark (PresentMon CSV ou CapFrameX JSON)")
-        .pick_file()
-        .map(|p| p.to_string_lossy().to_string())
-        .ok_or_else(|| "Cancelled".to_string())
-}
-
-#[tauri::command]
-async fn parse_benchmark_file(path: String) -> Result<BenchmarkResult, String> {
-    let file_name = std::path::Path::new(&path)
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-
-    if path.to_lowercase().ends_with(".csv") {
-        parse_presentmon_csv(&path, &file_name)
-    } else if path.to_lowercase().ends_with(".json") {
-        parse_capframex_json(&path, &file_name)
-    } else {
-        Err("Formato não suportado. Usa ficheiros .csv (PresentMon) ou .json (CapFrameX).".into())
-    }
-}
-
-fn parse_presentmon_csv(path: &str, file_name: &str) -> Result<BenchmarkResult, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Erro ao ler ficheiro: {}", e))?;
-    let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
-    let mut lines = content.lines();
-
-    // Parse header to find column indices
-    let header = lines.next().ok_or("Ficheiro CSV vazio")?;
-    let cols: Vec<&str> = header.split(',').collect();
-
-    let find_col = |names: &[&str]| -> Option<usize> {
-        for name in names {
-            if let Some(i) = cols.iter().position(|c| c.trim().eq_ignore_ascii_case(name)) {
-                return Some(i);
-            }
-        }
-        None
-    };
-
-    let col_app = find_col(&["Application", "application"]);
-    let col_time = find_col(&["TimeInSeconds", "timeinseconds"]);
-    let col_ft = find_col(&["MsBetweenPresents", "msbetweenpresents", "FrameTime"]);
-    let col_dropped = find_col(&["Dropped", "dropped"]);
-
-    let col_ft = col_ft.ok_or("Coluna 'MsBetweenPresents' ou 'FrameTime' não encontrada no CSV")?;
-
-    let mut frametimes: Vec<f64> = Vec::new();
-    let mut timestamps: Vec<f64> = Vec::new();
-    let mut process = String::new();
-    let mut dropped_count = 0usize;
-
-    for line in lines {
-        let fields: Vec<&str> = line.split(',').collect();
-        if fields.len() <= col_ft { continue; }
-
-        let ft: f64 = match fields[col_ft].trim().parse() {
-            Ok(v) if v > 0.0 => v,
-            _ => continue,
-        };
-
-        let ts = col_time
-            .and_then(|i| fields.get(i))
-            .and_then(|v| v.trim().parse::<f64>().ok())
-            .unwrap_or_else(|| if timestamps.is_empty() { 0.0 } else { timestamps.last().unwrap() + ft / 1000.0 });
-
-        if process.is_empty() {
-            if let Some(i) = col_app {
-                if let Some(v) = fields.get(i) {
-                    let v = v.trim();
-                    if !v.is_empty() && v != "<unknown>" { process = v.to_string(); }
-                }
-            }
-        }
-
-        if let Some(i) = col_dropped {
-            if let Some(v) = fields.get(i) {
-                if v.trim() == "1" || v.trim().eq_ignore_ascii_case("true") {
-                    dropped_count += 1;
-                }
-            }
-        }
-
-        frametimes.push(ft);
-        timestamps.push(ts);
-    }
-
-    if frametimes.is_empty() {
-        return Err("Nenhum frame válido encontrado no ficheiro CSV".into());
-    }
-
-    if process.is_empty() { process = "Unknown".into(); }
-    Ok(calc_metrics(&frametimes, &timestamps, dropped_count, &process, file_name))
-}
-
-fn parse_capframex_json(path: &str, file_name: &str) -> Result<BenchmarkResult, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Erro ao ler ficheiro: {}", e))?;
-    let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
-    let json: serde_json::Value = serde_json::from_str(content)
-        .map_err(|e| format!("JSON inválido: {}", e))?;
-
-    // CapFrameX JSON format: { "Runs": [ { "CaptureData": { "MsBetweenPresents": [...], "Dropped": [...] } } ], "Info": { "ProcessName": "..." } }
-    // Each Run is a SessionRun object with CaptureData sub-object
-    let (frametimes, dropped) = if let Some(runs) = json.get("Runs").and_then(|r| r.as_array()) {
-        // Try as array of SessionRun objects (official CapFrameX format)
-        let mut ft: Vec<f64> = Vec::new();
-        let mut dr: usize = 0;
-        let mut found_obj = false;
-        for run in runs {
-            if let Some(capture) = run.get("CaptureData") {
-                found_obj = true;
-                if let Some(ms) = capture.get("MsBetweenPresents").and_then(|m| m.as_array()) {
-                    ft.extend(ms.iter().filter_map(|v| v.as_f64()).filter(|&v| v > 0.0));
-                }
-                if let Some(dropped_arr) = capture.get("Dropped").and_then(|d| d.as_array()) {
-                    dr += dropped_arr.iter().filter(|v| v.as_bool().unwrap_or(false) || v.as_i64().unwrap_or(0) == 1).count();
-                }
-            }
-        }
-        if !found_obj {
-            // Fallback: maybe Runs is array of arrays of raw frame times
-            ft = runs.iter()
-                .filter_map(|r| r.as_array())
-                .flatten()
-                .filter_map(|v| v.as_f64())
-                .filter(|&v| v > 0.0)
-                .collect();
-        }
-        (ft, dr)
-    } else if let Some(data) = json.get("CaptureData").and_then(|d| d.get("MsBetweenPresents")).and_then(|m| m.as_array()) {
-        let ft: Vec<f64> = data.iter().filter_map(|v| v.as_f64()).filter(|&v| v > 0.0).collect();
-        let dr = json.get("CaptureData")
-            .and_then(|d| d.get("Dropped"))
-            .and_then(|d| d.as_array())
-            .map(|arr| arr.iter().filter(|v| v.as_bool().unwrap_or(false) || v.as_i64().unwrap_or(0) == 1).count())
-            .unwrap_or(0);
-        (ft, dr)
-    } else if let Some(data) = json.get("MsBetweenPresents").and_then(|m| m.as_array()) {
-        let ft: Vec<f64> = data.iter().filter_map(|v| v.as_f64()).filter(|&v| v > 0.0).collect();
-        (ft, 0)
-    } else {
-        return Err("Formato CapFrameX não reconhecido: não encontrou frame times".into());
-    };
-
-    if frametimes.is_empty() {
-        return Err("Nenhum frame válido encontrado no CapFrameX JSON".into());
-    }
-
-    // Build timestamps from cumulative frame times
-    let mut timestamps = Vec::with_capacity(frametimes.len());
-    let mut t = 0.0;
-    for &ft in &frametimes {
-        timestamps.push(t);
-        t += ft / 1000.0;
-    }
-
-    let process = json.get("Info")
-        .and_then(|i| i.get("ProcessName"))
-        .and_then(|p| p.as_str())
-        .or_else(|| json.get("ProcessName").and_then(|p| p.as_str()))
-        .unwrap_or("Unknown")
-        .to_string();
-
-    Ok(calc_metrics(&frametimes, &timestamps, dropped, &process, file_name))
-}
-
-#[tauri::command]
-async fn scan_capframex_folder() -> Result<Vec<String>, String> {
-    let appdata = std::env::var("APPDATA").unwrap_or_default();
-    let cx_dir = std::path::Path::new(&appdata).join("CapFrameX").join("Captures");
-    if !cx_dir.exists() {
-        return Ok(vec![]);
-    }
-
-    let mut files: Vec<String> = Vec::new();
-    fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if let Some(ext) = p.extension() {
-                    if ext == "json" {
-                        out.push(p.to_string_lossy().to_string());
-                    }
-                }
-            }
-        }
-    }
-    walk(&cx_dir, &mut files);
-    files.sort_by(|a, b| b.cmp(a)); // newest first by filename (CapFrameX uses timestamps)
-    files.truncate(50); // limit to 50 most recent
-    Ok(files)
-}
-
-#[tauri::command]
-async fn check_presentmon() -> Result<serde_json::Value, String> {
-    // Check common PresentMon locations
-    let checks = vec![
-        "PresentMon.exe",
-        "PresentMon64.exe",
-        r"C:\Program Files\PresentMon\PresentMon.exe",
-        r"C:\Program Files (x86)\PresentMon\PresentMon.exe",
-    ];
-
-    for path in &checks {
-        let result = Command::new("where")
-            .arg(path)
-            .output();
-        if let Ok(out) = result {
-            if out.status.success() {
-                let found = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                return Ok(serde_json::json!({ "installed": true, "path": found }));
-            }
-        }
-        // Check file existence directly
-        if std::path::Path::new(path).exists() {
-            return Ok(serde_json::json!({ "installed": true, "path": path }));
-        }
-    }
-
-    // Check CapFrameX installation
-    let appdata = std::env::var("APPDATA").unwrap_or_default();
-    let cx_path = std::path::Path::new(&appdata).join("CapFrameX");
-    let cx_installed = cx_path.exists();
-
-    Ok(serde_json::json!({
-        "installed": false,
-        "path": "",
-        "capframex_installed": cx_installed,
-        "capframex_captures": if cx_installed {
-            cx_path.join("Captures").to_string_lossy().to_string()
-        } else { "".into() }
-    }))
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Auto-update — check GitHub releases for newer version
-// ────────────────────────────────────────────────────────────────────
-
-#[tauri::command]
-async fn check_for_update() -> Result<serde_json::Value, String> {
-    let current_version = env!("CARGO_PKG_VERSION");
-    let client = reqwest::Client::builder()
-        .user_agent("aimcamp-player-agent")
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
-
-    let resp = client
-        .get("https://api.github.com/repos/aim-camp/player-agent/releases/latest")
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {}", e))?;
-
-    if !resp.status().is_success() {
-        return Ok(serde_json::json!({ "update_available": false, "error": format!("GitHub API: {}", resp.status()) }));
-    }
-
-    let release: serde_json::Value = resp.json().await
-        .map_err(|e| format!("Parse error: {}", e))?;
-
-    let tag = release["tag_name"].as_str().unwrap_or("v0.0.0");
-    let remote_version = tag.trim_start_matches('v');
-
-    let has_update = version_newer(remote_version, current_version);
-
-    // Find installer download URLs
-    let mut msi_url = String::new();
-    let mut nsis_url = String::new();
-    if let Some(assets) = release["assets"].as_array() {
-        for asset in assets {
-            let name = asset["name"].as_str().unwrap_or("");
-            let url = asset["browser_download_url"].as_str().unwrap_or("");
-            if name.ends_with(".msi") { msi_url = url.to_string(); }
-            if name.ends_with(".exe") && name.contains("setup") { nsis_url = url.to_string(); }
-        }
-    }
-
-    Ok(serde_json::json!({
-        "update_available": has_update,
-        "current_version": current_version,
-        "latest_version": remote_version,
-        "tag": tag,
-        "release_name": release["name"].as_str().unwrap_or(""),
-        "release_notes": release["body"].as_str().unwrap_or(""),
-        "html_url": release["html_url"].as_str().unwrap_or(""),
-        "msi_url": msi_url,
-        "nsis_url": nsis_url,
-        "published_at": release["published_at"].as_str().unwrap_or("")
-    }))
-}
-
-fn version_newer(remote: &str, current: &str) -> bool {
-    let parse = |v: &str| -> Vec<u32> {
-        v.split('.').filter_map(|s| s.parse().ok()).collect()
-    };
-    let r = parse(remote);
-    let c = parse(current);
-    for i in 0..3 {
-        let rv = r.get(i).copied().unwrap_or(0);
-        let cv = c.get(i).copied().unwrap_or(0);
-        if rv > cv { return true; }
-        if rv < cv { return false; }
-    }
-    false
-}
-
-#[tauri::command]
-async fn download_update(url: String) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .user_agent("aimcamp-player-agent")
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
-
-    let resp = client.get(&url).send().await
-        .map_err(|e| format!("Download error: {}", e))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("Download failed: {}", resp.status()));
-    }
-
-    let fname = url.split('/').last().unwrap_or("update-installer.msi");
-    let download_dir = dirs_next::download_dir()
-        .unwrap_or_else(|| std::env::temp_dir());
-    let dest = download_dir.join(fname);
-
-    let bytes = resp.bytes().await.map_err(|e| format!("Read error: {}", e))?;
-    std::fs::write(&dest, &bytes).map_err(|e| format!("Write error: {}", e))?;
-
-    Ok(dest.to_string_lossy().to_string())
-}
-
-#[tauri::command]
-async fn run_installer(path: String) -> Result<(), String> {
-    Command::new("cmd")
-        .args(&["/C", "start", "", &path])
-        .spawn()
-        .map_err(|e| format!("Launch installer error: {}", e))?;
-    Ok(())
-}
-
-// ────────────────────────────────────────────────────────────────────
 fn main() {
+    let ai_state = Arc::new(Mutex::new(AIState::new()));
+    
     tauri::Builder::default()
+        .manage(ai_state)
         .invoke_handler(tauri::generate_handler![
             generate_script,
             save_script,
@@ -2705,48 +1854,38 @@ fn main() {
             save_cfg,
             load_cfg,
             get_hardware_info,
-            get_driver_info,
-            check_driver_updates,
-            install_driver_update,
-            get_script_report,
             list_processes,
             kill_process,
             ping_server,
-            apply_dns,
-            restore_dns,
-            apply_tcp_tweaks,
-            restore_tcp_tweaks,
-            apply_qos_cs2,
-            remove_qos_cs2,
-            set_mtu,
-            prioritize_ethernet,
-            disable_wifi,
-            restore_network_defaults,
             scan_demos,
             parse_demo_header,
             open_demo_in_cs2,
             pick_demo_folder,
-            advisor_chat,
+            ai_chat,
             send_to_discord,
-            capture_screenshot,
-            save_feedback,
-            load_feedback_history,
-            delete_feedback,
-            send_feedback_github,
-            send_feedback_discord_with_image,
-            pick_benchmark_file,
-            parse_benchmark_file,
-            scan_capframex_folder,
-            check_presentmon,
-            check_for_update,
-            download_update,
-            run_installer,
-            import_schema_zip,
-            export_schema_zip,
-            llm_install_ollama,
-            llm_test_connection,
-            llm_download_model,
+            // Local AI commands
+            init_ai_assistant,
+            ai_local_chat,
+            ai_explain_feature,
+            ai_get_suggestions,
+            ai_record_optimization,
+            ai_record_satisfaction,
+            ai_process_voice,
+            ai_get_conversation_history,
+            ai_clear_history,
+            ai_update_config,
+            ai_get_config,
+            ai_search_features,
+            // LLM Manager commands
+            llm_get_all_providers,
+            llm_get_active_provider,
+            llm_set_active_provider,
+            llm_enable_provider,
+            llm_update_config,
             llm_check_requirements,
+            llm_download_model,
+            llm_add_custom_provider,
+            llm_remove_provider,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -2994,454 +2133,24 @@ async fn kill_process(pid: u32) -> Result<String, String> {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Ping server — TCP connect latency (ICMP blocked on game servers)
+// Ping server — returns avg/min/max/loss
 // ────────────────────────────────────────────────────────────────────
 #[tauri::command]
-async fn ping_server(host: String, port: u16, count: u32) -> Result<serde_json::Value, String> {
+async fn ping_server(host: String, count: u32) -> Result<serde_json::Value, String> {
     let script = format!(r#"
-$times = @()
-$h = '{host}'
-$p = {port}
-$count = {count}
-for ($i = 0; $i -lt $count; $i++) {{
-    $start = [DateTime]::UtcNow
-    try {{
-        $tcp = New-Object System.Net.Sockets.TcpClient
-        $conn = $tcp.BeginConnect($h, $p, $null, $null)
-        $wait = $conn.AsyncWaitHandle.WaitOne(2000, $false)
-        if ($wait -and $tcp.Connected) {{
-            $ms = [math]::Round(([DateTime]::UtcNow - $start).TotalMilliseconds, 0)
-            $times += $ms
-            $tcp.Close()
-        }} else {{
-            try {{ $tcp.Close() }} catch {{}}
-        }}
-    }} catch {{}}
-    if ($i -lt ($count - 1)) {{ Start-Sleep -Milliseconds 200 }}
-}}
-if ($times.Count -gt 0) {{
-    $avg = [math]::Round(($times | Measure-Object -Average).Average, 1)
-    $min = ($times | Measure-Object -Minimum).Minimum
-    $max = ($times | Measure-Object -Maximum).Maximum
-    $loss = [math]::Round(($count - $times.Count) * 100 / $count, 0)
-    @{{ host='{host}'; avg=$avg; min=$min; max=$max; loss=$loss; ok=$true }} | ConvertTo-Json
+$r = Test-Connection -ComputerName '{}' -Count {} -ErrorAction SilentlyContinue
+if ($r) {{
+    $t = @($r | ForEach-Object {{ $_.ResponseTime }})
+    @{{ host='{}'; avg=[math]::Round(($t|Measure-Object -Average).Average,1); min=($t|Measure-Object -Minimum).Minimum; max=($t|Measure-Object -Maximum).Maximum; loss=0; ok=$true }} | ConvertTo-Json
 }} else {{
-    @{{ host='{host}'; avg=-1; min=-1; max=-1; loss=100; ok=$false }} | ConvertTo-Json
+    @{{ host='{}'; avg=-1; min=-1; max=-1; loss=100; ok=$false }} | ConvertTo-Json
 }}
-"#, host = host, port = port, count = count);
+"#, host, count, host, host);
     let output = Command::new("powershell")
         .args(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &script])
         .output()
         .map_err(|e| format!("Ping failed: {}", e))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(stdout.trim())
-        .map_err(|e| format!("Ping JSON parse: {} — raw: {}", e, &stdout[..stdout.len().min(300)]))
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Network Optimization Commands
-// ────────────────────────────────────────────────────────────────────
-#[tauri::command]
-async fn apply_dns(primary: String, secondary: String) -> Result<String, String> {
-    let script = format!(r#"
-$adapter = Get-NetAdapter | Where-Object {{ $_.Status -eq 'Up' -and ($_.InterfaceDescription -notlike '*Virtual*') -and ($_.InterfaceDescription -notlike '*Loopback*') }} | Sort-Object -Property LinkSpeed -Descending | Select-Object -First 1
-if (-not $adapter) {{ throw 'No active network adapter found' }}
-$ifIdx = $adapter.InterfaceIndex
-Set-DnsClientServerAddress -InterfaceIndex $ifIdx -ServerAddresses ('{primary}','{secondary}')
-"DNS set to {primary}/{secondary} on $($adapter.Name)"
-"#, primary = primary, secondary = secondary);
-    let out = Command::new("powershell")
-        .args(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &script])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-    }
-}
-
-#[tauri::command]
-async fn restore_dns() -> Result<String, String> {
-    let script = r#"
-$adapters = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and ($_.InterfaceDescription -notlike '*Virtual*') }
-foreach ($a in $adapters) {
-    Set-DnsClientServerAddress -InterfaceIndex $a.InterfaceIndex -ResetServerAddresses
-}
-"DNS restored to DHCP automatic on $($adapters.Count) adapter(s)"
-"#;
-    let out = Command::new("powershell")
-        .args(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-    }
-}
-
-#[tauri::command]
-async fn apply_tcp_tweaks() -> Result<String, String> {
-    let script = r#"
-# Disable Nagle algorithm globally (reduces latency at cost of bandwidth)
-$path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'
-Set-ItemProperty -Path $path -Name 'TcpAckFrequency' -Value 1 -Type DWord -Force
-Set-ItemProperty -Path $path -Name 'TCPNoDelay' -Value 1 -Type DWord -Force
-Set-ItemProperty -Path $path -Name 'TcpDelAckTicks' -Value 0 -Type DWord -Force
-# Increase TCP window size
-Set-ItemProperty -Path $path -Name 'GlobalMaxTcpWindowSize' -Value 65535 -Type DWord -Force
-Set-ItemProperty -Path $path -Name 'TcpWindowSize' -Value 65535 -Type DWord -Force
-# Enable ECN
-netsh int tcp set global ecncapability=enabled 2>$null | Out-Null
-# Enable RSS (Receive Side Scaling)
-netsh int tcp set global rss=enabled 2>$null | Out-Null
-# Set congestion provider
-netsh int tcp set supplemental template=internet congestionprovider=CTCP 2>$null | Out-Null
-"TCP gaming tweaks applied (Nagle disabled, ECN/RSS enabled)"
-"#;
-    let out = Command::new("powershell")
-        .args(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-    }
-}
-
-#[tauri::command]
-async fn restore_tcp_tweaks() -> Result<String, String> {
-    let script = r#"
-$path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'
-@('TcpAckFrequency','TCPNoDelay','TcpDelAckTicks','GlobalMaxTcpWindowSize','TcpWindowSize') | ForEach-Object {
-    Remove-ItemProperty -Path $path -Name $_ -ErrorAction SilentlyContinue
-}
-netsh int tcp set global ecncapability=default 2>$null | Out-Null
-netsh int tcp set global rss=enabled 2>$null | Out-Null
-"TCP settings restored to Windows defaults"
-"#;
-    let out = Command::new("powershell")
-        .args(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-    }
-}
-
-#[tauri::command]
-async fn apply_qos_cs2() -> Result<String, String> {
-    let script = r#"
-# Create DSCP QoS policy for CS2 executables (DSCP 46 = Expedited Forwarding)
-$names = @('cs2.exe', 'CS2.exe')
-foreach ($exe in $names) {
-    $policy = Get-NetQosPolicy -Name "AimCamp_$exe" -ErrorAction SilentlyContinue
-    if (-not $policy) {
-        New-NetQosPolicy -Name "AimCamp_$exe" -AppPathNameMatchCondition $exe `
-            -IPProtocolMatchCondition Both -DSCPAction 46 -NetworkProfile All `
-            -ErrorAction SilentlyContinue | Out-Null
-    }
-}
-# Also set throttle rate to 0 (unlimited) for cs2
-New-NetQosPolicy -Name "AimCamp_CS2_Priority" -AppPathNameMatchCondition "cs2.exe" `
-    -PriorityValue8021Action 6 -ErrorAction SilentlyContinue | Out-Null
-"QoS DSCP 46 (Expedited Forwarding) applied to cs2.exe"
-"#;
-    let out = Command::new("powershell")
-        .args(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-    }
-}
-
-#[tauri::command]
-async fn remove_qos_cs2() -> Result<String, String> {
-    let script = r#"
-Get-NetQosPolicy | Where-Object { $_.Name -like 'AimCamp_*' } | Remove-NetQosPolicy -Confirm:$false -ErrorAction SilentlyContinue
-"QoS policies for CS2 removed"
-"#;
-    let out = Command::new("powershell")
-        .args(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-    }
-}
-
-#[tauri::command]
-async fn set_mtu(mtu: u32) -> Result<String, String> {
-    let script = format!(r#"
-$adapter = Get-NetAdapter | Where-Object {{ $_.Status -eq 'Up' -and ($_.InterfaceDescription -notlike '*Virtual*') -and ($_.InterfaceDescription -notlike '*Loopback*') }} | Sort-Object -Property LinkSpeed -Descending | Select-Object -First 1
-if (-not $adapter) {{ throw 'No active network adapter found' }}
-netsh interface ipv4 set subinterface "$($adapter.Name)" mtu={mtu} store=persistent 2>&1 | Out-Null
-"MTU set to {mtu} on $($adapter.Name)"
-"#, mtu = mtu);
-    let out = Command::new("powershell")
-        .args(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &script])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-    }
-}
-
-#[tauri::command]
-async fn prioritize_ethernet() -> Result<String, String> {
-    let script = r#"
-$eth = Get-NetAdapter | Where-Object { ($_.InterfaceDescription -like '*Ethernet*' -or $_.InterfaceDescription -like '*Realtek*' -or $_.InterfaceDescription -like '*Intel*' -or $_.MediaType -eq '802.3') -and $_.Status -eq 'Up' } | Select-Object -First 1
-if (-not $eth) { throw 'No active Ethernet adapter found' }
-# Set very low metric (higher priority) for IPv4 and IPv6
-Set-NetIPInterface -InterfaceIndex $eth.InterfaceIndex -InterfaceMetric 5 -ErrorAction SilentlyContinue
-"Ethernet '$($eth.Name)' set to metric 5 (highest priority)"
-"#;
-    let out = Command::new("powershell")
-        .args(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-    }
-}
-
-#[tauri::command]
-async fn disable_wifi() -> Result<String, String> {
-    let script = r#"
-$wifi = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*Wi-Fi*' -or $_.InterfaceDescription -like '*Wireless*' -or $_.Name -like '*Wi-Fi*' -or $_.Name -like '*WiFi*' } | Where-Object { $_.Status -eq 'Up' }
-if (-not $wifi) { "No active Wi-Fi adapter found — nothing to disable"; return }
-Disable-NetAdapter -Name $wifi.Name -Confirm:$false
-"Wi-Fi '$($wifi.Name)' disabled"
-"#;
-    let out = Command::new("powershell")
-        .args(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-    }
-}
-
-#[tauri::command]
-async fn restore_network_defaults() -> Result<String, String> {
-    let script = r#"
-# Restore DNS to DHCP
-Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
-    Set-DnsClientServerAddress -InterfaceIndex $_.InterfaceIndex -ResetServerAddresses -ErrorAction SilentlyContinue
-}
-# Restore TCP registry tweaks
-$path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'
-@('TcpAckFrequency','TCPNoDelay','TcpDelAckTicks','GlobalMaxTcpWindowSize','TcpWindowSize') | ForEach-Object {
-    Remove-ItemProperty -Path $path -Name $_ -ErrorAction SilentlyContinue
-}
-# Remove QoS policies
-Get-NetQosPolicy | Where-Object { $_.Name -like 'AimCamp_*' } | Remove-NetQosPolicy -Confirm:$false -ErrorAction SilentlyContinue
-# Restore MTU
-$adapter = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and ($_.InterfaceDescription -notlike '*Virtual*') } | Select-Object -First 1
-if ($adapter) {
-    netsh interface ipv4 set subinterface "$($adapter.Name)" mtu=1500 store=persistent 2>&1 | Out-Null
-}
-# Re-enable all Wi-Fi adapters
-Get-NetAdapter | Where-Object { ($_.InterfaceDescription -like '*Wi-Fi*' -or $_.InterfaceDescription -like '*Wireless*') -and $_.Status -eq 'Disabled' } | ForEach-Object {
-    Enable-NetAdapter -Name $_.Name -Confirm:$false -ErrorAction SilentlyContinue
-}
-"All network settings restored to Windows defaults"
-"#;
-    let out = Command::new("powershell")
-        .args(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-    }
-}
-
-#[tauri::command]
-async fn llm_install_ollama() -> Result<String, String> {
-    // Download & install Ollama on Windows
-    let script = r#"
-$ProgressPreference = 'SilentlyContinue'
-$DownloadUrl = 'https://ollama.ai/download/OllamaSetup.exe'
-$InstallerPath = "$env:TEMP\OllamaSetup.exe"
-
-try {
-    Write-Host "📥 Downloading Ollama installer..."
-    Invoke-WebRequest -Uri $DownloadUrl -OutFile $InstallerPath -UseBasicParsing
-    
-    Write-Host "⏳ Installing Ollama..."
-    Start-Process -FilePath $InstallerPath -Wait -Verb RunAs
-    
-    Write-Host "✅ Ollama installed successfully!"
-    Remove-Item $InstallerPath -Force -ErrorAction SilentlyContinue
-} catch {
-    throw "Installation failed: $_"
-}
-"#;
-    
-    let output = Command::new("powershell")
-        .args(&["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
-        .output()
-        .map_err(|e| format!("Ollama installation failed: {}", e))?;
-    
-    if output.status.success() {
-        Ok("Ollama installed successfully".to_string())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
-    }
-}
-
-#[tauri::command]
-async fn llm_test_connection(endpoint: String) -> Result<bool, String> {
-    // Test if Ollama server is running
-    use std::time::Duration;
-    
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build() {
-            Ok(c) => c,
-            Err(e) => return Err(format!("Client error: {}", e)),
-        };
-    
-    match client.get(&format!("{}/api/tags", endpoint)).send().await {
-        Ok(response) => {
-            if response.status().is_success() {
-                Ok(true)
-            } else {
-                Err(format!("Server responded with status: {}", response.status()))
-            }
-        }
-        Err(_) => Ok(false), // Connection refused = not running
-    }
-}
-
-#[tauri::command]
-async fn llm_download_model(provider_id: String) -> Result<String, String> {
-    // PersonaPlex 7B is a speech-to-speech audio model (NOT a text LLM).
-    // It requires Linux + A100/H100 GPU and cannot run on consumer gaming PCs.
-    // Direct the user to HuggingFace for more information.
-    if provider_id == "personaplex-7b" {
-        return Err(
-            "PersonaPlex 7B é um modelo de voz (speech-to-speech), não um LLM de texto. \
-             Requer Linux + GPU A100/H100. Não compatível com Ollama em Windows gaming PCs. \
-             Visite: https://huggingface.co/nvidia/personaplex-7b-v1".to_string()
-        );
-    }
-
-    let model_tag = match provider_id.as_str() {
-        "llama-3.2-3b" | "llama-3.2-3b-instruct" => "llama3.2:3b",
-        "llama-3.1-8b" | "llama-3.1-8b-instruct" => "llama3.1:8b",
-        "nemotron-mini" => "nemotron-mini",  // NVIDIA text LLM, works on consumer RTX via Ollama
-        "ollama-local" => "llama3.2:3b",    // default model
-        other => return Err(format!("Unknown provider: '{}'. Use llama-3.2-3b, nemotron-mini, or llama-3.1-8b", other)),
-    };
-
-    let script = format!(r#"
-$ErrorActionPreference = 'Stop'
-# Find Ollama executable
-$candidates = @(
-    "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe",
-    "$env:ProgramFiles\Ollama\ollama.exe",
-    "ollama"
-)
-$OllamaPath = $null
-foreach ($c in $candidates) {{
-    if ($c -eq 'ollama') {{
-        $found = Get-Command ollama -ErrorAction SilentlyContinue
-        if ($found) {{ $OllamaPath = 'ollama'; break }}
-    }} elseif (Test-Path $c) {{
-        $OllamaPath = $c; break
-    }}
-}}
-if (-not $OllamaPath) {{
-    throw 'Ollama nao encontrado. Instala o Ollama primeiro (passo 1).'
-}}
-# Start Ollama service if not running
-$svc = Get-Process -Name ollama -ErrorAction SilentlyContinue
-if (-not $svc) {{
-    Start-Process $OllamaPath -WindowStyle Hidden -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 3
-}}
-# Pull the model (blocking — shows progress)
-& $OllamaPath pull '{model}'
-if ($LASTEXITCODE -ne 0) {{ throw "ollama pull falhou com codigo $LASTEXITCODE" }}
-"Modelo '{model}' descarregado com sucesso"
-"#, model = model_tag);
-
-    let output = Command::new("powershell")
-        .args(&["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script])
-        .output()
-        .map_err(|e| format!("Falha ao iniciar download: {}", e))?;
-
-    if output.status.success() {
-        let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Ok(if out.is_empty() { format!("Modelo {} descarregado", model_tag) } else { out })
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-    }
-}
-
-#[tauri::command]
-async fn llm_check_requirements(provider_id: String) -> Result<Vec<String>, String> {
-    let mut missing = Vec::new();
-    
-    match provider_id.as_str() {
-        "ollama-local" => {
-            // Check if Ollama is installed
-            let script = r#"
-$OllamaPath = 'C:\Users\' + $env:USERNAME + '\AppData\Local\Programs\Ollama\ollama.exe'
-if (Test-Path $OllamaPath) { Write-Host 'INSTALLED' } else { Write-Host 'NOT_INSTALLED' }
-"#;
-            
-            let output = Command::new("powershell")
-                .args(&["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
-                .output()
-                .map_err(|e| format!("Check failed: {}", e))?;
-            
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !stdout.contains("INSTALLED") {
-                missing.push("Ollama not installed".to_string());
-            }
-        }
-        "llama-cpp" => {
-            missing.push("Manual installation required - download llama.cpp from GitHub".to_string());
-        }
-        "personaplex-7b" | "personaplex" => {
-            missing.push("PersonaPlex 7B é um modelo de voz (speech-to-speech), não um LLM de texto. Requer Linux + GPU A100/H100. Não compatível com Ollama. Visite: https://huggingface.co/nvidia/personaplex-7b-v1".to_string());
-        }
-        "nemotron-mini" | "llama-3.2-3b" | "llama-3.1-8b" => {
-            // These run via Ollama — check if Ollama is installed
-            let script = r#"
-$OllamaPath = 'C:\Users\' + $env:USERNAME + '\AppData\Local\Programs\Ollama\ollama.exe'
-if (Test-Path $OllamaPath) { Write-Host 'INSTALLED' } else { Write-Host 'NOT_INSTALLED' }
-"#;
-            let output = Command::new("powershell")
-                .args(&["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
-                .output()
-                .map_err(|e| format!("Check failed: {}", e))?;
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !stdout.contains("INSTALLED") {
-                missing.push("Ollama not installed — use Step 1 to install first".to_string());
-            }
-        }
-        _ => {}
-    }
-    
-    Ok(missing)
+        .map_err(|e| format!("Ping JSON parse: {} — {}", e, &stdout[..stdout.len().min(200)]))
 }

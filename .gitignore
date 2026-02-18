@@ -20,3 +20,7 @@ test-demos/
 # Env
 .env
 .env.*
+
+# AI assistant files
+CLAUDE.md
+.claude/
