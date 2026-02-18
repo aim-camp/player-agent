@@ -2,6 +2,7 @@ import { open as shellOpen } from "@tauri-apps/api/shell";
 import { invoke } from "@tauri-apps/api/tauri";
 import { appWindow } from "@tauri-apps/api/window";
 import "./style.css";
+import { llmService } from "./lib/llm-service";
 
 /* ================================================================
    Global error handler — catch-all for uncaught errors & rejections
@@ -488,7 +489,7 @@ interface Theme {
 }
 
 const THEMES: Theme[] = [
-  { name: "Matrix", primary: "#00ffaa", secondary: "#3b82f6" },
+  { name: "Matrix", primary: "#00ff41", secondary: "#008f11" },
   { name: "Cyberpunk", primary: "#ff00ff", secondary: "#00ffff" },
   { name: "Sunset", primary: "#ff6b35", secondary: "#f7c948" },
   { name: "Arctic", primary: "#00d4ff", secondary: "#a78bfa" },
@@ -2838,19 +2839,17 @@ const PROC_FLAGS = new Set([
 ]);
 
 /* ================================================================
-   Network servers to ping
+   Network servers to ping (TCP connect — ICMP blocked on gameservers)
    ================================================================ */
 const NET_SERVERS = [
-  { name: "Valve EU West", host: "ams.valve.net" },
-  { name: "Valve EU East", host: "vie.valve.net" },
-  { name: "Valve EU North", host: "sto.valve.net" },
-  { name: "Valve NA East", host: "eat.valve.net" },
-  { name: "Valve NA West", host: "lax.valve.net" },
-  { name: "Valve SA", host: "gru.valve.net" },
-  { name: "FACEIT EU (1)", host: "fra.valve.net" },
-  { name: "FACEIT NA", host: "chi.valve.net" },
-  { name: "Cloudflare DNS", host: "1.1.1.1" },
-  { name: "Google DNS", host: "8.8.8.8" },
+  { name: "Valve (Steam API)", host: "api.steampowered.com", port: 443 },
+  { name: "Steam Community", host: "steamcommunity.com", port: 443 },
+  { name: "Steam CDN", host: "cdn.cloudflare.steamstatic.com", port: 443 },
+  { name: "FACEIT (API)", host: "api.faceit.com", port: 443 },
+  { name: "FACEIT (Play)", host: "play.faceit.com", port: 443 },
+  { name: "Cloudflare (1.1.1.1)", host: "1.1.1.1", port: 443 },
+  { name: "Google (8.8.8.8)", host: "8.8.8.8", port: 443 },
+  { name: "AWS EU West", host: "s3.eu-west-1.amazonaws.com", port: 443 },
 ];
 
 /* ================================================================
@@ -4157,37 +4156,44 @@ async function refreshProcesses() {
 async function runPingTests() {
   const list = document.getElementById("net-results");
   if (!list) return;
-  list.innerHTML = '<div class="net-status">Pinging servers...</div>';
-  const results: Array<{ name: string; avg: number; min: number; max: number }> = [];
+  list.innerHTML = '<div class="net-status">Testing connections (TCP latency)...</div>';
+  const results: Array<{ name: string; avg: number; min: number; max: number; loss: number }> = [];
   for (const srv of NET_SERVERS) {
     try {
-      const r = await invoke<{ host: string; avg: number; min: number; max: number; ok: boolean }>("ping_server", { host: srv.host, count: 4 });
-      results.push({ name: srv.name, avg: r.avg, min: r.min, max: r.max });
+      // Show progress per server
+      const statusEl = list.querySelector(".net-status");
+      if (statusEl) statusEl.textContent = `Testing ${srv.name}...`;
+      const r = await invoke<{ host: string; avg: number; min: number; max: number; loss: number; ok: boolean }>(
+        "ping_server", { host: srv.host, port: srv.port ?? 443, count: 3 }
+      );
+      results.push({ name: srv.name, avg: r.avg, min: r.min, max: r.max, loss: r.loss ?? 0 });
     } catch {
-      results.push({ name: srv.name, avg: -1, min: -1, max: -1 });
+      results.push({ name: srv.name, avg: -1, min: -1, max: -1, loss: 100 });
     }
   }
   list.innerHTML = "";
   const hdr = document.createElement("div");
   hdr.className = "ping-header";
-  hdr.innerHTML = "<span>Server</span><span>Avg</span><span>Min</span><span>Max</span><span>Grade</span>";
+  hdr.innerHTML = "<span>Server</span><span>Avg</span><span>Min</span><span>Max</span><span>Loss</span><span>Grade</span>";
   list.appendChild(hdr);
   for (const r of results) {
     const row = document.createElement("div");
     row.className = "ping-row";
     let cls: string;
     if (r.avg < 0) cls = "ping-bad";
-    else if (r.avg < 30) cls = "ping-good";
-    else if (r.avg < 80) cls = "ping-ok";
+    else if (r.avg < 50) cls = "ping-good";
+    else if (r.avg < 120) cls = "ping-ok";
     else cls = "ping-bad";
     let grade: string;
     if (r.avg < 0) grade = "FAIL";
-    else if (r.avg < 15) grade = "A+";
-    else if (r.avg < 30) grade = "A";
-    else if (r.avg < 50) grade = "B";
-    else if (r.avg < 80) grade = "C";
+    else if (r.avg < 30) grade = "A+";
+    else if (r.avg < 50) grade = "A";
+    else if (r.avg < 80) grade = "B";
+    else if (r.avg < 120) grade = "C";
     else grade = "D";
-    row.innerHTML = `<span class="ping-host">${r.name}</span><span class="ping-val ${cls}">${r.avg < 0 ? "--" : r.avg + "ms"}</span><span class="ping-val">${r.min < 0 ? "--" : r.min + "ms"}</span><span class="ping-val">${r.max < 0 ? "--" : r.max + "ms"}</span><span class="ping-val ${cls}">${grade}</span>`;
+    const lossStr = r.avg < 0 ? "--" : (r.loss > 0 ? `${r.loss}%` : "0%");
+    const lossCls = r.loss >= 50 ? "ping-bad" : r.loss > 0 ? "ping-ok" : "";
+    row.innerHTML = `<span class="ping-host">${r.name}</span><span class="ping-val ${cls}">${r.avg < 0 ? "--" : r.avg + "ms"}</span><span class="ping-val">${r.min < 0 ? "--" : r.min + "ms"}</span><span class="ping-val">${r.max < 0 ? "--" : r.max + "ms"}</span><span class="ping-val ${lossCls}">${lossStr}</span><span class="ping-val ${cls}">${grade}</span>`;
     list.appendChild(row);
   }
 }
@@ -5035,10 +5041,22 @@ function showConfirmModal(title: string, message: string): Promise<boolean> {
   });
 }
 
+/* ================================================================
+   Application build() — DOM construction
+   ================================================================ */
 function build() {
   const app = document.getElementById("app");
   if (!app) return;
   app.innerHTML = "";
+
+  // Load saved theme
+  const savedTheme = localStorage.getItem("aimcamp_theme");
+  if (savedTheme) {
+    const idx = parseInt(savedTheme, 10);
+    if (!isNaN(idx) && idx >= 0 && idx < THEMES.length) {
+      applyTheme(idx);
+    }
+  }
 
   /* ── Sidebar ─────────────────────────────────────────────────── */
   const sidebar = document.createElement("nav");
@@ -5046,43 +5064,43 @@ function build() {
 
   const btnConfig = document.createElement("button");
   btnConfig.className = "sidebar-btn active";
-  btnConfig.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg><span>CONFIG</span>`;
-  attachTooltip(btnConfig, tipHtml("Config", "System Optimizer (SYS) + CFG Manager — Windows, BIOS, NVIDIA, Network, Services optimizations and full CS2 console command editor with 148+ commands, autoexec export, pro player configs and more.", "Up to +40% cumulative FPS gain", "Registry / PowerShell / autoexec.cfg"));
+  btnConfig.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg><span>Configuration</span>`;
+  attachTooltip(btnConfig, tipHtml("Configuration", "System Optimizer (SYS) + CFG Manager — Windows, BIOS, NVIDIA, Network, Services optimizations and full CS2 console command editor with 148+ commands, autoexec export, pro player configs and more.", "Up to +40% cumulative FPS gain", "Registry / PowerShell / autoexec.cfg"));
 
   const btnHwTab = document.createElement("button");
   btnHwTab.className = "sidebar-btn";
-  btnHwTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v2"/><path d="M15 2v2"/><path d="M9 20v2"/><path d="M15 20v2"/><path d="M20 9h2"/><path d="M20 14h2"/><path d="M2 9h2"/><path d="M2 14h2"/></svg><span>HW</span>`;
-  attachTooltip(btnHwTab, tipHtml("Hardware Info", "Scans your full system hardware — CPU, GPU, RAM, motherboard, storage and monitors via WMI queries. Detects XMP status, GPU scheduling, power plan, HPET timer and more. Smart analysis available to identify bottlenecks."));
+  btnHwTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v2"/><path d="M15 2v2"/><path d="M9 20v2"/><path d="M15 20v2"/><path d="M20 9h2"/><path d="M20 14h2"/><path d="M2 9h2"/><path d="M2 14h2"/></svg><span>Hardware</span>`;
+  attachTooltip(btnHwTab, tipHtml("Hardware", "Scans your full system hardware — CPU, GPU, RAM, motherboard, storage and monitors via WMI queries. Detects XMP status, GPU scheduling, power plan, HPET timer and more. Smart analysis available to identify bottlenecks."));
 
   const btnDrvTab = document.createElement("button");
   btnDrvTab.className = "sidebar-btn";
-  btnDrvTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg><span>DRV</span>`;
+  btnDrvTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg><span>Drivers</span>`;
   attachTooltip(btnDrvTab, tipHtml("Drivers", "Lists all installed device drivers with version, date, manufacturer and digital signature status. Checks Windows Update for available driver updates and allows one-click background installation."));
 
   const btnProcTab = document.createElement("button");
   btnProcTab.className = "sidebar-btn";
-  btnProcTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg><span>PROC</span>`;
-  attachTooltip(btnProcTab, tipHtml("Process Manager", "Real-time process monitor focused on gaming. Flags known resource-heavy applications (overlays, RGB software, streaming tools) that compete with CS2 for CPU/GPU time. Kill processes directly to free resources.", "Varies — killing bloatware can free 5-15% CPU"));
+  btnProcTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg><span>Task Manager</span>`;
+  attachTooltip(btnProcTab, tipHtml("Task Manager", "Real-time process monitor focused on gaming. Flags known resource-heavy applications (overlays, RGB software, streaming tools) that compete with CS2 for CPU/GPU time. Kill processes directly to free resources.", "Varies — killing bloatware can free 5-15% CPU"));
 
   const btnNetTab = document.createElement("button");
   btnNetTab.className = "sidebar-btn";
-  btnNetTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><circle cx="12" cy="20" r="1"/></svg><span>NET</span>`;
-  attachTooltip(btnNetTab, tipHtml("Network Diagnostics", "Pings official Valve CS2 server regions worldwide and measures latency, jitter and packet loss. Helps identify the best server region for your connection. Smart analysis suggests network config improvements."));
+  btnNetTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><circle cx="12" cy="20" r="1"/></svg><span>Network</span>`;
+  attachTooltip(btnNetTab, tipHtml("Network", "Pings official Valve CS2 server regions worldwide and measures latency, jitter and packet loss. Helps identify the best server region for your connection. Smart analysis suggests network config improvements."));
 
   const btnDemoTab = document.createElement("button");
   btnDemoTab.className = "sidebar-btn";
-  btnDemoTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8"/></svg><span>DEMO</span>`;
-  attachTooltip(btnDemoTab, tipHtml("Demo Review", "Parses CS2 .dem files and extracts match metadata (map, duration, tickrate, rounds). Rate your performance and add notes. Coaching analysis scores 18 gameplay review tips with personalized feedback."));
+  btnDemoTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8"/></svg><span>Demos</span>`;
+  attachTooltip(btnDemoTab, tipHtml("Demos", "Parses CS2 .dem files and extracts match metadata (map, duration, tickrate, rounds). Rate your performance and add notes. Coaching analysis scores 18 gameplay review tips with personalized feedback."));
 
   const btnFdbkTab = document.createElement("button");
   btnFdbkTab.className = "sidebar-btn";
-  btnFdbkTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span>FDBK</span>`;
-  attachTooltip(btnFdbkTab, tipHtml("Feedback & Suggestions", "Send bug reports, feature requests and general feedback directly to the development team via Discord webhook. Your input shapes future updates. All submissions are anonymous."));
+  btnFdbkTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span>Feedback</span>`;
+  attachTooltip(btnFdbkTab, tipHtml("Feedback", "Send bug reports, feature requests and general feedback directly to the development team via Discord webhook. Your input shapes future updates. All submissions are anonymous."));
 
   const btnBenchTab = document.createElement("button");
   btnBenchTab.className = "sidebar-btn";
-  btnBenchTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M18 20V10"/><path d="M12 20V4"/><path d="M6 20v-6"/></svg><span>BNCH</span>`;
-  attachTooltip(btnBenchTab, tipHtml("Benchmark & Frame Analysis", "Import PresentMon CSV or CapFrameX JSON benchmark captures. Visualizes FPS over time, frame time distribution, 1% / 0.1% lows, and stutter analysis. Compare before/after optimization runs."));
+  btnBenchTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M18 20V10"/><path d="M12 20V4"/><path d="M6 20v-6"/></svg><span>Benchmark</span>`;
+  attachTooltip(btnBenchTab, tipHtml("Benchmark", "Import PresentMon CSV or CapFrameX JSON benchmark captures. Visualizes FPS over time, frame time distribution, 1% / 0.1% lows, and stutter analysis. Compare before/after optimization runs."));
 
   /* ── Community placeholder buttons ─────────────────────────── */
   const sidebarSep = document.createElement("div");
@@ -5093,23 +5111,23 @@ function build() {
 
   const btnRankTab = document.createElement("button");
   btnRankTab.className = "sidebar-btn placeholder-btn";
-  btnRankTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M6 9H4.5a2.5 2.5 0 0 1 0-5C6 4 6 7 6 7s0 3 1.5 3S9 7 9 7s0-3 1.5-3a2.5 2.5 0 0 1 0 5H9"/><path d="M6 9v12"/><path d="M9 9v12"/><path d="M18 9h1.5a2.5 2.5 0 0 0 0-5C18 4 18 7 18 7s0 3-1.5 3S15 7 15 7s0-3-1.5-3a2.5 2.5 0 0 0 0 5H15"/><path d="M15 9v12"/><path d="M18 9v12"/></svg><span>RANK</span>`;
-  attachTooltip(btnRankTab, tipHtml("Rankings & Stats", "Coming soon — Track your CS2 competitive rankings, ELO history, win rate trends and per-map statistics. Integrates with Steam and FACEIT profiles."));
+  btnRankTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M6 9H4.5a2.5 2.5 0 0 1 0-5C6 4 6 7 6 7s0 3 1.5 3S9 7 9 7s0-3 1.5-3a2.5 2.5 0 0 1 0 5H9"/><path d="M6 9v12"/><path d="M9 9v12"/><path d="M18 9h1.5a2.5 2.5 0 0 0 0-5C18 4 18 7 18 7s0 3-1.5 3S15 7 15 7s0-3-1.5-3a2.5 2.5 0 0 0 0 5H15"/><path d="M15 9v12"/><path d="M18 9v12"/></svg><span>Rankings</span>`;
+  attachTooltip(btnRankTab, tipHtml("Rankings", "Coming soon — Track your CS2 competitive rankings, ELO history, win rate trends and per-map statistics. Integrates with Steam and FACEIT profiles."));
 
   const btnServersTab = document.createElement("button");
   btnServersTab.className = "sidebar-btn placeholder-btn";
-  btnServersTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><circle cx="6" cy="6" r="1"/><circle cx="6" cy="18" r="1"/></svg><span>SRVS</span>`;
-  attachTooltip(btnServersTab, tipHtml("Match & Servers", "Coming soon — Browse community servers, retake/DM/FFA servers and organize 5v5 practice matches with your team through aim.camp matchmaking."));
+  btnServersTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><circle cx="6" cy="6" r="1"/><circle cx="6" cy="18" r="1"/></svg><span>Servers</span>`;
+  attachTooltip(btnServersTab, tipHtml("Servers", "Coming soon — Browse community servers, retake/DM/FFA servers and organize 5v5 practice matches with your team through aim.camp matchmaking."));
 
   const btnMarketTab = document.createElement("button");
   btnMarketTab.className = "sidebar-btn placeholder-btn";
-  btnMarketTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="9" cy="21" r="1"/><circle cx="20" cy="21" r="1"/><path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"/></svg><span>MRKT</span>`;
-  attachTooltip(btnMarketTab, tipHtml("Item Tracker & Market", "Coming soon — Track CS2 skin prices, inventory value, trade-up calculator and market trends. Price alerts and Steam Community Market integration."));
+  btnMarketTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="9" cy="21" r="1"/><circle cx="20" cy="21" r="1"/><path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"/></svg><span>Market</span>`;
+  attachTooltip(btnMarketTab, tipHtml("Market", "Coming soon — Track CS2 skin prices, inventory value, trade-up calculator and market trends. Price alerts and Steam Community Market integration."));
 
   const btnHubTab = document.createElement("button");
   btnHubTab.className = "sidebar-btn placeholder-btn";
-  btnHubTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg><span>HUB</span>`;
-  attachTooltip(btnHubTab, tipHtml("aim.camp Hub", "Coming soon — Central hub for the aim.camp community. News, guides, team finder, tournament brackets and direct integration with the aim.camp platform."));
+  btnHubTab.innerHTML = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg><span>Hub</span>`;
+  attachTooltip(btnHubTab, tipHtml("Hub", "Coming soon — Central hub for the aim.camp community. News, guides, team finder, tournament brackets and direct integration with the aim.camp platform."));
 
   /* ── Sidebar watermark ─────────────────────────────────────── */
   const watermark = document.createElement("div");
@@ -5215,6 +5233,11 @@ function build() {
     if (t === "hw" && !document.querySelector(".hw-grid")) refreshHardwareInfo();
     if (t === "drv" && !document.querySelector(".drv-grid")) refreshDriverInfo();
     if (t === "proc" && !document.querySelector(".proc-item")) refreshProcesses();
+    if (t === "net" && !document.querySelector(".ping-header")) runPingTests();
+    if (t === "demo" && !document.querySelector(".demo-list-header")) {
+      const savedFolder = localStorage.getItem("csmooth_demo_folder");
+      if (savedFolder) scanDemoFolder(savedFolder);
+    }
     if (t === "fdbk" && !document.querySelector(".fdbk-card") && !document.querySelector(".fdbk-empty")) refreshFeedbackHistory();
   }
   btnConfig.addEventListener("click", () => switchTab("config"));
@@ -5327,6 +5350,29 @@ function build() {
     toast(`Schema "${schema.name}" loaded ✔`);
   });
 
+  /* ── Agent status badge ───────────────────────────────────────── */
+  const agentBadge = document.createElement("div");
+  agentBadge.className = "agent-status-badge";
+  agentBadge.title = "Agent connection status";
+  const agentDot = document.createElement("span");
+  agentDot.className = "agent-status-dot connected";
+  const agentLabel = document.createElement("span");
+  agentLabel.textContent = "ON";
+  agentBadge.appendChild(agentDot);
+  agentBadge.appendChild(agentLabel);
+  headerRight.appendChild(agentBadge);
+
+  /* ── Settings button (header) ─────────────────────────────────── */
+  const btnHeaderSettings = document.createElement("button");
+  btnHeaderSettings.className = "adv-btn";
+  btnHeaderSettings.title = "Application Settings";
+  btnHeaderSettings.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="3"/><path d="M12 1v6m0 6v6M5.64 5.64l4.24 4.24m4.24 4.24l4.24 4.24M1 12h6m6 0h6M5.64 18.36l4.24-4.24m4.24-4.24l4.24-4.24"/></svg>`;
+  const settingsLabel = document.createElement("span");
+  settingsLabel.textContent = "SETTINGS";
+  btnHeaderSettings.appendChild(settingsLabel);
+  btnHeaderSettings.addEventListener("click", showSettingsModal);
+  headerRight.appendChild(btnHeaderSettings);
+
   /* ── Advisor config button ──────────────────────────────────────── */
   const advBtn = document.createElement("button");
   advBtn.className = "adv-btn";
@@ -5360,6 +5406,514 @@ function build() {
   headerRight.appendChild(themeWrap);
   headerRight.appendChild(btnMin);
   headerRight.appendChild(btnClose);
+
+  /* ── Settings Modal ──────────────────────────────────────────────── */
+  function showSettingsModal() {
+    const overlay = document.createElement("div");
+    overlay.className = "adv-overlay";
+    overlay.innerHTML = `
+      <div class="adv-modal" style="width:80vw;max-width:1600px;max-height:80vh;overflow-y:auto;">
+        <div class="adv-modal-header">
+          <h3>⚙️ Application Settings</h3>
+          <button class="adv-modal-close" id="settings-close">✕</button>
+        </div>
+        <div class="adv-modal-body" style="display:flex;flex-direction:column;gap:16px;">
+          
+          <!-- AI / Agent Configuration -->
+          <div style="background:rgba(255,255,255,0.02);padding:14px;border-radius:6px;border:1px solid rgba(255,255,255,0.05);">
+            <h4 style="font-family:Orbitron,monospace;font-size:11px;font-weight:700;margin:0 0 12px;color:var(--neon-cyan);letter-spacing:0.08em;">🤖 AI / LLM CONFIGURATION</h4>
+            
+            <!-- 1-Click Install Section -->
+            <div style="background:rgba(0,255,180,0.04);border:1px solid rgba(0,255,180,0.15);border-radius:6px;padding:12px;margin-bottom:14px;">
+              <div style="font-size:10px;font-weight:700;color:var(--neon-cyan);margin:0 0 10px;letter-spacing:0.06em;">📦 1-CLICK LOCAL LLM INSTALL</div>
+              <div style="font-size:10px;opacity:0.6;margin-bottom:10px;line-height:1.5;">Run AI locally — no cloud subscription needed. Instala o Ollama (motor) e depois faz download do modelo desejado.</div>
+              
+              <!-- Step 1: Ollama Engine -->
+              <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;padding:8px 10px;background:rgba(255,255,255,0.03);border-radius:4px;">
+                <span style="flex:0 0 20px;font-size:14px;">1️⃣</span>
+                <div style="flex:1;">
+                  <div style="font-size:11px;font-weight:600;">Ollama <span style="opacity:0.5;font-weight:400;">(motor local — necessário)</span></div>
+                  <div style="font-size:9px;opacity:0.5;margin-top:1px;">Executa modelos LLM localmente no teu PC</div>
+                </div>
+                <button id="install-btn-ollama" class="btn-export" style="font-size:10px;padding:5px 12px;white-space:nowrap;">📥 Instalar Ollama</button>
+                <span id="install-status-ollama" style="font-size:10px;opacity:0.6;min-width:80px;text-align:right;"></span>
+              </div>
+              
+              <!-- Step 2: Llama 3.2 3B -->
+              <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;padding:8px 10px;background:rgba(255,255,255,0.03);border-radius:4px;">
+                <span style="flex:0 0 20px;font-size:14px;">2️⃣</span>
+                <div style="flex:1;">
+                  <div style="font-size:11px;font-weight:600;">Llama 3.2 3B <span style="opacity:0.5;font-weight:400;">(Meta — recomendado, 2GB)</span></div>
+                  <div style="font-size:9px;opacity:0.5;margin-top:1px;">Rápido, leve, funciona em qualquer GPU/CPU</div>
+                </div>
+                <button id="install-btn-llama" class="btn-export" style="font-size:10px;padding:5px 12px;white-space:nowrap;">⬇️ Download</button>
+                <span id="install-status-llama" style="font-size:10px;opacity:0.6;min-width:80px;text-align:right;"></span>
+              </div>
+              
+              <!-- Step 3: NVIDIA Nemotron-Mini 4B (text LLM, runs via Ollama) -->
+              <div style="display:flex;align-items:center;gap:10px;padding:8px 10px;background:rgba(255,255,255,0.03);border-radius:4px;">
+                <span style="flex:0 0 20px;font-size:14px;">3️⃣</span>
+                <div style="flex:1;">
+                  <div style="font-size:11px;font-weight:600;">Nemotron-Mini 4B <span style="opacity:0.5;font-weight:400;">(NVIDIA — texto, 2.7GB)</span></div>
+                  <div style="font-size:9px;opacity:0.5;margin-top:1px;">LLM de texto NVIDIA para gaming PCs — requer GPU NVIDIA com 4GB+ VRAM</div>
+                </div>
+                <button id="install-btn-llama8b" class="btn-export" style="font-size:10px;padding:5px 12px;white-space:nowrap;">⬇️ Download</button>
+                <span id="install-status-llama8b" style="font-size:10px;opacity:0.6;min-width:80px;text-align:right;"></span>
+              </div>
+              
+              <!-- PersonaPlex info row -->
+              <div style="display:flex;align-items:center;gap:10px;padding:8px 10px;background:rgba(100,200,255,0.04);border:1px solid rgba(100,200,255,0.1);border-radius:4px;margin-top:4px;">
+                <span style="flex:0 0 20px;font-size:14px;">🎙️</span>
+                <div style="flex:1;">
+                  <div style="font-size:11px;font-weight:600;">PersonaPlex 7B <span style="opacity:0.5;font-weight:400;">(NVIDIA — speech-to-speech)</span></div>
+                  <div style="font-size:9px;opacity:0.5;margin-top:1px;">Modelo de voz conversacional (áudio→áudio) — requer Linux + GPU A100. Não é um LLM de texto.</div>
+                </div>
+                <button id="install-btn-personaplex" class="btn-adv" style="font-size:10px;padding:5px 12px;white-space:nowrap;">🔗 HuggingFace</button>
+              </div>
+              
+              <div id="install-ollama-log" style="display:none;margin-top:8px;padding:6px 10px;background:rgba(0,0,0,0.3);border-radius:4px;font-size:9px;font-family:monospace;opacity:0.8;white-space:pre-wrap;max-height:60px;overflow-y:auto;"></div>
+            </div>
+            
+            <!-- Provider Selection -->
+            <div style="display:flex;gap:12px;margin-bottom:12px;">
+              <div style="flex:1;">
+                <label style="display:block;font-size:11px;margin-bottom:4px;font-weight:600;">LLM Provider</label>
+                <select id="settings-llm-provider" style="width:100%;padding:8px 10px;font-size:11px;background:rgba(15,15,25,0.8);border:1px solid rgba(255,255,255,0.15);border-radius:4px;color:var(--neon-green);font-family:Rajdhani,monospace;cursor:pointer;">
+                  <option value="" style="background:rgba(15,15,25,0.95);color:var(--neon-green);">Selecionar provider...</option>
+                  <option value="nemotron-mini" style="background:rgba(15,15,25,0.95);color:var(--neon-green);">💻 Nemotron-Mini 4B (NVIDIA) - 2.7GB Local</option>
+                  <option value="llama-3.2-3b" style="background:rgba(15,15,25,0.95);color:var(--neon-green);">💻 Llama 3.2 3B - 2.0GB Local</option>
+                  <option value="groq-llama" style="background:rgba(15,15,25,0.95);color:var(--neon-green);">☁️ Groq Cloud API - Fastest</option>
+                  <option value="openai-compatible" style="background:rgba(15,15,25,0.95);color:var(--neon-green);">☁️ OpenAI Compatible API</option>
+                </select>
+              </div>
+              <div style="flex:0 0 200px;">
+                <label style="display:block;font-size:11px;margin-bottom:4px;font-weight:600;">Status</label>
+                <div id="settings-llm-status" style="padding:8px 10px;font-size:10px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:4px;color:rgba(255,255,255,0.6);font-family:Rajdhani,monospace;display:flex;align-items:center;gap:6px;">
+                  <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,0.3);"></span>
+                  <span>Não configurado</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Cloud Provider Config -->
+            <div id="settings-cloud-config" style="display:none;border-top:1px solid rgba(255,255,255,0.05);padding-top:12px;margin-top:8px;">
+              <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+                <label style="flex:0 0 120px;font-size:11px;">API Endpoint</label>
+                <input type="text" id="settings-llm-endpoint" placeholder="https://api.groq.com/..." style="flex:1;padding:6px 10px;font-size:11px;background:rgba(15,15,25,0.8);border:1px solid rgba(255,255,255,0.15);border-radius:4px;color:var(--neon-green);font-family:Rajdhani,monospace;">
+              </div>
+              <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+                <label style="flex:0 0 120px;font-size:11px;">API Key</label>
+                <input type="password" id="settings-llm-apikey" placeholder="Inserir chave API" style="flex:1;padding:6px 10px;font-size:11px;background:rgba(15,15,25,0.8);border:1px solid rgba(255,255,255,0.15);border-radius:4px;color:var(--neon-green);font-family:Rajdhani,monospace;">
+              </div>
+            </div>
+
+            <!-- Local Provider Config -->
+            <div id="settings-local-config" style="display:none;border-top:1px solid rgba(255,255,255,0.05);padding-top:12px;margin-top:8px;">
+              <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+                <label style="flex:0 0 120px;font-size:11px;">GPU Layers</label>
+                <input type="number" id="settings-llm-gpu-layers" value="35" min="0" max="100" style="flex:0 0 100px;padding:6px 10px;font-size:11px;background:rgba(15,15,25,0.8);border:1px solid rgba(255,255,255,0.15);border-radius:4px;color:var(--neon-green);font-family:Rajdhani,monospace;">
+                <span style="font-size:10px;opacity:0.6;">Camadas a processar na GPU (mais = mais rápido, requer VRAM)</span>
+              </div>
+              <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+                <label style="flex:0 0 120px;font-size:11px;">Quantization</label>
+                <select id="settings-llm-quant" style="flex:0 0 120px;padding:6px 10px;font-size:11px;background:rgba(15,15,25,0.8);border:1px solid rgba(255,255,255,0.15);border-radius:4px;color:var(--neon-green);font-family:Rajdhani,monospace;cursor:pointer;">
+                  <option value="q4" selected style="background:rgba(15,15,25,0.95);">Q4 (padrão)</option>
+                  <option value="q5" style="background:rgba(15,15,25,0.95);">Q5 (melhor)</option>
+                  <option value="q8" style="background:rgba(15,15,25,0.95);">Q8 (máximo)</option>
+                </select>
+                <span style="font-size:10px;opacity:0.6;">Qualidade do modelo (maior = melhor, mas mais lento)</span>
+              </div>
+              <div style="display:flex;gap:8px;margin-top:12px;">
+                <button id="settings-llm-download" class="btn-export" style="font-size:10px;padding:6px 16px;">📥 Download Model</button>
+                <div id="settings-llm-download-progress" style="display:none;flex:1;">
+                  <div style="background:rgba(255,255,255,0.1);border-radius:4px;overflow:hidden;height:28px;position:relative;">
+                    <div id="settings-llm-progress-bar" style="background:linear-gradient(90deg,var(--neon-green),var(--neon-cyan));height:100%;width:0%;transition:width 0.3s;"></div>
+                    <span id="settings-llm-progress-text" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:10px;font-weight:600;color:#000;mix-blend-mode:difference;">0%</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Actions -->
+            <div style="display:flex;gap:8px;margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,0.05);">
+              <button id="settings-llm-test" class="btn-export" style="font-size:10px;padding:6px 16px;">🧪 Test Connection</button>
+              <button id="settings-llm-save" class="btn-export" style="font-size:10px;padding:6px 16px;background:var(--neon-green);color:#000;">💾 Save Configuration</button>
+              <div id="settings-llm-test-result" style="flex:1;padding:6px 10px;font-size:10px;opacity:0;transition:opacity 0.3s;"></div>
+            </div>
+
+            <p style="font-size:9px;opacity:0.5;margin:10px 0 0;line-height:1.4;">O AI Assistant usa LLMs para análise inteligente de hardware, sugestões personalizadas e explicação de features. Escolha entre modelos locais (privados, sem internet) ou cloud APIs (mais rápidos, requerem chave).</p>
+          </div>
+
+          <!-- Integrations & Webhooks -->
+          <div style="background:rgba(255,255,255,0.02);padding:14px;border-radius:6px;border:1px solid rgba(255,255,255,0.05);">
+            <h4 style="font-family:Orbitron,monospace;font-size:11px;font-weight:700;margin:0 0 8px;color:var(--neon-cyan);letter-spacing:0.08em;">🔗 INTEGRATIONS & WEBHOOKS</h4>
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+              <label style="flex:0 0 150px;font-size:11px;">Discord Webhook URL</label>
+              <input type="text" id="settings-discord-webhook" placeholder="https://discord.com/api/webhooks/..." style="flex:1;padding:6px 10px;font-size:11px;background:rgba(15,15,25,0.8);border:1px solid rgba(255,255,255,0.15);border-radius:4px;color:var(--neon-green);font-family:Rajdhani,monospace;">
+            </div>
+            <button class="btn-export" style="margin-top:4px;margin-bottom:12px;font-size:10px;">Test Discord Webhook</button>
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+              <label style="flex:0 0 150px;font-size:11px;">GitHub Personal Token</label>
+              <input type="password" id="settings-github-token" placeholder="ghp_..." style="flex:1;padding:6px 10px;font-size:11px;background:rgba(15,15,25,0.8);border:1px solid rgba(255,255,255,0.15);border-radius:4px;color:var(--neon-green);font-family:Rajdhani,monospace;">
+            </div>
+            <button class="btn-export" style="margin-top:4px;font-size:10px;">Verify GitHub Token</button>
+            <p style="font-size:9px;opacity:0.5;margin:10px 0 0;line-height:1.4;">Discord webhook enables feedback submission to your Discord server. GitHub token allows creating issues directly from the app. Both are optional and stored locally.</p>
+          </div>
+
+          <!-- Theme Section -->
+          <div style="background:rgba(255,255,255,0.02);padding:14px;border-radius:6px;border:1px solid rgba(255,255,255,0.05);">
+            <h4 style="font-family:Orbitron,monospace;font-size:11px;font-weight:700;margin:0 0 8px;color:var(--neon-cyan);letter-spacing:0.08em;">🎨 THEME & APPEARANCE</h4>
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+              <label style="flex:0 0 120px;font-size:11px;">Color Theme</label>
+              <select id="settings-theme-select" style="flex:1;padding:6px 10px;font-size:11px;background:rgba(15,15,25,0.8);border:1px solid rgba(255,255,255,0.15);border-radius:4px;color:var(--neon-green);font-family:Rajdhani,monospace;cursor:pointer;">
+                <option style="background:rgba(15,15,25,0.95);color:var(--neon-green);">Matrix</option>
+                <option style="background:rgba(15,15,25,0.95);color:var(--neon-green);">Ocean</option>
+                <option style="background:rgba(15,15,25,0.95);color:var(--neon-green);">Sunset</option>
+                <option style="background:rgba(15,15,25,0.95);color:var(--neon-green);">Nord</option>
+                <option style="background:rgba(15,15,25,0.95);color:var(--neon-green);">Tokyo Night</option>
+                <option style="background:rgba(15,15,25,0.95);color:var(--neon-green);">Dracula</option>
+                <option style="background:rgba(15,15,25,0.95);color:var(--neon-green);">Gruvbox</option>
+                <option style="background:rgba(15,15,25,0.95);color:var(--neon-green);">Synthwave</option>
+                <option style="background:rgba(15,15,25,0.95);color:var(--neon-green);">Solarized</option>
+                <option style="background:rgba(15,15,25,0.95);color:var(--neon-green);">Amber</option>
+                <option style="background:rgba(15,15,25,0.95);color:var(--neon-green);">Monochrome</option>
+              </select>
+            </div>
+            <p style="font-size:9px;opacity:0.5;margin:4px 0 0;line-height:1.4;">Choose from 11 color themes. Changes apply immediately.</p>
+          </div>
+
+          <!-- Updates Section -->
+          <div style="background:rgba(255,255,255,0.02);padding:14px;border-radius:6px;border:1px solid rgba(255,255,255,0.05);">
+            <h4 style="font-family:Orbitron,monospace;font-size:11px;font-weight:700;margin:0 0 8px;color:var(--neon-cyan);letter-spacing:0.08em;">🔄 UPDATES & MAINTENANCE</h4>
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+              <div>
+                <label style="font-size:11px;font-weight:600;color:var(--text-main);display:block;margin-bottom:2px;">Current Version</label>
+                <span style="font-family:Orbitron,monospace;font-size:9px;opacity:0.65;">v1.3.5 (2026-02-18)</span>
+              </div>
+              <button class="btn-export" style="font-size:10px;padding:4px 12px;">Check for Updates</button>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;">
+              <input type="checkbox" id="settings-auto-update" checked style="margin:0;">
+              <label for="settings-auto-update" style="font-size:10px;cursor:pointer;">Auto-check for updates on startup</label>
+            </div>
+            <p style="font-size:9px;opacity:0.5;margin:8px 0 0;line-height:1.4;">Player Agent automatically checks for new releases on GitHub. Update notifications will appear in the app header.</p>
+          </div>
+
+          <!-- About Section -->
+          <div style="background:rgba(255,255,255,0.02);padding:14px;border-radius:6px;border:1px solid rgba(255,255,255,0.05);">
+            <h4 style="font-family:Orbitron,monospace;font-size:11px;font-weight:700;margin:0 0 12px;color:var(--neon-cyan);letter-spacing:0.08em;text-align:center;">ℹ️ ABOUT PLAYER AGENT</h4>
+            <div style="text-align:center;">
+              <div style="margin:0 auto 12px;width:48px;height:48px;background:linear-gradient(135deg, var(--neon-green), var(--neon-cyan));border-radius:10px;display:inline-flex;align-items:center;justify-content:center;">
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#020617" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+              </div>
+              <p style="font-size:10px;opacity:0.5;margin:0 0 12px;">CS2 Performance & Optimization Platform</p>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:9px;margin-bottom:12px;">
+                <div style="background:rgba(255,255,255,0.02);padding:6px;border-radius:4px;border:1px solid rgba(255,255,255,0.05);">
+                  <div style="opacity:0.5;margin-bottom:2px;">Version</div>
+                  <div style="font-family:Orbitron,monospace;color:var(--neon-green);">v1.3.5</div>
+                </div>
+                <div style="background:rgba(255,255,255,0.02);padding:6px;border-radius:4px;border:1px solid rgba(255,255,255,0.05);">
+                  <div style="opacity:0.5;margin-bottom:2px;">Release</div>
+                  <div style="font-family:Orbitron,monospace;color:var(--neon-green);">2026-02-18</div>
+                </div>
+                <div style="background:rgba(255,255,255,0.02);padding:6px;border-radius:4px;border:1px solid rgba(255,255,255,0.05);">
+                  <div style="opacity:0.5;margin-bottom:2px;">License</div>
+                  <div style="font-family:Orbitron,monospace;color:var(--neon-green);">MIT</div>
+                </div>
+                <div style="background:rgba(255,255,255,0.02);padding:6px;border-radius:4px;border:1px solid rgba(255,255,255,0.05);">
+                  <div style="opacity:0.5;margin-bottom:2px;">Framework</div>
+                  <div style="font-family:Orbitron,monospace;color:var(--neon-green);">Tauri 1.8</div>
+                </div>
+              </div>
+              <div style="display:flex;gap:6px;justify-content:center;flex-wrap:wrap;">
+                <button class="btn-export" style="font-size:9px;padding:4px 10px;">📘 Docs</button>
+                <button class="btn-export" style="font-size:9px;padding:4px 10px;">🐙 GitHub</button>
+                <button class="btn-export" style="font-size:9px;padding:4px 10px;">💬 Discord</button>
+              </div>
+              <p style="font-size:8px;opacity:0.4;margin:12px 0 0;line-height:1.4;">Created by aim.camp team • Built with ❤️ for the CS2 community<br>Not affiliated with Valve Corporation</p>
+            </div>
+          </div>
+
+        </div>
+        <div class="adv-modal-actions" style="margin-top:12px;">
+          <button class="adv-save" id="settings-save">SAVE & CLOSE</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    
+    // Load current theme
+    const themeSelect = document.getElementById("settings-theme-select") as HTMLSelectElement;
+    if (themeSelect) {
+      themeSelect.value = THEMES[currentThemeIdx].name;
+      themeSelect.addEventListener("change", () => {
+        const idx = THEMES.findIndex(t => t.name === themeSelect.value);
+        if (idx >= 0) applyTheme(idx);
+      });
+    }
+    
+    // LLM Provider Configuration
+    const llmProviderSelect = document.getElementById("settings-llm-provider") as HTMLSelectElement;
+    const llmStatus = document.getElementById("settings-llm-status");
+    const cloudConfig = document.getElementById("settings-cloud-config");
+    const localConfig = document.getElementById("settings-local-config");
+    const llmEndpoint = document.getElementById("settings-llm-endpoint") as HTMLInputElement;
+    const llmApiKey = document.getElementById("settings-llm-apikey") as HTMLInputElement;
+    const llmGpuLayers = document.getElementById("settings-llm-gpu-layers") as HTMLInputElement;
+    const llmQuant = document.getElementById("settings-llm-quant") as HTMLSelectElement;
+    const llmDownloadBtn = document.getElementById("settings-llm-download") as HTMLButtonElement;
+    const llmTestBtn = document.getElementById("settings-llm-test") as HTMLButtonElement;
+    const llmSaveBtn = document.getElementById("settings-llm-save") as HTMLButtonElement;
+    const llmTestResult = document.getElementById("settings-llm-test-result");
+    const llmDownloadProgress = document.getElementById("settings-llm-download-progress");
+    const llmProgressBar = document.getElementById("settings-llm-progress-bar");
+    const llmProgressText = document.getElementById("settings-llm-progress-text");
+    
+    // Load active provider
+    llmService.getActiveProvider().then(provider => {
+      if (provider && llmProviderSelect) {
+        llmProviderSelect.value = provider.id;
+        updateLLMConfig(provider.id);
+      }
+    }).catch(console.error);
+    
+    function updateLLMConfig(providerId: string) {
+      if (!providerId) {
+        if (cloudConfig) cloudConfig.style.display = "none";
+        if (localConfig) localConfig.style.display = "none";
+        if (llmStatus) {
+          llmStatus.innerHTML = `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,0.3);"></span><span>Não configurado</span>`;
+        }
+        return;
+      }
+      
+      llmService.getActiveProvider().then(provider => {
+        if (!provider) return;
+        
+        const isCloud = provider.provider_type === "Cloud";
+        if (cloudConfig) cloudConfig.style.display = isCloud ? "block" : "none";
+        if (localConfig) localConfig.style.display = isCloud ? "none" : "block";
+        
+        // Update status
+        const statusLabel = llmService.getStatusLabel(provider.status);
+        const statusColor = provider.status === "Active" ? "var(--neon-green)" : 
+                           provider.status === "Downloaded" ? "var(--neon-cyan)" :
+                           typeof provider.status === "object" && "Downloading" in provider.status ? "var(--neon-cyan)" :
+                           "rgba(255,100,100,0.8)";
+        
+        if (llmStatus) {
+          llmStatus.innerHTML = `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${statusColor};"></span><span>${statusLabel}</span>`;
+        }
+        
+        // Load config values
+        if (isCloud) {
+          if (llmEndpoint) llmEndpoint.value = provider.config.endpoint || "";
+          if (llmApiKey) llmApiKey.value = provider.config.api_key || "";
+        } else {
+          if (llmGpuLayers) llmGpuLayers.value = String(provider.config.gpu_layers || 35);
+          if (llmQuant) llmQuant.value = provider.config.quantization || "q4";
+        }
+      }).catch(console.error);
+    }
+    
+    // Provider selection change
+    if (llmProviderSelect) {
+      llmProviderSelect.addEventListener("change", () => {
+        updateLLMConfig(llmProviderSelect.value);
+      });
+    }
+    
+    // Test connection
+    if (llmTestBtn) {
+      llmTestBtn.addEventListener("click", async () => {
+        if (!llmProviderSelect.value) {
+          if (llmTestResult) {
+            llmTestResult.textContent = "⚠️ Selecione um provider primeiro";
+            llmTestResult.style.opacity = "1";
+            llmTestResult.style.color = "rgba(255,200,100,0.9)";
+          }
+          return;
+        }
+        
+        llmTestBtn.disabled = true;
+        llmTestBtn.textContent = "🔄 Testing...";
+        
+        try {
+          const requirements = await llmService.checkRequirements(llmProviderSelect.value);
+          if (requirements.length === 0) {
+            if (llmTestResult) {
+              llmTestResult.textContent = "✅ Todos os requisitos satisfeitos";
+              llmTestResult.style.opacity = "1";
+              llmTestResult.style.color = "var(--neon-green)";
+            }
+          } else {
+            if (llmTestResult) {
+              llmTestResult.textContent = `⚠️ Requisitos em falta: ${requirements.join(", ")}`;
+              llmTestResult.style.opacity = "1";
+              llmTestResult.style.color = "rgba(255,200,100,0.9)";
+            }
+          }
+        } catch (error) {
+          if (llmTestResult) {
+            llmTestResult.textContent = `❌ Erro: ${error}`;
+            llmTestResult.style.opacity = "1";
+            llmTestResult.style.color = "rgba(255,100,100,0.9)";
+          }
+        } finally {
+          llmTestBtn.disabled = false;
+          llmTestBtn.textContent = "🧪 Test Connection";
+          setTimeout(() => {
+            if (llmTestResult) llmTestResult.style.opacity = "0";
+          }, 5000);
+        }
+      });
+    }
+    
+    // Save configuration
+    if (llmSaveBtn) {
+      llmSaveBtn.addEventListener("click", async () => {
+        if (!llmProviderSelect.value) {
+          toast("⚠️ Selecione um provider primeiro");
+          return;
+        }
+        
+        llmSaveBtn.disabled = true;
+        llmSaveBtn.textContent = "💾 Saving...";
+        
+        try {
+          const provider = await llmService.getActiveProvider();
+          if (!provider) throw new Error("Provider não encontrado");
+          
+          const isCloud = provider.provider_type === "Cloud";
+          const config = isCloud ? {
+            endpoint: llmEndpoint?.value || provider.config.endpoint,
+            api_key: llmApiKey?.value || provider.config.api_key,
+          } : {
+            gpu_layers: Number(llmGpuLayers?.value || 35),
+            quantization: llmQuant?.value || "q4",
+          };
+          
+          await llmService.updateProviderConfig(llmProviderSelect.value, config);
+          await llmService.setActiveProvider(llmProviderSelect.value);
+          await llmService.enableProvider(llmProviderSelect.value, true);
+          
+          toast("✅ Configuração LLM salva com sucesso");
+          updateLLMConfig(llmProviderSelect.value);
+        } catch (error) {
+          toast(`❌ Erro ao salvar: ${error}`);
+        } finally {
+          llmSaveBtn.disabled = false;
+          llmSaveBtn.textContent = "💾 Save Configuration";
+        }
+      });
+    }
+    
+    // Download model
+    if (llmDownloadBtn) {
+      llmDownloadBtn.addEventListener("click", async () => {
+        if (!llmProviderSelect.value) {
+          toast("⚠️ Selecione um provider local primeiro");
+          return;
+        }
+        
+        llmDownloadBtn.disabled = true;
+        llmDownloadBtn.style.display = "none";
+        if (llmDownloadProgress) llmDownloadProgress.style.display = "flex";
+        
+        try {
+          await llmService.downloadModel(llmProviderSelect.value, (progress) => {
+            if (llmProgressBar) llmProgressBar.style.width = `${progress}%`;
+            if (llmProgressText) llmProgressText.textContent = `${Math.round(progress)}%`;
+          });
+          
+          toast("✅ Modelo descarregado com sucesso");
+          updateLLMConfig(llmProviderSelect.value);
+        } catch (error) {
+          toast(`❌ Erro no download: ${error}`);
+        } finally {
+          llmDownloadBtn.disabled = false;
+          llmDownloadBtn.style.display = "inline-block";
+          if (llmDownloadProgress) llmDownloadProgress.style.display = "none";
+        }
+      });
+    }
+    
+    document.getElementById("settings-close")!.addEventListener("click", () => overlay.remove());
+    document.getElementById("settings-save")!.addEventListener("click", () => overlay.remove());
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) overlay.remove();
+    });
+
+    // ── 1-Click LLM install buttons ───────────────────────────────
+    const installLog = document.getElementById("install-ollama-log");
+
+    function setInstallStatus(id: string, msg: string, color?: string) {
+      const el = document.getElementById(`install-status-${id}`);
+      if (el) { el.textContent = msg; if (color) el.style.color = color; }
+    }
+
+    // Install Ollama engine
+    document.getElementById("install-btn-ollama")?.addEventListener("click", async () => {
+      const btn = document.getElementById("install-btn-ollama") as HTMLButtonElement;
+      btn.disabled = true; btn.textContent = "⏳ Instalando...";
+      setInstallStatus("ollama", "a instalar...", "var(--neon-cyan)");
+      if (installLog) { installLog.style.display = "block"; installLog.textContent = "A descarregar OllamaSetup.exe..."; }
+      try {
+        const msg = await invoke<string>("llm_install_ollama");
+        setInstallStatus("ollama", "✅ Instalado", "var(--neon-green)");
+        if (installLog) installLog.textContent = msg;
+        toast("Ollama instalado com sucesso!");
+        btn.textContent = "✅ Instalado";
+      } catch (e) {
+        setInstallStatus("ollama", "❌ Erro", "#ef4444");
+        if (installLog) installLog.textContent = String(e);
+        btn.disabled = false; btn.textContent = "📥 Instalar Ollama";
+      }
+    });
+
+    // Download Llama 3.2 3B
+    document.getElementById("install-btn-llama")?.addEventListener("click", async () => {
+      const btn = document.getElementById("install-btn-llama") as HTMLButtonElement;
+      btn.disabled = true; btn.textContent = "⏳ Downloading...";
+      setInstallStatus("llama", "a descarregar...", "var(--neon-cyan)");
+      if (installLog) { installLog.style.display = "block"; installLog.textContent = "ollama pull llama3.2:3b (pode demorar vários minutos)..."; }
+      try {
+        const msg = await invoke<string>("llm_download_model", { providerId: "llama-3.2-3b" });
+        setInstallStatus("llama", "✅ Pronto", "var(--neon-green)");
+        if (installLog) installLog.textContent = msg;
+        toast("Llama 3.2 3B pronto a usar!");
+        btn.textContent = "✅ Download concluído";
+      } catch (e) {
+        setInstallStatus("llama", "❌ Erro", "#ef4444");
+        if (installLog) installLog.textContent = `Erro: ${e}`;
+        btn.disabled = false; btn.textContent = "⬇️ Download";
+      }
+    });
+
+    // Download Nemotron-Mini 4B (NVIDIA text LLM — works on consumer RTX via Ollama)
+    document.getElementById("install-btn-llama8b")?.addEventListener("click", async () => {
+      const btn = document.getElementById("install-btn-llama8b") as HTMLButtonElement;
+      btn.disabled = true; btn.textContent = "⏳ Downloading...";
+      setInstallStatus("llama8b", "a descarregar...", "var(--neon-cyan)");
+      if (installLog) { installLog.style.display = "block"; installLog.textContent = "ollama pull nemotron-mini (pode demorar vários minutos, ~2.7GB)..."; }
+      try {
+        const msg = await invoke<string>("llm_download_model", { providerId: "nemotron-mini" });
+        setInstallStatus("llama8b", "✅ Pronto", "var(--neon-green)");
+        if (installLog) installLog.textContent = msg;
+        toast("Nemotron-Mini 4B pronto a usar!");
+        btn.textContent = "✅ Download concluído";
+      } catch (e) {
+        setInstallStatus("llama8b", "❌ Erro", "#ef4444");
+        if (installLog) installLog.textContent = `Erro: ${e}`;
+        btn.disabled = false; btn.textContent = "⬇️ Download";
+      }
+    });
+
+    // PersonaPlex — open HuggingFace page (not installable on gaming PCs via Ollama)
+    document.getElementById("install-btn-personaplex")?.addEventListener("click", async () => {
+      await shellOpen("https://huggingface.co/nvidia/personaplex-7b-v1");
+    });
+  } // end showSettingsModal
 
   header.appendChild(headerLeft);
   header.appendChild(headerRight);
@@ -5540,6 +6094,39 @@ function build() {
   c8.appendChild(cardRecommendBtn("extras"));
   c8.appendChild(cardApplyBtn("Apply Extras", "extras", "🛡"));
 
+  /* ── 9. AI / Agent Configuration ─────────────────────────────── */
+  const c9 = card("AI / Agent Configuration", "Configure Cloud Advisor API endpoint and credentials for AI-powered recommendations.");
+  c9.dataset.section = "ai-agent";
+  c9.innerHTML += `
+    <div class="toggle-row" style="margin-bottom:8px;">
+      <label>Cloud Advisor Endpoint</label>
+      <input type="text" id="cfg-adv-endpoint" placeholder="https://api.example.com" style="flex:1;padding:4px 8px;font-size:11px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:4px;color:var(--neon-green);font-family:Rajdhani,monospace;">
+    </div>
+    <div class="toggle-row" style="margin-bottom:8px;">
+      <label>API Key</label>
+      <input type="password" id="cfg-adv-key" placeholder="Enter API key" style="flex:1;padding:4px 8px;font-size:11px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:4px;color:var(--neon-green);font-family:Rajdhani,monospace;">
+    </div>
+    <button class="btn-export" style="margin-top:8px;">Test Connection</button>
+    <p style="font-size:10px;opacity:0.5;margin:8px 0 0;line-height:1.4;">Cloud Advisor provides AI-powered analysis and recommendations for hardware bottlenecks, system configs and CS2 performance. Click the purple "ADV" button in the header to manage credentials and view recommendations.</p>
+  `;
+
+  /* ── 10. Integrations & Webhooks ─────────────────────────────── */
+  const c10 = card("Integrations & Webhooks", "Connect Discord and GitHub for automated feedback and issue reporting.");
+  c10.dataset.section = "integrations";
+  c10.innerHTML += `
+    <div class="toggle-row" style="margin-bottom:8px;">
+      <label>Discord Webhook URL</label>
+      <input type="text" id="cfg-discord-webhook" placeholder="https://discord.com/api/webhooks/..." style="flex:1;padding:4px 8px;font-size:11px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:4px;color:var(--neon-green);font-family:Rajdhani,monospace;">
+    </div>
+    <button class="btn-export" style="margin-top:8px;margin-bottom:16px;">Test Discord Webhook</button>
+    <div class="toggle-row" style="margin-bottom:8px;">
+      <label>GitHub Personal Access Token</label>
+      <input type="password" id="cfg-github-token" placeholder="ghp_..." style="flex:1;padding:4px 8px;font-size:11px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:4px;color:var(--neon-green);font-family:Rajdhani,monospace;">
+    </div>
+    <button class="btn-export" style="margin-top:8px;">Verify GitHub Token</button>
+    <p style="font-size:10px;opacity:0.5;margin:12px 0 0;line-height:1.4;">Discord webhook enables feedback submission to your Discord server. GitHub token allows creating issues directly from the app. Both are optional and stored locally. Configure these in the Feedback tab to enable auto-submit features.</p>
+  `;
+
   /* ── PRO TIPS (not toggleable — pure informational guidance) ───── */
   /* We inject a tips section below the grid, before the actions bar */
   const tipsSection = document.createElement("section");
@@ -5651,6 +6238,8 @@ function build() {
   const sysPane3 = document.createElement("main");
   sysPane3.className = "app-main";
   sysPane3.appendChild(c8);
+  sysPane3.appendChild(c9);
+  sysPane3.appendChild(c10);
   sysSub.panels[3].appendChild(sysPane3);
   sysSub.panels[3].appendChild(tipsSection);
 
@@ -6491,7 +7080,7 @@ function build() {
   hwHeader.style.cssText = "display:flex;gap:8px;padding:10px 12px;align-items:center;";
   const btnHwRefresh = document.createElement("button");
   btnHwRefresh.className = "btn-export";
-  btnHwRefresh.textContent = "Scan Hardware";
+  btnHwRefresh.textContent = "Refresh";
   btnHwRefresh.title = "Detect hardware via WMI";
   btnHwRefresh.addEventListener("click", refreshHardwareInfo);
   const btnHwAdv = document.createElement("button");
@@ -6560,7 +7149,7 @@ function build() {
   drvHeader.style.cssText = "display:flex;gap:8px;padding:10px 12px;align-items:center;";
   const btnDrvRefresh = document.createElement("button");
   btnDrvRefresh.className = "btn-export";
-  btnDrvRefresh.textContent = "Analyze Drivers";
+  btnDrvRefresh.textContent = "Refresh";
   btnDrvRefresh.title = "Analyze system and peripheral drivers via WMI";
   btnDrvRefresh.addEventListener("click", refreshDriverInfo);
   const drvInfo = document.createElement("span");
@@ -6591,7 +7180,7 @@ function build() {
   procHeader.style.cssText = "display:flex;gap:8px;padding:10px 12px;align-items:center;";
   const btnProcRefresh = document.createElement("button");
   btnProcRefresh.className = "btn-export";
-  btnProcRefresh.textContent = "Refresh Processes";
+  btnProcRefresh.textContent = "Refresh";
   btnProcRefresh.title = "List top 40 processes by RAM usage";
   btnProcRefresh.addEventListener("click", refreshProcesses);
   const btnProcAdv = document.createElement("button");
@@ -6660,20 +7249,32 @@ function build() {
   tabNet.id = "tab-net";
   tabNet.className = "tab-panel";
 
+  const netSub = buildSubTabs(["🌐 Servers", "⚡ Optimizations"]);
+  tabNet.appendChild(netSub.bar);
+
+  /* ── SUB-TAB 0: Servers ── */
+  const netPanel0 = netSub.panels[0];
+
   const netHeader = document.createElement("section");
-  netHeader.style.cssText = "display:flex;gap:8px;padding:10px 12px;align-items:center;";
+  netHeader.style.cssText = "display:flex;gap:8px;padding:10px 12px;align-items:center;flex-wrap:wrap;";
   const btnPingAll = document.createElement("button");
   btnPingAll.className = "btn-export";
-  btnPingAll.textContent = "Ping All Servers";
-  btnPingAll.title = "Ping Valve + FACEIT + DNS servers";
-  btnPingAll.addEventListener("click", runPingTests);
+  btnPingAll.textContent = "▶ Run Test";
+  btnPingAll.title = "TCP latency test to Valve, FACEIT, DNS servers";
+  btnPingAll.addEventListener("click", async () => {
+    btnPingAll.disabled = true;
+    btnPingAll.textContent = "⏳ Testing...";
+    await runPingTests();
+    btnPingAll.disabled = false;
+    btnPingAll.textContent = "▶ Run Test";
+  });
   const btnNetAdv = document.createElement("button");
   btnNetAdv.className = "btn-adv";
   btnNetAdv.innerHTML = "🔍 Diagnose";
-  btnNetAdv.title = "Network quality and latency diagnosis — requires Advisor key configured";
+  btnNetAdv.title = "Network quality and latency diagnosis — requires Advisor key";
   const netInfo = document.createElement("span");
   netInfo.style.cssText = "font-size:10px;opacity:0.5;";
-  netInfo.textContent = "Pings 10 servers (Valve, FACEIT, DNS). Takes ~40 seconds.";
+  netInfo.textContent = "TCP latency to 8 servers (Valve, FACEIT, DNS). ~5–10s.";
   netHeader.appendChild(btnPingAll);
   netHeader.appendChild(btnNetAdv);
   const netShareBar = buildShareBar(() => {
@@ -6682,20 +7283,20 @@ function build() {
   });
   netHeader.appendChild(netShareBar);
   netHeader.appendChild(netInfo);
-  tabNet.appendChild(netHeader);
+  netPanel0.appendChild(netHeader);
 
   const netResults = document.createElement("div");
   netResults.id = "net-results";
   netResults.className = "net-grid";
   netResults.style.cssText = "padding:0 12px 12px;";
-  netResults.innerHTML = '<div class="net-status">Click "Ping All Servers" to test latency</div>';
-  tabNet.appendChild(netResults);
+  netResults.innerHTML = '<div class="net-status">Click "▶ Run Test" to test TCP latency to game servers</div>';
+  netPanel0.appendChild(netResults);
 
   const netAdvResp = document.createElement("div");
   netAdvResp.className = "adv-response";
   netAdvResp.id = "net-adv-response";
   netAdvResp.style.margin = "0 12px";
-  tabNet.appendChild(netAdvResp);
+  netPanel0.appendChild(netAdvResp);
 
   btnNetAdv.addEventListener("click", async () => {
     if (!hasAdvKey()) {
@@ -6703,7 +7304,7 @@ function build() {
       return;
     }
     const netText = document.getElementById("net-results")?.textContent || "";
-    if (netText.includes('Click "Ping')) {
+    if (netText.includes('Run Test')) {
       toast("Run ping tests first", true);
       return;
     }
@@ -6717,6 +7318,276 @@ function build() {
     }
     btnNetAdv.disabled = false;
   });
+
+  /* ── SUB-TAB 1: Optimizations ── */
+  const netPanel1 = netSub.panels[1];
+  netPanel1.style.cssText = "padding:8px 12px 16px;display:flex;flex-direction:column;gap:12px;overflow-y:auto;";
+
+  function netOptCard(title: string, icon: string, desc: string): { wrap: HTMLElement; body: HTMLElement } {
+    const wrap = document.createElement("div");
+    wrap.style.cssText = "border:1px solid rgba(255,255,255,0.07);border-radius:8px;overflow:hidden;";
+    const hdr = document.createElement("div");
+    hdr.style.cssText = "display:flex;align-items:center;gap:8px;padding:10px 12px;background:rgba(255,255,255,0.03);border-bottom:1px solid rgba(255,255,255,0.06);";
+    hdr.innerHTML = `<span style="font-size:16px">${icon}</span><div><div style="font-weight:600;font-size:12px">${title}</div><div style="font-size:10px;opacity:0.5;margin-top:1px">${desc}</div></div>`;
+    const body = document.createElement("div");
+    body.style.cssText = "padding:10px 12px;display:flex;flex-direction:column;gap:8px;";
+    wrap.appendChild(hdr);
+    wrap.appendChild(body);
+    return { wrap, body };
+  }
+
+  function netStatusSpan(id: string): HTMLElement {
+    const s = document.createElement("span");
+    s.id = id;
+    s.style.cssText = "font-size:10px;opacity:0.6;margin-left:8px;";
+    return s;
+  }
+
+  function netActionRow(label: string, btnLabel: string, btnClass: string, onClick: () => Promise<void>, statusId?: string): HTMLElement {
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:8px;";
+    const lbl = document.createElement("span");
+    lbl.style.cssText = "font-size:11px;opacity:0.8;flex:1;";
+    lbl.textContent = label;
+    const btnW = document.createElement("div");
+    btnW.style.cssText = "display:flex;align-items:center;gap:6px;";
+    const btn = document.createElement("button");
+    btn.className = btnClass;
+    btn.textContent = btnLabel;
+    btn.style.cssText += "padding:4px 10px;font-size:11px;";
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      const prev = btn.textContent;
+      btn.textContent = "⏳";
+      try { await onClick(); } catch (e) { toast(String(e), true); }
+      btn.disabled = false;
+      btn.textContent = prev;
+    });
+    btnW.appendChild(btn);
+    if (statusId) btnW.appendChild(netStatusSpan(statusId));
+    row.appendChild(lbl);
+    row.appendChild(btnW);
+    return row;
+  }
+
+  // ── DNS Optimizer ──────────────────────────────────────────────
+  const { wrap: dnsWrap, body: dnsBody } = netOptCard(
+    "DNS Optimizer",
+    "🔧",
+    "Switch DNS to lower latency resolvers — improves connection establishment speed"
+  );
+
+  const dnsPresets = [
+    { label: "Cloudflare 1.1.1.1", p: "1.1.1.1", s: "1.0.0.1" },
+    { label: "Google 8.8.8.8", p: "8.8.8.8", s: "8.8.4.4" },
+    { label: "Quad9 (Secure)", p: "9.9.9.9", s: "149.112.112.112" },
+  ];
+  const dnsRow = document.createElement("div");
+  dnsRow.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;align-items:center;";
+  const dnsSelect = document.createElement("select");
+  dnsSelect.className = "pro-select";
+  dnsSelect.style.cssText = "flex:1;min-width:140px;font-size:11px;padding:4px 8px;height:28px;";
+  for (const [i, p] of dnsPresets.entries()) {
+    const opt = document.createElement("option");
+    opt.value = String(i);
+    opt.textContent = p.label;
+    dnsSelect.appendChild(opt);
+  }
+  const btnApplyDns = document.createElement("button");
+  btnApplyDns.className = "btn-export";
+  btnApplyDns.textContent = "Apply";
+  btnApplyDns.style.cssText += "padding:4px 10px;font-size:11px;";
+  const btnRestoreDns = document.createElement("button");
+  btnRestoreDns.className = "btn-adv";
+  btnRestoreDns.textContent = "Restore";
+  btnRestoreDns.style.cssText += "padding:4px 10px;font-size:11px;";
+  const dnsStatus = netStatusSpan("dns-opt-status");
+  dnsRow.appendChild(dnsSelect);
+  dnsRow.appendChild(btnApplyDns);
+  dnsRow.appendChild(btnRestoreDns);
+  dnsRow.appendChild(dnsStatus);
+  dnsBody.appendChild(dnsRow);
+  dnsBody.appendChild((() => {
+    const info = document.createElement("div");
+    info.style.cssText = "font-size:10px;opacity:0.4;";
+    info.textContent = "Changes applied via netsh on the active network adapter. Runs as admin.";
+    return info;
+  })());
+
+  btnApplyDns.addEventListener("click", async () => {
+    btnApplyDns.disabled = true;
+    const preset = dnsPresets[Number(dnsSelect.value)];
+    dnsStatus.textContent = "Applying...";
+    try {
+      const msg = await invoke<string>("apply_dns", { primary: preset.p, secondary: preset.s });
+      dnsStatus.textContent = `✅ ${msg}`;
+      toast(`DNS set to ${preset.label}`);
+    } catch (e) { dnsStatus.textContent = `❌ ${e}`; toast(String(e), true); }
+    btnApplyDns.disabled = false;
+  });
+  btnRestoreDns.addEventListener("click", async () => {
+    btnRestoreDns.disabled = true;
+    dnsStatus.textContent = "Restoring...";
+    try {
+      const msg = await invoke<string>("restore_dns");
+      dnsStatus.textContent = `✅ ${msg}`;
+      toast("DNS restored to DHCP automatic");
+    } catch (e) { dnsStatus.textContent = `❌ ${e}`; toast(String(e), true); }
+    btnRestoreDns.disabled = false;
+  });
+  netPanel1.appendChild(dnsWrap);
+
+  // ── TCP Optimizer ─────────────────────────────────────────────
+  const { wrap: tcpWrap, body: tcpBody } = netOptCard(
+    "TCP Game Optimizer",
+    "📡",
+    "Disable Nagle algorithm, tune TCP stack for low-latency gaming"
+  );
+  tcpBody.appendChild(netActionRow(
+    "Apply TCP gaming tweaks (disable Nagle, enable ECN, tune buffers)",
+    "Apply", "btn-export",
+    async () => {
+      const msg = await invoke<string>("apply_tcp_tweaks");
+      const s = document.getElementById("tcp-opt-status");
+      if (s) s.textContent = `✅ ${msg}`;
+      toast("TCP tweaks applied");
+    },
+    "tcp-opt-status"
+  ));
+  tcpBody.appendChild(netActionRow(
+    "Restore default TCP settings",
+    "Restore", "btn-adv",
+    async () => {
+      const msg = await invoke<string>("restore_tcp_tweaks");
+      const s = document.getElementById("tcp-opt-status");
+      if (s) s.textContent = `✅ ${msg}`;
+      toast("TCP defaults restored");
+    }
+  ));
+  netPanel1.appendChild(tcpWrap);
+
+  // ── QoS Gaming Mode ───────────────────────────────────────────
+  const { wrap: qosWrap, body: qosBody } = netOptCard(
+    "QoS Gaming Mode",
+    "🎮",
+    "Prioritize CS2 packets with DSCP marking — reduces latency spikes in crowded networks"
+  );
+  qosBody.appendChild(netActionRow(
+    "Set high-priority QoS policy for CS2.exe and cs2.exe",
+    "Enable", "btn-export",
+    async () => {
+      const msg = await invoke<string>("apply_qos_cs2");
+      const s = document.getElementById("qos-opt-status");
+      if (s) s.textContent = `✅ ${msg}`;
+      toast("QoS policy for CS2 enabled");
+    },
+    "qos-opt-status"
+  ));
+  qosBody.appendChild(netActionRow(
+    "Remove QoS policies added by this tool",
+    "Disable", "btn-adv",
+    async () => {
+      const msg = await invoke<string>("remove_qos_cs2");
+      const s = document.getElementById("qos-opt-status");
+      if (s) s.textContent = `✅ ${msg}`;
+      toast("QoS policies removed");
+    }
+  ));
+  netPanel1.appendChild(qosWrap);
+
+  // ── MTU Optimizer ─────────────────────────────────────────────
+  const { wrap: mtuWrap, body: mtuBody } = netOptCard(
+    "MTU Optimizer",
+    "📦",
+    "Find and apply the optimal MTU — prevents packet fragmentation which causes lag spikes"
+  );
+  const mtuRow = document.createElement("div");
+  mtuRow.style.cssText = "display:flex;gap:6px;align-items:center;flex-wrap:wrap;";
+  const mtuPresets = [
+    { label: "1500 (Default)", val: 1500 },
+    { label: "1492 (PPPoE)", val: 1492 },
+    { label: "1480 (VPN safe)", val: 1480 },
+    { label: "1472 (Optimal test)", val: 1472 },
+    { label: "1460 (Conservative)", val: 1460 },
+  ];
+  const mtuSelect = document.createElement("select");
+  mtuSelect.className = "pro-select";
+  mtuSelect.style.cssText = "flex:1;min-width:140px;font-size:11px;padding:4px 8px;height:28px;";
+  for (const p of mtuPresets) {
+    const opt = document.createElement("option");
+    opt.value = String(p.val);
+    opt.textContent = p.label;
+    mtuSelect.appendChild(opt);
+  }
+  const btnApplyMtu = document.createElement("button");
+  btnApplyMtu.className = "btn-export";
+  btnApplyMtu.textContent = "Apply";
+  btnApplyMtu.style.cssText += "padding:4px 10px;font-size:11px;";
+  const mtuStatus = netStatusSpan("mtu-opt-status");
+  mtuRow.appendChild(mtuSelect);
+  mtuRow.appendChild(btnApplyMtu);
+  mtuRow.appendChild(mtuStatus);
+  mtuBody.appendChild(mtuRow);
+  btnApplyMtu.addEventListener("click", async () => {
+    btnApplyMtu.disabled = true;
+    const val = Number(mtuSelect.value);
+    mtuStatus.textContent = "Applying...";
+    try {
+      const msg = await invoke<string>("set_mtu", { mtu: val });
+      mtuStatus.textContent = `✅ ${msg}`;
+      toast(`MTU set to ${val}`);
+    } catch (e) { mtuStatus.textContent = `❌ ${e}`; toast(String(e), true); }
+    btnApplyMtu.disabled = false;
+  });
+  netPanel1.appendChild(mtuWrap);
+
+  // ── Network Adapter Priority ─────────────────────────────────
+  const { wrap: adpWrap, body: adpBody } = netOptCard(
+    "Adapter Priority",
+    "🔌",
+    "Force Ethernet over Wi-Fi — ensures wired connection is always preferred"
+  );
+  adpBody.appendChild(netActionRow(
+    "Set Ethernet as top-priority interface (lower route metric)",
+    "Prioritize Ethernet", "btn-export",
+    async () => {
+      const msg = await invoke<string>("prioritize_ethernet");
+      const s = document.getElementById("adp-opt-status");
+      if (s) s.textContent = `✅ ${msg}`;
+      toast("Ethernet prioritized");
+    },
+    "adp-opt-status"
+  ));
+  adpBody.appendChild(netActionRow(
+    "Disable Wi-Fi adapter while Ethernet is active",
+    "Disable Wi-Fi", "btn-adv",
+    async () => {
+      const msg = await invoke<string>("disable_wifi");
+      const s = document.getElementById("adp-opt-status");
+      if (s) s.textContent = `✅ ${msg}`;
+      toast(msg);
+    }
+  ));
+  netPanel1.appendChild(adpWrap);
+
+  // ── Restore All Defaults ──────────────────────────────────────
+  const restoreRow = document.createElement("div");
+  restoreRow.style.cssText = "display:flex;justify-content:flex-end;padding:4px 0;";
+  const btnRestoreAll = document.createElement("button");
+  btnRestoreAll.className = "btn-adv";
+  btnRestoreAll.textContent = "↩ Restore All Network Defaults";
+  btnRestoreAll.style.cssText += "font-size:11px;";
+  btnRestoreAll.addEventListener("click", async () => {
+    if (!confirm("Restore all network settings to Windows defaults?")) return;
+    btnRestoreAll.disabled = true;
+    try {
+      const msg = await invoke<string>("restore_network_defaults");
+      toast(msg);
+    } catch (e) { toast(String(e), true); }
+    btnRestoreAll.disabled = false;
+  });
+  restoreRow.appendChild(btnRestoreAll);
+  netPanel1.appendChild(restoreRow);
 
   const netSig = document.createElement("section");
   netSig.className = "cfg-actions";
@@ -7175,6 +8046,214 @@ build();
 const savedTheme = localStorage.getItem("csmooth_theme");
 if (savedTheme !== null) applyTheme(Number.parseInt(savedTheme, 10));
 
+/* ================================================================
+   Dazzling Progress Bar for data loading
+   ================================================================ */
+function createProgressBar(): { container: HTMLElement; update: (label: string, progress: number) => void; remove: () => void } {
+  const container = document.createElement("div");
+  container.style.cssText = `
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.85);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    z-index: 9999;
+    backdrop-filter: blur(4px);
+  `;
+
+  const content = document.createElement("div");
+  content.style.cssText = `
+    text-align: center;
+    color: var(--text-primary);
+    font-family: 'Orbitron', monospace;
+  `;
+
+  const title = document.createElement("div");
+  title.textContent = "INITIALIZING PLAYER AGENT...";
+  title.style.cssText = `
+    font-size: 24px;
+    margin-bottom: 32px;
+    background: linear-gradient(90deg, var(--primary), var(--secondary));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    font-weight: bold;
+    letter-spacing: 2px;
+  `;
+
+  const label = document.createElement("div");
+  label.style.cssText = `
+    font-size: 12px;
+    opacity: 0.7;
+    margin-bottom: 16px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  `;
+
+  // Progress bar with animated gradient
+  const barBg = document.createElement("div");
+  barBg.style.cssText = `
+    width: 300px;
+    height: 6px;
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 3px;
+    overflow: hidden;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    margin-bottom: 16px;
+  `;
+
+  const barFill = document.createElement("div");
+  barFill.style.cssText = `
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, var(--primary), var(--secondary));
+    border-radius: 3px;
+    transition: width 0.3s ease;
+    box-shadow: 0 0 10px var(--primary);
+  `;
+  barBg.appendChild(barFill);
+
+  const percent = document.createElement("div");
+  percent.style.cssText = `
+    font-size: 11px;
+    opacity: 0.6;
+    margin-top: 12px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  `;
+
+  // Animated dots
+  const dots = document.createElement("div");
+  dots.style.cssText = `
+    margin-top: 24px;
+    font-size: 20px;
+    letter-spacing: 4px;
+    animation: pulse 1.5s infinite;
+  `;
+  dots.textContent = "●●●";
+
+  // Add animation if not already present
+  if (!document.querySelector("style[data-progress-animation]")) {
+    const style = document.createElement("style");
+    style.setAttribute("data-progress-animation", "true");
+    style.textContent = `
+      @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.3; }
+      }
+      @keyframes glow {
+        0%, 100% { box-shadow: 0 0 10px var(--primary); }
+        50% { box-shadow: 0 0 20px var(--primary), 0 0 30px var(--secondary); }
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  content.appendChild(title);
+  content.appendChild(label);
+  content.appendChild(barBg);
+  content.appendChild(percent);
+  content.appendChild(dots);
+  container.appendChild(content);
+  document.body.appendChild(container);
+
+  return {
+    container,
+    update: (text: string, progress: number) => {
+      label.textContent = text;
+      barFill.style.width = `${Math.min(progress, 100)}%`;
+      percent.textContent = `${Math.round(progress)}%`;
+    },
+    remove: () => {
+      container.style.opacity = "0";
+      container.style.transition = "opacity 0.3s ease";
+      setTimeout(() => container.remove(), 300);
+    },
+  };
+}
+
+/* ================================================================
+   Parallel Data Pre-loading on Startup
+   ================================================================ */
+async function preloadAllData() {
+  const progress = createProgressBar();
+  const tasks = [
+    { name: "Hardware Analysis", fn: refreshHardwareInfo, weight: 20 },
+    { name: "Driver Detection", fn: refreshDriverInfo, weight: 35 },
+    { name: "Process Scanning", fn: refreshProcesses, weight: 15 },
+    { name: "Network Diagnostics", fn: runPingTests, weight: 20 },
+  ];
+
+  let completed = 0;
+  const totalWeight = tasks.reduce((sum, t) => sum + t.weight, 0);
+
+  // Start all tasks in parallel
+  const promises = tasks.map(async (task) => {
+    try {
+      progress.update(task.name, (completed / totalWeight) * 100);
+      await task.fn();
+      completed += task.weight;
+      progress.update(task.name, Math.min((completed / totalWeight) * 100, 99));
+    } catch (e) {
+      console.error(`Error loading ${task.name}:`, e);
+      completed += task.weight;
+    }
+  });
+
+  await Promise.all(promises);
+  progress.update("Finalizing...", 100);
+  
+  // Give a moment to show 100% before closing
+  await new Promise(resolve => setTimeout(resolve, 500));
+  progress.remove();
+
+  // Voice agent welcome greeting
+  greetVoiceAgent();
+}
+
+/* ================================================================
+   Voice Agent Welcome Greeting
+   ================================================================ */
+async function greetVoiceAgent() {
+  try {
+    const llmProvider = await llmService.getActiveProvider();
+    if (!llmProvider) return; // No LLM configured yet
+
+    const greeting = `🎮 Welcome, Player! I'm your AI Coach, ready to help you optimize your CS2 setup and improve your game. Ask me anything about your hardware, configs, or gameplay. Let's get you winning! 🚀`;
+    
+    // Show toast notification
+    const toast_el = document.createElement("div");
+    toast_el.className = "status-toast";
+    toast_el.style.cssText = `
+      background: linear-gradient(135deg, var(--primary), var(--secondary));
+      color: var(--text-primary);
+      padding: 16px;
+      border-radius: 8px;
+      margin: 12px;
+      font-size: 14px;
+      max-width: 400px;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+    `;
+    toast_el.textContent = greeting;
+    document.body.appendChild(toast_el);
+    
+    setTimeout(() => {
+      toast_el.style.opacity = "0";
+      toast_el.style.transition = "opacity 0.3s ease";
+      setTimeout(() => toast_el.remove(), 300);
+    }, 5000);
+
+    console.log("🤖 Voice Agent activated:", llmProvider.name);
+  } catch (e) {
+    console.log("Voice agent not configured (this is normal on first run)");
+  }
+}
+
 // Restore last active schema values on startup OR sync with system state on first run
 (async () => {
   const activeSchema = getActiveSchema();
@@ -7187,6 +8266,10 @@ if (savedTheme !== null) applyTheme(Number.parseInt(savedTheme, 10));
     // First run or no active schema — sync toggles with actual system state
     await syncTogglesWithSystemState();
   }
+
+  // Pre-load all data in parallel with progress bar
+  // Delay slightly to let the UI fully render first
+  setTimeout(() => preloadAllData(), 100);
 })();
 
 // ── Auto-update check on startup ────────────────────────────────

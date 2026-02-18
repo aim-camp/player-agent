@@ -70,7 +70,7 @@ body::before {
   background: rgba(6, 10, 26, 0.95);
   border-right: 1px solid var(--border-glow);
   flex-shrink: 0;
-  width: 56px;
+  width: 90px;
   align-items: stretch;
   z-index: 10;
   overflow-y: auto;
@@ -425,6 +425,30 @@ body::before {
   transform: translateX(10px);
   background: var(--neon-green);
   box-shadow: 0 0 6px var(--neon-green);
+}
+
+/* ── select dropdowns ─────────────────────────────────────────────── */
+select {
+  background: rgba(15, 15, 25, 0.8);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  color: var(--neon-green);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+}
+select:hover {
+  border-color: rgba(0, 255, 170, 0.3);
+  background: rgba(15, 15, 25, 0.95);
+}
+select:focus {
+  outline: none;
+  border-color: var(--neon-green);
+  box-shadow: 0 0 6px rgba(0, 255, 170, 0.25);
+}
+select option {
+  background: rgba(15, 15, 25, 0.95);
+  color: var(--neon-green);
+  padding: 8px;
 }
 
 /* ── system-state LED ────────────────────────────────────────────── */
@@ -3509,6 +3533,57 @@ textarea:focus {
 }
 .adv-status.disconnected {
   background: #ef4444;
+}
+
+/* Agent status badge */
+.agent-status-badge {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  background: rgba(34, 197, 94, 0.08);
+  border: 1px solid rgba(34, 197, 94, 0.25);
+  font-family: "Orbitron", monospace;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  transition: all 0.15s;
+}
+.agent-status-badge .agent-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.agent-status-badge .agent-status-dot.connected {
+  background: #22c55e;
+  box-shadow: 0 0 6px #22c55e;
+  animation: pulse-green 2s ease-in-out infinite;
+}
+.agent-status-badge .agent-status-dot.disconnected {
+  background: #ef4444;
+  box-shadow: 0 0 4px #ef4444;
+}
+.agent-status-badge span:last-child {
+  color: #22c55e;
+  text-shadow: 0 0 4px rgba(34, 197, 94, 0.3);
+}
+.agent-status-badge.disconnected {
+  background: rgba(239, 68, 68, 0.08);
+  border-color: rgba(239, 68, 68, 0.25);
+}
+.agent-status-badge.disconnected span:last-child {
+  color: #ef4444;
+  text-shadow: 0 0 4px rgba(239, 68, 68, 0.3);
+}
+@keyframes pulse-green {
+  0%, 100% {
+    box-shadow: 0 0 6px #22c55e;
+  }
+  50% {
+    box-shadow: 0 0 12px #22c55e, 0 0 20px rgba(34, 197, 94, 0.4);
+  }
 }
 
 /* ── Share bar ───────────────────────────────────────────────────── */
